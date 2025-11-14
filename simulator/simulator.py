@@ -6,9 +6,9 @@ import simpy
 import pandas as pd
 from compute_node import ComputeNode
 from classes.job import Job
-from master_node_with_heterogeneous_nodes_csp import UtilityBasedWithCSPChoisingNodesOnlineV2
-from simulator.utils.plots import plot_gantt_chart
-from simulator.classes.tracker import Tracker
+from master_node_with_heterogeneous_nodes_csp import SchedulingUsingCSPOnline
+from utils.plots import plot_gantt_chart
+from classes.tracker import Tracker
 
 
 logger = logging.getLogger(__name__)
@@ -135,7 +135,7 @@ def simulatorForOptimalPerfsUsingCSPOnline(config,jobs=[], overlap = False, thre
     if len(nodes_config) == 0:
         logging.error("No nodes configuration provided for heterogeneous nodes.")
 
-    master = UtilityBasedWithCSPChoisingNodesOnlineV2(env, [], tracker, config, overlap=overlap)
+    master = SchedulingUsingCSPOnline(env, [], tracker, config, overlap=overlap)
     
     
     compute_nodes = [ComputeNode(env, i, master,  
@@ -151,7 +151,7 @@ def simulatorForOptimalPerfsUsingCSPOnline(config,jobs=[], overlap = False, thre
     master.nb_nodes = len(compute_nodes)
     
     for node in compute_nodes:
-        env.process(node.process_tasks_homogeneous_computes())
+        env.process(node.processTasks())
 
     if poisson:   
         env.process(jobsInjectorBasedOnLambdaPoisson(env, master, job_file_path=config['jobs_file_path'], lambda_rate=config['lambda_rate']))        

@@ -25,7 +25,7 @@ def sortSolution(transfers, works):
     
     return transfers, works
 
-def choiceNodesOnlineVersion2(master_node, jobs: list, replicas_locations: dict, nodes_free_time: list):
+def onLineSchedulingUsingCSP(master_node, jobs: list, replicas_locations: dict, nodes_free_time: list):
     """
     Planifie dynamiquement les transferts et les exécutions de tâches sur les nœuds de calcul
     en utilisant le solveur Choco (via pychoco).
@@ -160,24 +160,26 @@ def choiceNodesOnlineVersion2(master_node, jobs: list, replicas_locations: dict,
     best_avg_utility = -1
     transfers = {}
     works_exec = {}
-    solver.limit_time("30s")
+    solver.limit_time("10s")
     while solver.solve():
         transfers = {}
         works_exec = {}
 
         for j in range(nb_nodes):
-            transfers[f"node_{j}"] = []
-            for i in range(nb_data):
-                if heights[j][i].get_value() == 1:
-                    transfers[f"node_{j}"].append((
-                        jobs[i].job_id,possible_nodes[j].node_id,transfer_tasks[j][i].start.get_value(),transfer_tasks[j][i].end.get_value(),transfer_tasks[j][i].end.get_value() - transfer_tasks[j][i].start.get_value()
-                    ))
+            
+            
 
             works_exec[f"node_{j}"] = []
             for (t, ii, jj, kk, h) in work_tasks:
                 if jj == j and h.get_value() == 1:
                     works_exec[f"node_{j}"].append((
                         jobs[ii].job_id,possible_nodes[j].node_id,kk,t.start.get_value(),t.end.get_value(),t.end.get_value() - t.start.get_value()
+                    ))
+            transfers[f"node_{j}"] = []
+            for i in range(nb_data):
+                if heights[j][i].get_value() == 1 and len(works_exec[f"node_{j}"]) > 0:
+                    transfers[f"node_{j}"].append((
+                        jobs[i].job_id,possible_nodes[j].node_id,transfer_tasks[j][i].start.get_value(),transfer_tasks[j][i].end.get_value(),transfer_tasks[j][i].end.get_value() - transfer_tasks[j][i].start.get_value()
                     ))
         #current_avg_utility = evaluateUtility(master_node, jobs, transfers, works_exec)
         #if current_avg_utility <= 1 :#master_node.threshold:

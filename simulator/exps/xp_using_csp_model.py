@@ -21,7 +21,7 @@ from simulator import (
 from utils.parser import ArgumentParser
 
 
-from simulator.utils.plots import plot_line, plot_gantt_chart
+from utils.plots import plot_line, plot_gantt_chart
 
 logger = logging.getLogger(__name__)
 
@@ -55,9 +55,9 @@ def main():
     
     nodes_config = generateHeterogeneousInfrastructureEquilibre(config)
 
-    config['jobs_file_path'] = f"workloads/jobs-for-all/jobs-{config['total_nb_jobs']}.json"
-    results_destination = f"results-using-CSP/" #/exps-on-cats-without-load
-    exp_name = "utility"
+    config['jobs_file_path'] = f"workloads/jobs-{config['total_nb_jobs']}.json"
+    results_destination = f"results/"
+    exp_name = "Test"
 
     random.seed(42)
     

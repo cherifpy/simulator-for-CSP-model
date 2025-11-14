@@ -7,7 +7,7 @@ from classes.job import Task, Replica, Job
 import copy
 from compute_node import ComputeNode
 
-from utils.modelCSP import choiceNodes, choiceNodesOnline, choiceNodesOnlineVersion2
+from utils.modelCSP import onLineSchedulingUsingCSP
 
 
 logger = logging.getLogger(__name__)
@@ -106,7 +106,7 @@ class SchedulingUsingCSPOnline:
                 if len(jobs_to_reschedule) > 0:
                     
                     logger.debug("[%s] Master: Start looking for a solution. at time %s", self.env.now,self.env.now)
-                    transfers_, works_ = choiceNodesOnlineVersion2(self, jobs_to_reschedule, replicas_locations, nodes_free_time)
+                    transfers_, works_ = onLineSchedulingUsingCSP(self, jobs_to_reschedule, replicas_locations, nodes_free_time)
 
                 else:
                     transfers_, works_ = {}, {}
@@ -123,12 +123,12 @@ class SchedulingUsingCSPOnline:
                         if len(self.waiting_jobs) > 0:
                             self.waiting_jobs.pop(0)
 
-                    """self.ongoing_transfers = {}
+                    self.ongoing_transfers = {}
                     self.ongoing_works = {}                
                     
                     for node_id in range(len(self.compute_nodes)):
                         self.ongoing_transfers[f'node_{node_id}'] = None
-                        self.ongoing_works[f'node_{node_id}'] = None"""
+                        self.ongoing_works[f'node_{node_id}'] = None
                 
                 else:
                     print('no solution found at time ', self.env.now)
@@ -322,7 +322,7 @@ class SchedulingUsingCSPOnline:
                 task = self.jobs[job_id].tasks[k]
                 if task.status == "Started":
                     execution_time = task.duration * self.compute_nodes[node_id].compute_capacity
-                    nodes_free_time[node_id] = int(task.starting_time + execution_time- self.env.now)
+                    nodes_free_time[node_id] = int(t_end - self.env.now)
                 if task.status == "Finished":
                     nodes_free_time[node_id] = 0
                 else:
@@ -351,19 +351,10 @@ class SchedulingUsingCSPOnline:
         with compute_node.bandwidth_lock.request() as node_req:
             
             yield node_req  
-
-            self.compute_nodes[compute_node.node_id].job_order.append(job_id)
             
             logger.debug("[%s] Compute-%s: Got new dataset transfert of job %s: duration: %s, dataset_size: %s", self.env.now, compute_node.node_id, job_id, transfer_time, dataset_size)
-            
-            self.compute_nodes[compute_node.node_id].running_task.append(-1)
-            
             yield self.env.timeout(transfer_time)
-
-            end_time = self.env.now
-            
-            self.compute_nodes[compute_node.node_id].running_task.pop(0)
-            
+            end_time = self.env.now            
             self.compute_nodes[compute_node.node_id].datasets.append(job_id)
             
             dataset_ready_event.succeed()
