@@ -1,0 +1,34 @@
+{
+    "total_nb_jobs": 50,
+    
+    "total_nb_compute_nodes": 100,
+    "homogeneous": false,
+
+    "min_nb_tasks_per_job": 1,
+    "max_nb_tasks_per_job": 20,
+    
+    "min_task_duration_sec": 100,
+    "max_task_duration_sec": 150, 
+    
+    "min_dataset_size_MB": 30240, 
+    "max_dataset_size_MB": 51200,
+    
+    "replication_factor_defaults": 1,
+    
+    "compute_node_bw_MBps": 384,
+    "compute_node_latency_ms":1,
+    "min_compute_node_bw_MBps": 25,
+    "max_compute_node_bw_MBps": 1280,
+    
+    "lambda_rate":10,
+    
+    "max_replica_peer_job":1,
+    "max_replica_with_rescheduling":101,
+    "jobs_file_path":null,
+    "changing_priority": false,
+
+    "threshold": 1,
+    "max_theta_user_preferences": 1,
+    "adapting_theta": false
+    
+}
