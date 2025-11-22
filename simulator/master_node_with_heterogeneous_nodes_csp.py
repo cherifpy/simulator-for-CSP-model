@@ -7,7 +7,7 @@ from classes.job import Task, Replica, Job
 import copy
 from compute_node import ComputeNode
 
-from utils.modelCSP import onLineSchedulingUsingCSP
+from utils.modelCSP import onLineSchedulingUsingCSP,schedulingUsingJavaCSP
 
 
 logger = logging.getLogger(__name__)
@@ -106,7 +106,7 @@ class SchedulingUsingCSPOnline:
                 if len(jobs_to_reschedule) > 0:
                     
                     logger.debug("[%s] Master: Start looking for a solution. at time %s", self.env.now,self.env.now)
-                    transfers_, works_ = onLineSchedulingUsingCSP(self, jobs_to_reschedule, replicas_locations, nodes_free_time)
+                    transfers_, works_ = schedulingUsingJavaCSP(self, jobs_to_reschedule, replicas_locations, nodes_free_time)
 
                 else:
                     transfers_, works_ = {}, {}

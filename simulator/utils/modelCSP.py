@@ -1,4 +1,5 @@
 from pychoco import *
+import pandas as pd
 import random as rnd
 import math
 import numpy as np
@@ -226,3 +227,127 @@ def evaluateUtility(master_node, jobs,transfers:dict, works:dict):
     avg_utility = np.mean(list(utility_per_data.values()))
 
     return avg_utility
+
+
+def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, nodes_free_time: list):
+    """
+    Wrapper to call the Java CSP solver via command line.
+    """
+    import json
+
+    matrix = []
+    print("replicas_locations:", replicas_locations)
+    print('jobs:', [job.job_id for job in jobs])
+
+    for job in jobs:
+        if job in replicas_locations.keys():
+            matrix.append(replicas_locations[job.job_id])
+        else:
+            matrix.append([])
+
+    with open("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/replicas_locations.json", "w") as f:
+        json.dump(matrix, f)
+
+    jobs_data = []
+    for job in jobs:
+        if len([task.duration for task in job.tasks if task.status == "NotStarted"])> 0:
+            jobs_data.append({
+                "job_id": job.job_id,
+                "dataset_size": job.dataset_size,
+                "nb_tasks": len([task.duration for task in job.tasks if task.status == "NotStarted"]),
+                "task_duration": job.tasks[0].duration 
+            })
+    print(jobs_data)
+    pd.DataFrame(jobs_data).to_json("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/jobs.json", orient="records", indent=4)
+
+    nodes_list = []
+    for node_id, node in enumerate(master_node.compute_nodes):
+        nodes_list.append({
+            "node_id": node_id,
+            "bandwidth": node.bandwidth,
+            "compute_capacity": node.compute_capacity,
+            "free_time": nodes_free_time[node_id]
+        })
+    pd.DataFrame(nodes_list).to_json("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/nodes.json", orient="records", indent=4)
+
+    import subprocess
+
+    """nodes = [{"bandwidth":n.bandwidth,"cpu": n.compute_capacity, "free_time": nodes_free_time[i]} for i, n in enumerate(master_node.compute_nodes)]
+    pd.DataFrame(nodes).to_csv("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/nodes.json", index=False)"""
+    
+    # Run
+    #javac   -d bin src/main/Main.java
+    result = subprocess.run(
+        [
+            "javac", 
+            "-cp",
+            "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/lib/*",
+            "-d",
+            "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/bin",
+            "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/src/main/Main.java"
+        ],
+        capture_output=True,
+        text=True
+    )  
+    print(result.stderr)
+
+    print('Start looking for a solution')
+    #java -cp "" main.Main
+    result = subprocess.run(
+        [
+            "java", 
+            "-cp",
+            "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/bin:/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/lib/*",    
+            "main.Main"
+        ],
+        capture_output=True,
+        text=True
+    )  
+
+
+    print("results")
+
+    print(result.stderr)
+
+    transfers = {}
+    works = {}
+
+    model_output_path = "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/outputs"
+
+    #df_transfers = pd.read_csv(f"{model_output_path}/transfers.csv")
+    #df_works = pd.read_csv(f"{model_output_path}/works.csv")
+
+    works = toDict(f"{model_output_path}/works.csv")
+    transfers = toDict(f"{model_output_path}/transfers.csv")
+    
+    
+    return transfers, works # Implementation would go here
+
+
+def toDict(path_to_csv, nb_nodes=None):
+    import csv
+    # Création du dictionnaire
+    dict_info = {}
+
+    for node_id in range(nb_nodes if nb_nodes is not None else 100):
+        dict_info[f"node_{node_id}"] = []
+
+    # Lecture du CSV
+    with open(path_to_csv, newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            if 'task_index' in row.keys():
+                task_index = int(row["task_index"])
+            job_index = int(row["job_index"])
+            start_time = int(row["start_time"])
+            end_time = int(row["end_time"])
+            node_index = int(row["node_index"])
+            
+            # On remplit la structure works_exec
+            
+            if 'task_index' in row.keys():
+                dict_info[f"node_{node_index}"].append((job_index, node_index, task_index, start_time, end_time, end_time - start_time ))
+            else:
+                dict_info[f"node_{node_index}"].append((job_index, node_index, start_time, end_time, end_time - start_time ))
+
+    return dict_info

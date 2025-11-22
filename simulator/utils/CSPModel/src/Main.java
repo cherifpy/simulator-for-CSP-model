@@ -1,20 +1,29 @@
-package simulator.utils.CSPModel;
+//package simulator.utils.CSPModel;
 
 import org.chocosolver.solver.Model;
 import org.chocosolver.solver.Solver;
 import org.chocosolver.solver.variables.IntVar;
 import org.chocosolver.solver.variables.Task;
+
+import model.Scheduling;
+
 import static org.chocosolver.solver.search.strategy.Search.*;
 import org.chocosolver.solver.Solution;
 import org.chocosolver.solver.Model;
 
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.FileWriter;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
 
 
 public class Main {
 
+    
     static class WorkEntry {
         public Task task;
         public int dataIndex;
@@ -30,255 +39,265 @@ public class Main {
         }
     }
 
-    public static void main(String[] args) {
+    public static class Config {
+        public int totalNbComputeNodes;
+        public boolean sameStartingTime;
+        public double lambdaRate;
+        public String jobsFilePath;
+    }
 
+    public static class Job {
+        public int datasetSize;
+        public int nbTasks;
+        public int taskDuration;
+    }
 
-        int seed = 42;
-        Random rnd = new Random(seed);
+    public static class NodeConfig {
+        public int bandwidth;
+        public double computationNodes;
+        public double energyConsumption;
 
-        final int CPU_UNIT = 1;
-
-        // DATA
-        int nb_data = 1;
-        int[] data_sizes = new int[nb_data];
-        for (int i = 0; i < nb_data; i++) {
-            data_sizes[i] = 37315; //rnd.nextInt(40960 - 2048 + 1) + 2048; // similar to rnd.choice([2048,40960])
+        public NodeConfig(int bw, double cpu, double energy) {
+            this.bandwidth = bw;
+            this.computationNodes = cpu;
+            this.energyConsumption = energy;
         }
-        int nb_min_works = 1;
-        int nb_max_works = 20;
-        List<List<Integer>> works = new ArrayList<>();
-        for (int i = 0; i < nb_data; i++) {
-            int nbWorksForData = 4; //rnd.nextInt(nb_max_works - nb_min_works + 1) + nb_min_works;
-            List<Integer> wlist = new ArrayList<>();
-            
-            int works_duration  = 58; //rnd.nextInt(100 - 10 + 1) + 10;
-            for (int k = 0; k < nbWorksForData; k++) {
-                wlist.add(works_duration);
-            }
-            works.add(wlist);
-        }
-        
-        
-        rnd = new Random(seed);
-        // NODES
-        int nb_nodes = 20;
-        int[] bandwidths = new int[nb_nodes];
-        int[] cpus = new int[nb_nodes];
-        for (int j = 0; j < nb_nodes; j++) {
-            bandwidths[j] = rnd.nextInt(800 - 12 + 1) + 12; // [12,800]
-            cpus[j] = (rnd.nextInt(10) + 1) * CPU_UNIT;     // [1, 10]
-        }
+    }
 
-        // compute an upper bound on makespan (same idea as python)
-        long makespanLong = 0;
-        
-        long sumData = 0;
-        for (int s : data_sizes) sumData += s;
-        
-        int minBandwidth = Integer.MAX_VALUE;
-        for (int b : bandwidths) if (b < minBandwidth) minBandwidth = b;
-        System.err.println("minBandwidth="+minBandwidth);
-        makespanLong = sumData / Math.max(1, minBandwidth);
-        
-        long totalWork = 0;
-        for (List<Integer> wl : works) for (int w : wl) totalWork += w;
-        
-        int maxCpu = 0;
-        for (int c : cpus) if (c > maxCpu) maxCpu = c;
-        
-        makespanLong += totalWork * CPU_UNIT * Math.max(1, maxCpu);
-        makespanLong *= 2;
+    public static void writeWorkConfigCSV(List<Scheduling.WorkConfig> works, String path) throws Exception {
+        FileWriter writer = new FileWriter(path);
 
-        
-        int makespan = (int) Math.min(makespanLong, Integer.MAX_VALUE);
-        
-        System.out.println("Computed makespan upper bound: " + makespan);
-        // print inputs (summary)
-        System.out.println("DATA");
-        for (int i = 0; i < nb_data; i++) {
-            System.out.println(" Data " + i + ": size=" + data_sizes[i] + " MB, works=" + works.get(i));
-        }
-        System.out.println("NODES");
-        for (int j = 0; j < nb_nodes; j++) {
-            System.out.println(" Node " + j + ": bandwidth=" + bandwidths[j] + " MB/s, cpu=" + cpus[j] + " units/s");
+        // Header
+        writer.write("task_index,job_index,start_time,end_time,node_index\n");
+
+        // Rows
+        for (Scheduling.WorkConfig w : works) {
+            writer.write(
+                    w.taskindex + "," +
+                            w.jobIndex + "," +
+                            w.startTime + "," +
+                            w.endTime + "," +
+                            w.nodeIndex + "\n"
+            );
         }
 
-        // ----- MODEL -----
-        Model model = new Model("Bag of Tasks Scheduling (Java)");
+        writer.close();
+    }
 
-        // Arrays for transfer tasks and heights
-        Task[][] transferTasks = new Task[nb_nodes][nb_data];
-        IntVar[][] transferHeights = new IntVar[nb_nodes][nb_data];
+    public static List<String> readLines(String path) throws Exception {
+        List<String> lines = new ArrayList<>();
+        BufferedReader br = new BufferedReader(new FileReader(path));
+        String line;
+        while ((line = br.readLine()) != null) {
+            lines.add(line);
+        }
+        br.close();
+        return lines;
+    }
 
-        // For storing work tasks
-        List<WorkEntry> workTasks = new ArrayList<>();
+    public static List<NodeConfig> loadNodeConfigCSV(String path) throws Exception {
+        List<String> lines = readLines(path);
+        List<NodeConfig> list = new ArrayList<>();
 
-        // Create transfer tasks: one per (node, data)
-        for (int j = 0; j < nb_nodes; j++) {
-            for (int i = 0; i < nb_data; i++) {
-                
-                IntVar s = model.intVar("start_transfer_d" + i + "_n" + j, 0, makespan);
-                int d = (int) Math.ceil((double) data_sizes[i] / (double) bandwidths[j]); 
-                IntVar durationVar = model.intVar(d);
-                IntVar end = model.intVar("end_transfer_d" + i + "_n" + j, 0, makespan);
-                Task t = new Task(s, durationVar, end);
-                IntVar h = model.intVar("height_transfer_d" + i + "_n" + j, 0, 1);
-                transferTasks[j][i] = t;
-                transferHeights[j][i] = h;
-            }
+        // Skip header (line 0)
+        for (int i = 1; i < lines.size(); i++) {
+            String[] parts = lines.get(i).split(",");
+
+            int bw = Integer.parseInt(parts[0]);
+            double cpu = Double.parseDouble(parts[1]);
+            double energy = Double.parseDouble(parts[2]);
+
+            list.add(new NodeConfig(bw, cpu, energy));
         }
 
-        // Create work tasks: for each node, each data, each work
-        for (int j = 0; j < nb_nodes; j++) {
-            for (int i = 0; i < nb_data; i++) {
-                List<Integer> wl = works.get(i);
-                for (int k = 0; k < wl.size(); k++) {
-                    int w = wl.get(k);
-                    IntVar s = model.intVar("start_work_d" + i + "_w" + k + "_n" + j, 0, makespan);
-                    int d = (int) Math.ceil((double) (w) * (double) cpus[j]);
-                    IntVar durationVar = model.intVar(d);
-                    IntVar end = model.intVar("end_work_d" + i + "_w" + k + "_n" + j, 0, makespan);
-                    Task t = new Task(s, durationVar, end);
-                    IntVar h = model.intVar("height_work_d" + i + "_w" + k + "_n" + j, 0, 1);
-                    workTasks.add(new WorkEntry(t, i, j, k, h));
-                }
+        return list;
+    }
+
+    /* ============================================================
+        =================   GENERATE INFRA   ========================
+        ============================================================ */
+    public static List<NodeConfig> generateHeterogeneousInfrastructureEquilibre(Config config) {
+
+        int nbNode = config.totalNbComputeNodes;
+
+        Map<Integer, Double> proportions = Map.of(
+                0, 0.30,
+                1, 0.30,
+                2, 0.20,
+                3, 0.20
+        );
+
+        Map<Integer, Map<String, double[]>> cats = new HashMap<>();
+        cats.put(0, Map.of("VCPU", new double[]{1, 5.1}, "BW", new double[]{12, 128}));
+        cats.put(1, Map.of("VCPU", new double[]{6, 10}, "BW", new double[]{12, 128}));
+        cats.put(2, Map.of("VCPU", new double[]{1, 5.1}, "BW", new double[]{600, 800}));
+        cats.put(3, Map.of("VCPU", new double[]{6, 10}, "BW", new double[]{600, 800}));
+
+        Random random = new Random(42);
+        List<NodeConfig> nodes = new ArrayList<>();
+
+        for (int cat = 0; cat < 4; cat++) {
+            int count = (int) (proportions.get(cat) * nbNode);
+
+            for (int i = 0; i < count; i++) {
+                double vcpu = cats.get(cat).get("VCPU")[0] +
+                        random.nextDouble() * (cats.get(cat).get("VCPU")[1] - cats.get(cat).get("VCPU")[0]);
+
+                int bw = (int) (cats.get(cat).get("BW")[0] +
+                        random.nextDouble() * (cats.get(cat).get("BW")[1] - cats.get(cat).get("BW")[0]));
+
+                double energy = 0.1 + random.nextDouble() * (2.1 - 0.1);
+
+                nodes.add(new NodeConfig(bw, vcpu, energy));
             }
         }
 
-        // ----- CONSTRAINTS -----
-        // Cumulative constraints for transfers on each node (capacity = 1)
-        for (int j = 0; j < nb_nodes; j++) {
-            Task[] tasksForNode = new Task[nb_data];
-            IntVar[] heightsForNode = new IntVar[nb_data];
-            for (int i = 0; i < nb_data; i++) {
-                tasksForNode[i] = transferTasks[j][i];
-                heightsForNode[i] = transferHeights[j][i];
+        return nodes;
+    }
+
+    /* ============================================================
+       ======================   SCHEDULER   ========================
+       ============================================================ */
+
+
+    /* ============================================================
+       ========================= MAIN ==============================
+       ============================================================ */
+
+    private static final Logger logger = Logger.getLogger(Main.class.getName());
+
+    public static String toJsonArray(List<?> list) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("[\n");
+
+        for (int i = 0; i < list.size(); i++) {
+            Object val = list.get(i);
+
+            if (val instanceof Number) {
+                sb.append("  ").append(val);
+            } else {
+                sb.append("  \"").append(val.toString()).append("\"");
             }
-            // capacity = 1
-            model.cumulative(tasksForNode, heightsForNode, model.intVar(1)).post();
+
+            if (i < list.size() - 1) sb.append(",");
+            sb.append("\n");
         }
 
-        // At least one transfer per data (sum over nodes heights[j][i] >= 1)
-        for (int i = 0; i < nb_data; i++) {
-            IntVar[] arr = new IntVar[nb_nodes];
-            for (int j = 0; j < nb_nodes; j++) arr[j] = transferHeights[j][i];
-            model.sum(arr, ">=", 1).post();
-        }
+        sb.append("]");
+        return sb.toString();
+    }
 
-        // A work can start only after the corresponding transfer is finished on that node,
-        // and only if the transfer happened (height)
-        for (WorkEntry we : workTasks) {
-            Task wt = we.task;
-            int i = we.dataIndex;
-            int j = we.nodeIndex;
-            IntVar h = we.height;
-            // wt.getStart() and transferTasks[j][i].getEnd() are IntVar
-            model.arithm(wt.getStart(), ">=", transferTasks[j][i].getEnd()).post();
-            model.arithm(h, "<=", transferHeights[j][i]).post();
-        }
+    public static void writeTextFile(String path, String content) throws Exception {
+        java.nio.file.Files.write(
+                java.nio.file.Paths.get(path),
+                content.getBytes()
+        );
+    }
 
-        // Cumulative constraint on nodes for works (capacity = 1)
-        for (int j = 0; j < nb_nodes; j++) {
-            // collect tasks and heights for works whose nodeIndex == j
-            List<Task> tlist = new ArrayList<>();
-            List<IntVar> hlist = new ArrayList<>();
-            for (WorkEntry we : workTasks) {
-                if (we.nodeIndex == j) {
-                    tlist.add(we.task);
-                    hlist.add(we.height);
-                }
+
+    public static String readFile(String path) throws Exception {
+        return new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(path)));
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("Hello World!");
+        // Fichiers utilisés (vous pouvez modifier comme vous voulez)
+        String configPath = "config.json";
+
+        // Configure logging
+        Logger root = Logger.getLogger("");
+        root.setLevel(Level.INFO);
+
+        Random random = new Random(42);
+
+        // ---- Load config JSON manually ----
+        String configText = readFile(configPath);
+        JSONObject configJson = new JSONObject(configText);
+
+        Config config = new Config();
+        config.totalNbComputeNodes = configJson.getInt("total_nb_compute_nodes");
+        config.sameStartingTime = configJson.getBoolean("same_starting_time");
+        config.lambdaRate = configJson.getDouble("lambda_rate");
+
+        // ---- Load jobs JSON manually ----
+        config.jobsFilePath = "workloads/jobs-a-a-20.json";
+        String jobsText = readFile(config.jobsFilePath);
+
+        JSONArray jobsArray = new JSONArray(jobsText);
+        List<Job> jobs = new ArrayList<>();
+
+        for (int i = 0; i < jobsArray.length(); i++) {
+            JSONObject j = jobsArray.getJSONObject(i);
+
+            Job job = new Job();
+            job.datasetSize = j.getInt("dataset_size");
+            job.nbTasks = j.getInt("nb_tasks");
+            job.taskDuration = j.getInt("task_duration");
+
+            jobs.add(job);
+        }
+        int nbData = jobs.size();
+        int[] data_sizes = new int[nbData];
+        int[][] works = new int[nbData][];
+        int ii = 0;
+        for (Job job : jobs) {
+            data_sizes[ii] = job.datasetSize;
+
+            List<Integer> tasks = new ArrayList<>();
+            for (int i = 0; i < job.nbTasks; i++) {
+                tasks.add(job.taskDuration);
             }
-            if (!tlist.isEmpty()) {
-                Task[] tArr = tlist.toArray(new Task[0]);
-                IntVar[] hArr = hlist.toArray(new IntVar[0]);
-                model.cumulative(tArr, hArr, model.intVar(1)).post();
+            works[ii] = tasks.stream().mapToInt(Integer::intValue).toArray();
+            ii++;
+        }
+        // Generate infra
+        //List<NodeConfig> nodes = generateHeterogeneousInfrastructureEquilibre(config);
+        List<NodeConfig> nodes = loadNodeConfigCSV("/Users/cherif/Documents/Traveaux/CSPModel/results-using-CSP/offline-mode-arriving-50jobs/nodes_config.csv");
+        int[] bandwidths = new int[nodes.size()];
+        double[] cpus = new double[nodes.size()];
+
+        for (int i = 0; i < nodes.size(); i++) {
+            NodeConfig node = nodes.get(i);
+            bandwidths[i] = node.bandwidth;
+            cpus[i] = node.computationNodes;
+        }
+
+        int[] starting_times = new int[nodes.size()];
+        if (config.sameStartingTime) {
+            for (int i = 0; i < nodes.size(); i++) {
+                starting_times[i] = 0;
+                System.out.println("Job "+i+" Start at time: "+ starting_times[i]);
             }
+        } else {
+            double s = 0;
+            //starting_times = new int[]{40, 41, 54, 64, 118, 163, 252, 256, 277, 279, 289, 317, 318, 327, 369, 400, 410, 446, 512, 512};
+            starting_times = new int[]{40, 41, 54, 64, 118, 163, 252, 256, 277, 279, 289, 317, 318, 327, 369, 400, 410, 446, 512, 512, 578, 626, 642, 649, 775, 792, 795, 800, 875, 912, 978, 1030, 1061, 1205, 1224, 1256, 1327, 1366, 1445, 1479, 1528, 1530, 1540, 1554, 1557, 1568, 1572, 1585, 1626, 1644, 1662, 1672, 1684, 1794, 1836, 1874, 1881, 1934, 1941, 1960, 2142, 2183, 2216, 2262, 2336, 2396, 2406, 2407, 2422, 2435, 2444, 2559, 2643, 2658, 2700, 2720, 2819, 2843, 2856, 2867, 2900, 2912, 2947, 3039, 3059, 3069, 3309, 3338, 3341, 3343, 3348, 3387, 3450, 3472, 3475, 3494, 3716, 3746, 3888, 3967, 3967, 4018, 4064, 4095, 4107, 4148, 4153, 4176, 4200, 4323, 4407, 4419, 4447, 4454, 4552, 4634, 4648, 4689, 4726, 4733, 4790, 4821, 4882, 4912, 4912, 4928, 4928, 5034, 5119, 5190, 5205, 5207, 5291, 5409, 5412, 5439, 5442, 5499, 5557, 5562, 5588, 5620, 5632, 5715, 5737, 5746, 5777, 5830, 5839, 5854, 6067, 6109, 6132, 6161, 6166, 6176, 6193, 6228, 6239, 6249, 6252, 6292, 6302, 6396, 6475, 6478, 6489, 6533, 6542, 6548, 6658, 6692, 6717, 6779, 6845, 6853, 6857, 6880, 6902, 6927, 6979, 7024, 7190, 7194, 7214, 7231, 7310, 7322, 7330, 7354, 7376, 7389, 7400, 7503, 7526, 7605, 7637, 7640, 7929, 8001};
+            for(int i=0;i<starting_times.length; i++) System.out.println("Job "+i+" Start at time: "+starting_times[i]);
+
+            /*for (int i = 0; i < nbData; i++) {
+                s += -Math.log(1 - random.nextDouble()) * config.lambdaRate;
+                starting_times[i] = (int) s;
+                System.out.println("Job "+i+" Start at time: "+ starting_times[i]);
+            }*/
         }
 
-        // Each work must be done exactly once (sum of heights for a given (data i, work k) across nodes == 1)
-        for (int i = 0; i < nb_data; i++) {
-            int nbWorksForData = works.get(i).size();
-            for (int k = 0; k < nbWorksForData; k++) {
-                List<IntVar> hs = new ArrayList<>();
-                for (WorkEntry we : workTasks) {
-                    if (we.dataIndex == i && we.workIndex == k) hs.add(we.height);
-                }
-                if (!hs.isEmpty()) {
-                    IntVar[] hsArr = hs.toArray(new IntVar[0]);
-                    model.sum(hsArr, "=", 1).post();
-                }
-            }
-        }
+        Scheduling sch = new Scheduling();
+        // Call scheduler
+        Scheduling.SchedulingResult result = Scheduling.runScheduler(nodes.size(), nbData, data_sizes, works, bandwidths, cpus, starting_times);
 
-        // ----- OBJECTIVE -----
-        // makespan var and ensure it's >= all ends
-        IntVar makespanVar = model.intVar("makespan", 0, makespan);
-        // collect all work ends
-        List<IntVar> endsList = new ArrayList<>();
-        for (WorkEntry we : workTasks) {
-            endsList.add(we.task.getEnd());
-        }
-        IntVar[] endsArr = endsList.toArray(new IntVar[0]);
-        // model.max(makespanVar, endsArr).post(); -- post max constraint between makespanVar and all ends
-        model.max(makespanVar, endsArr).post();
-        // minimize makespan
-        model.setObjective(false, makespanVar); // false => MINIMIZE (see Choco API)
+        String basePath = "/Users/cherif/Documents/Traveaux/CSPModel/results-using-CSP/offline-mode-arriving-200jobs";
 
-        // SOLVER & strategy: branch first on binary placement vars (heights), then on makespan
-        
+        // ---- Pure Java JSON saving ----
+        String worksJson = toJsonArray(result.worksExec);
+        String transfersJson = toJsonArray(result.transfers);
 
-        Solver solver = model.getSolver();
+        //writeTextFile(basePath + "/works_exec_solution.json", worksJson);
+        //writeTextFile(basePath + "/transfers_solution.json", transfersJson);
 
-        // 1) Build prioritized decision var list: all transfer heights, all work heights, then makespan
-        //List<IntVar> dv = new ArrayList<>();
-        //for (int j = 0; j < nb_nodes; j++) for (int i = 0; i < nb_data; i++) dv.add(transferHeights[j][i]);
-        //for (WorkEntry we : workTasks) dv.add(we.height);
-        //dv.add(makespanVar);
-        //IntVar[] searchVars = dv.toArray(new IntVar[0]);
+        Scheduling.writeNodeConfigCSV(nodes, basePath + "/nodes.csv");
+        Scheduling.writeTransferConfigCSV(result.transfers, basePath + "/transfers_solution.csv");
+        writeWorkConfigCSV(result.worksExec, basePath + "/works_exec_solution.csv");
 
-        // 2) Set a concrete search strategy (branch on binary placement vars first).
-        //    minDomLBSearch is a good general-purpose heuristic (min domain, choose LB).
-        //solver.setSearch(minDomLBSearch(endsArr)); 
-
-      
-        //solver.clearLimits(); // remove any previous limit
-        //solver.limitTime("300s");
-
-        // 4) Call the optimization routine that searches for an optimum.
-        //findOptimalSolution(objective, Model.MINIMIZE)
-        
-        
-        // ----- SOLVER -----
-        //Solver solver = model.getSolver();
-        solver.showShortStatistics();
-
-        boolean found = false;
-        while (solver.solve()) {
-            found = true;
-            System.out.println("Solution found with makespan = " + makespanVar.getValue());
-            
-            for (int j = 0; j < nb_nodes; j++) {
-                System.out.println("Node " + j + ":");
-                for (int i = 0; i < nb_data; i++) {
-                    if (transferHeights[j][i].getValue() == 1) {
-                        System.out.println("  Data " + i + " transferred from "
-                                + transferTasks[j][i].getStart() + " to "
-                                + transferTasks[j][i].getEnd());
-                    }
-                }
-                
-                for (WorkEntry we : workTasks) {
-                    if (we.nodeIndex == j && we.height.getValue() == 1) {
-                        System.out.println("  Work " + we.workIndex + " of Data " + we.dataIndex
-                                + " processed from " + we.task.getStart() + " to " + we.task.getEnd());
-                    }
-                }
-            }
-            System.out.println();
-        }
-        if (!found) {
-            System.out.println("No solution found");
-        }
-
+        logger.info("Terminé.");
     }
 }
