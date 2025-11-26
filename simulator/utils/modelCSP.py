@@ -307,7 +307,7 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
 
     print("results")
 
-    print(result.stderr)
+    print(result.stdout)
 
     transfers = {}
     works = {}
@@ -321,7 +321,7 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     transfers = toDict(f"{model_output_path}/transfers.csv")
     
     
-    return transfers, works # Implementation would go here
+    return sortSolution(transfers, works) # Implementation would go here
 
 
 def toDict(path_to_csv, nb_nodes=None):
@@ -351,3 +351,100 @@ def toDict(path_to_csv, nb_nodes=None):
                 dict_info[f"node_{node_index}"].append((job_index, node_index, start_time, end_time, end_time - start_time ))
 
     return dict_info
+
+
+def startMinizincModel(master_node, jobs: list, replicas_locations: dict, nodes_free_time: list):
+
+    transfers_time = []
+    for node in master_node.compute_nodes:
+        transfer_time_for_node = []
+        for job in jobs:
+            transfer_time = getTransferTime(job, node.node_id, node.bandwidth, replicas_locations)
+            transfer_time_for_node.append(transfer_time)
+        transfers_time.append(transfer_time_for_node)
+    params = {
+        "nb_nodes": len(master_node.compute_nodes),
+        "nb_data": len(jobs),
+        "makespan": 221506,
+        "data_sizes": [job.dataset_size for job in jobs],
+        "work_duration": [jobs[i].tasks[0].duration for i in range(len(jobs))],
+        "bandwidths": [node.bandwidth for node in master_node.compute_nodes],
+        "cpus": [node.compute_capacity * CPU_UNIT for node in master_node.compute_nodes],
+        "transfers_time": transfers_time,
+        "nb_works": [len([task for task in job.tasks if task.status == "NotStarted"]) for job in jobs],
+        "node_free_timespan": [t for t in nodes_free_time.values()],
+    }
+
+        # ---- Convert to DZN ----
+    dzn_path = "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/minizincModel/inputs/params.dzn"
+    with open(dzn_path, "w") as d:
+        for key, value in params.items():
+            if key == "transfers_time":
+                d.write("transfers_time = [")
+                for row in value:
+                    d.write("|" + ", ".join(map(str, row)) + ",")
+                d.write("|];\n")
+            elif isinstance(value, list):
+                d.write(f"{key} = {value};\n")
+            else:
+                d.write(f"{key} = {value};\n")
+
+
+
+    import subprocess
+
+    command = [
+        "minizinc",
+        "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/minizincModel/scheduler.mzn",
+        dzn_path,
+        "--solver", "CP-SAT",
+        "--output-mode", "json",
+        "-p", "3",
+    ]
+
+    result = subprocess.run(command, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print("MiniZinc ERROR:")
+        print(result.stderr)
+    else:
+        import re
+        raw = result.stdout
+        # supprimer les lignes "-----" ou "====="
+        cleaned_results = re.sub(r'^[-=]+$', '', raw, flags=re.MULTILINE).strip()
+        # écriture dans un fichier JSON
+        with open("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/minizincModel/outputs/sortie.json", "w") as f:
+            f.write(cleaned_results)
+        #print("Résultat écrit dans sortie.json")
+
+    if result.returncode == 0:
+        transfers, works = getResults(jobs, master_node, params["nb_data"], params["nb_nodes"], params["nb_works"], "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/minizincModel/outputs/sortie.json")
+        return sortSolution(transfers, works)
+    else:
+        return {}, {}
+
+
+
+def getResults(jobs, master_node, nb_data, nb_nodes, nb_works, output_path: str):
+    import json
+
+    with open(output_path, "r") as f:
+        data = json.load(f)
+
+    transfers = {f"node_{j}": [] for j in range(nb_nodes)}
+    works = {f"node_{j}": [] for j in range(nb_nodes)}
+
+    for j in range(nb_nodes):
+        for i in range(nb_data):
+            for k in range(nb_works[i]):
+                if data["work_height"][j][i][k] == 1:
+                    works[f"node_{j}"].append((jobs[i].job_id, master_node.compute_nodes[j].node_id, k, data["work_start"][j][i][k], data["work_end"][j][i][k], data["work_end"][j][i][k] - data["work_start"][j][i][k]))
+    
+    for j in range(nb_nodes):
+        for i in range(nb_data):
+            #dict_info[f"node_{node_index}"].append((job_index, node_index, task_index, start_time, end_time, end_time - start_time ))
+            if data["transfer_height"][j][i] == 1:
+                transfers[f"node_{j}"].append((jobs[i].job_id, master_node.compute_nodes[j].node_id, data["transfer_start"][j][i], data["transfer_end"][j][i], data["transfer_end"][j][i] - data["transfer_start"][j][i]))
+
+    
+    return transfers, works

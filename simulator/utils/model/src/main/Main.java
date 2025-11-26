@@ -395,7 +395,9 @@ public class Main {
                     .setExcludeObjective(true)
                     .setExcludeViews(false);
             bb.make(model);
-            solver.limitTime("4600s");
+            int time = 600;
+            System.out.println("Starting solver with time limit: " + time + "s");
+            solver.limitTime(time + "s");
             while (solver.solve()) {
 
                 found = true;

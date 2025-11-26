@@ -12,10 +12,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from simulator import (
     simulatorForOptimalPerfsUsingCSPOnline,
     generateHeterogeneousInfrastructureEquilibre,
-
     save_results_to_csv,
     configure_logging,
-
 )
 
 from utils.parser import ArgumentParser
@@ -57,11 +55,9 @@ def main():
 
     config['jobs_file_path'] = f"workloads/jobs-{config['total_nb_jobs']}.json"
     results_destination = f"results/"
-    exp_name = "Test"
-
+    exp_name = "Test-minizinc"
     random.seed(42)
     
-
     results, nodes_config_ = simulatorForOptimalPerfsUsingCSPOnline(config=config, jobs=[], overlap=True, poisson=True, varying_load=False,nodes_config=nodes_config)
     
     save_results_to_csv(logger, results, results_destination, exp_name)

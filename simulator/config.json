@@ -1,5 +1,5 @@
 {
-    "total_nb_jobs": 50,
+    "total_nb_jobs": 20,
     
     "total_nb_compute_nodes": 100,
     "homogeneous": false,
@@ -20,7 +20,7 @@
     "min_compute_node_bw_MBps": 25,
     "max_compute_node_bw_MBps": 1280,
     
-    "lambda_rate":40,
+    "lambda_rate":10,
     
     "max_replica_peer_job":1,
     "max_replica_with_rescheduling":101,
