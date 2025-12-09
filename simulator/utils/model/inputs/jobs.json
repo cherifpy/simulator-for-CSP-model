@@ -1,74 +1,14 @@
 [
     {
-        "job_id":34,
+        "job_id":1,
         "dataset_size":2048,
-        "nb_tasks":6,
-        "task_duration":100
-    },
-    {
-        "job_id":6,
-        "dataset_size":40960,
-        "nb_tasks":1,
-        "task_duration":100
-    },
-    {
-        "job_id":11,
-        "dataset_size":40960,
-        "nb_tasks":6,
-        "task_duration":100
-    },
-    {
-        "job_id":22,
-        "dataset_size":40960,
-        "nb_tasks":5,
-        "task_duration":100
-    },
-    {
-        "job_id":23,
-        "dataset_size":40960,
-        "nb_tasks":10,
+        "nb_tasks":8,
         "task_duration":10
     },
     {
-        "job_id":25,
+        "job_id":0,
         "dataset_size":40960,
-        "nb_tasks":6,
-        "task_duration":100
-    },
-    {
-        "job_id":27,
-        "dataset_size":40960,
-        "nb_tasks":5,
-        "task_duration":100
-    },
-    {
-        "job_id":28,
-        "dataset_size":40960,
-        "nb_tasks":9,
-        "task_duration":10
-    },
-    {
-        "job_id":29,
-        "dataset_size":40960,
-        "nb_tasks":1,
-        "task_duration":10
-    },
-    {
-        "job_id":30,
-        "dataset_size":40960,
-        "nb_tasks":18,
-        "task_duration":100
-    },
-    {
-        "job_id":31,
-        "dataset_size":2048,
-        "nb_tasks":2,
-        "task_duration":10
-    },
-    {
-        "job_id":33,
-        "dataset_size":2048,
-        "nb_tasks":1,
+        "nb_tasks":4,
         "task_duration":10
     }
 ]

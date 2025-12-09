@@ -360,7 +360,7 @@ def startMinizincModel(master_node, jobs: list, replicas_locations: dict, nodes_
         transfer_time_for_node = []
         for job in jobs:
             transfer_time = getTransferTime(job, node.node_id, node.bandwidth, replicas_locations)
-            transfer_time_for_node.append(transfer_time)
+            transfer_time_for_node.append(int(transfer_time))
         transfers_time.append(transfer_time_for_node)
     params = {
         "nb_nodes": len(master_node.compute_nodes),
@@ -399,7 +399,9 @@ def startMinizincModel(master_node, jobs: list, replicas_locations: dict, nodes_
         dzn_path,
         "--solver", "CP-SAT",
         "--output-mode", "json",
-        "-p", "3",
+        "-p", "8",
+        "-i"
+        #"-t","600000",
     ]
 
     result = subprocess.run(command, capture_output=True, text=True)
@@ -410,15 +412,21 @@ def startMinizincModel(master_node, jobs: list, replicas_locations: dict, nodes_
     else:
         import re
         raw = result.stdout
-        # supprimer les lignes "-----" ou "====="
-        cleaned_results = re.sub(r'^[-=]+$', '', raw, flags=re.MULTILINE).strip()
-        # écriture dans un fichier JSON
-        with open("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/minizincModel/outputs/sortie.json", "w") as f:
-            f.write(cleaned_results)
-        #print("Résultat écrit dans sortie.json")
+        #print("MiniZinc OUTPUT:")
+        #print(raw)
+        if "=====UNKNOWN=====" not in raw :
+            # supprimer les lignes "-----" ou "====="
+            cleaned_results = re.sub(r'^[-=]+$', '', raw, flags=re.MULTILINE).strip()
+        
+            # écriture dans un fichier JSON
+            with open("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/minizincModel/outputs/sortie.json", "w") as f:
+                f.write(cleaned_results)
+            #print("Résultat écrit dans sortie.json")
 
     if result.returncode == 0:
         transfers, works = getResults(jobs, master_node, params["nb_data"], params["nb_nodes"], params["nb_works"], "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/minizincModel/outputs/sortie.json")
+        with open("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/minizincModel/outputs/sortie.json", "w") as f:
+                f.write('{}')
         return sortSolution(transfers, works)
     else:
         return {}, {}
@@ -430,7 +438,8 @@ def getResults(jobs, master_node, nb_data, nb_nodes, nb_works, output_path: str)
 
     with open(output_path, "r") as f:
         data = json.load(f)
-
+    if len(data) == 0:
+        return {}, {}
     transfers = {f"node_{j}": [] for j in range(nb_nodes)}
     works = {f"node_{j}": [] for j in range(nb_nodes)}
 
