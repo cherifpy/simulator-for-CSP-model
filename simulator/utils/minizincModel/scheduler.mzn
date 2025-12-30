@@ -10,6 +10,8 @@ int: nb_nodes;
 int: nb_data;
 int:makespan;
 
+int: factor = 1;
+
 % Data 
 array[1..nb_data] of int: data_sizes;
 %array[1..nb_data] of int: starting_times;
@@ -144,6 +146,19 @@ constraint forall(i in 1..D, k in 1..nb_works[i]) (
   sum(j in 1..N)(work_height[j,i,k]) = 1
 );
 
+array [1..D] of var bool : is_transfered_more_than_once;
+constraint forall(i in 1..D)(
+  is_transfered_more_than_once[i] = (sum(j in 1..N)(transfer_height[j,i]) > 1)
+);
+
+
+% 11. Sum of works should be greater or equal to transfer duration (Utility)
+constraint forall(j in 1..N, i in 1..D) (
+  is_transfered_more_than_once[i] ->  transfer_height[j,i] * transfer_duration(i, j) <= factor * sum(k in 1..nb_works[i])(work_height[j,i,k] * work_duration(i,j))
+%  (is_transfered_more_than_once[i] - 1) * factor * transfer_height[j,i] * transfer_duration(i, j) <= (is_transfered_more_than_once[i] - 1) * sum(k in 1..nb_works[i])(work_height[j,i,k] * work_duration(i,j))
+);
+
+
 % ============= OBJECTIVE =============
 
 % Maximum Flow Time objective
@@ -169,16 +184,21 @@ int: lbds = sum(data_sizes);
 var int : data_transfer;
 constraint data_transfer = sum(i in 1..D, j in 1..N)(transfer_height[j,i] * data_sizes[i]);
 
-% Objective: minimize maximum flow time
-constraint objective_value = max(flow_time);
-%constraint objective_value <= 852*1.05;
+
+
+% % Objective: minimize maximum flow time
+%constraint objective_value = max(flow_time);
+constraint objective_value = sum(flow_time);
+% constraint objective_value <= 852*1.05;
+
+
 solve
 ::seq_search([
+    int_search(work_height,input_order,indomain_min), 
     int_search(transfer_height, input_order,indomain_min),
     int_search(transfer_start, input_order, indomain_split),
-    int_search(work_height,input_order,indomain_min), 
     int_search(work_start, input_order, indomain_split)])
-
+    
 minimize objective_value;
 
 %minimize 
@@ -188,44 +208,6 @@ minimize objective_value;
 %data_transfer;
 %satisfy;
 
-% ============= OUTPUT =============
 
-output [
-  "=== TRANSFERS ===\n"
-] ++
-[
-  if fix(transfer_height[j,i]) = 1 then
-    "Data " ++ show(i) ++ " on Node " ++ show(j) ++ 
-    ": [" ++ show(fix(transfer_start[j,i])) ++ 
-    ", " ++ show(fix(transfer_end[j,i])) ++ "]\n"
-  else "" endif
-  | j in 1..N, i in 1..D
-] ++
-["\n=== WORKS ===\n"] ++
-[
-  if k <= nb_works[i] /\ fix(work_height[j,i,k]) = 1 then
-    "Data " ++ show(i) ++ " Work " ++ show(k) ++ " on Node " ++ show(j) ++ 
-    ": [" ++ show(fix(work_start[j,i,k])) ++ 
-    ", " ++ show(fix(work_end[j,i,k])) ++ 
-    %"," ++ show(fix(work_height[j,i,k])) ++
-    "]\n"
-  else "" endif
-  | j in 1..N, i in 1..D, k in 1..max(nb_works)
-] ++
-% [
-%   concat(
-%     [ show(fix(transfer_height[j,i])) ] 
-%     ++ [ show(fix(work_height[j,i,k])) | k in 1..max(nb_works) ]
-%   ) ++ "\n"
-%   | j in 1..N, i in 1..D
-% ] ++
-["\n=== FLOW TIMES ===\n"] ++
-[
-  "Data " ++ show(i) ++ ": " ++ show(fix(flow_time[i])) ++ 
-  %" (start: 0" ++ 
-  ", end: " ++ show(fix(completion_time[i])) ++ ")\n"
-  | i in 1..D
-] ++
-["\n=== MAX FLOW TIME ===\n", "Max Flow Time: ", show(objective_value), "\n\n" ]
-++ 
-["\n=== TOT DATA TRANSFER ===\n", "Total data transfer: ", show(data_transfer), "\n\n" ];
+
+output [ show(objective_value) ++ ";" ++ show(data_transfer) ++";\n" ]

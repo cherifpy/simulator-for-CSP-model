@@ -1,3 +1,4 @@
+import re
 from pychoco import *
 import pandas as pd
 import random as rnd
@@ -389,8 +390,6 @@ def startMinizincModel(master_node, jobs: list, replicas_locations: dict, nodes_
             else:
                 d.write(f"{key} = {value};\n")
 
-
-
     import subprocess
 
     command = [
@@ -400,37 +399,44 @@ def startMinizincModel(master_node, jobs: list, replicas_locations: dict, nodes_
         "--solver", "CP-SAT",
         "--output-mode", "json",
         "-p", "8",
-        "-i"
-        #"-t","600000",
+        "-i", 
+        "-t","600000",
     ]
 
     result = subprocess.run(command, capture_output=True, text=True)
-
     if result.returncode != 0:
         print("MiniZinc ERROR:")
         print(result.stderr)
     else:
-        import re
         raw = result.stdout
-        #print("MiniZinc OUTPUT:")
-        #print(raw)
-        if "=====UNKNOWN=====" not in raw :
-            # supprimer les lignes "-----" ou "====="
-            cleaned_results = re.sub(r'^[-=]+$', '', raw, flags=re.MULTILINE).strip()
-        
-            # écriture dans un fichier JSON
+
+        # isoler tous les blocs {...}
+        json_blocks = re.findall(r'\{[\s\S]*?\}', raw)
+
+        if not json_blocks:
+            print("Aucun bloc JSON trouvé.")
+        else:
+            # prendre la dernière solution
+            last_json = json_blocks[-1]
+
+            # écrire proprement dans le fichier
             with open("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/minizincModel/outputs/sortie.json", "w") as f:
-                f.write(cleaned_results)
-            #print("Résultat écrit dans sortie.json")
+                f.write(last_json)
 
     if result.returncode == 0:
-        transfers, works = getResults(jobs, master_node, params["nb_data"], params["nb_nodes"], params["nb_works"], "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/minizincModel/outputs/sortie.json")
-        with open("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/minizincModel/outputs/sortie.json", "w") as f:
-                f.write('{}')
-        return sortSolution(transfers, works)
-    else:
-        return {}, {}
+        transfers, works = getResults(
+            jobs, master_node, params["nb_data"],
+            params["nb_nodes"], params["nb_works"],
+            "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/minizincModel/outputs/sortie.json"
+        )
 
+        # reset du fichier
+        with open("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/minizincModel/outputs/sortie.json", "w") as f:
+            f.write('{}')
+
+        return sortSolution(transfers, works)
+
+    return {}, {}
 
 
 def getResults(jobs, master_node, nb_data, nb_nodes, nb_works, output_path: str):

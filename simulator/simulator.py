@@ -164,7 +164,53 @@ def simulatorForOptimalPerfsUsingCSPOnline(config,jobs=[], overlap = False, thre
 
     return tracker, nodes_config
 
+def generateHeterogeneousInfrastructureEquilibre(config, node_homogeneous = True, path = None):
+    """Generate a heterogeneous infrastructure with random bandwidth for each compute node."""
+    nb_node = config['total_nb_compute_nodes']
+    import csv
 
+    def extract_bandwidth_cpu(csv_path):
+        bandwidth_list = []
+        cpu_list = []
+
+        with open(csv_path, "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                bandwidth_list.append(float(row["bandwidth"]))
+                cpu_list.append(float(row["computation_nodes"]))
+
+        return bandwidth_list, cpu_list
+
+
+    if path:
+        bandwidth_list, cpu_list = extract_bandwidth_cpu(path)
+        nodes_config = [{'bandwidth': bandwidth_list[i], 'computation_nodes': cpu_list[i], 'energy_consumption': random.uniform(0.1, 2.1)} for i in range(len(bandwidth_list))]
+        return nodes_config
+
+    categories = 4 # Number of categories
+    
+    taille_categories= {
+        0: 0.35,
+        1: 0.35,
+        2: 0.1,
+        3: 0.2
+    }
+    cats = {
+        0: {"VCPU":(1, 2.1), "BW": (12,128)},
+        1: {"VCPU":(6, 10), "BW": (12,128)},
+        2: {"VCPU":(1, 2.1), "BW": (600, 800)},
+        3: {"VCPU":(6,10), "BW": (600, 800)},
+    }
+
+    nodes_config = []
+    for cat in range(categories):
+        nodes_needed = int(taille_categories[cat] * nb_node)
+        for i in range(nodes_needed):
+            vcpu = random.uniform(cats[cat]["VCPU"][0], cats[cat]["VCPU"][1])
+            bw = random.randint(cats[cat]["BW"][0], cats[cat]["BW"][1])
+            nodes_config.append({'bandwidth': bw, 'computation_nodes': vcpu, 'energy_consumption': random.uniform(0.1, 2.1)})
+
+    return nodes_config
 
 def generateHeterogeneousInfrastructure(config, node_homogeneous = True):
     """Generate a heterogeneous infrastructure with random bandwidth for each compute node."""
