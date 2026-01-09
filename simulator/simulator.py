@@ -164,6 +164,8 @@ def simulatorForOptimalPerfsUsingCSPOnline(config,jobs=[], overlap = False, thre
 
     return tracker, nodes_config
 
+
+
 def generateHeterogeneousInfrastructureEquilibre(config, node_homogeneous = True, path = None):
     """Generate a heterogeneous infrastructure with random bandwidth for each compute node."""
     nb_node = config['total_nb_compute_nodes']
@@ -182,10 +184,10 @@ def generateHeterogeneousInfrastructureEquilibre(config, node_homogeneous = True
         return bandwidth_list, cpu_list
 
 
-    if path:
-        bandwidth_list, cpu_list = extract_bandwidth_cpu(path)
-        nodes_config = [{'bandwidth': bandwidth_list[i], 'computation_nodes': cpu_list[i], 'energy_consumption': random.uniform(0.1, 2.1)} for i in range(len(bandwidth_list))]
-        return nodes_config
+    #if path:
+    bandwidth_list, cpu_list = extract_bandwidth_cpu(path)
+    nodes_config = [{'bandwidth': bandwidth_list[i], 'computation_nodes': cpu_list[i], 'energy_consumption': random.uniform(0.1, 2.1)} for i in range(len(bandwidth_list))]
+    return nodes_config
 
     categories = 4 # Number of categories
     

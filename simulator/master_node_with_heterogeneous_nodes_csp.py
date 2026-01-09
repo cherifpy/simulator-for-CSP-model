@@ -106,8 +106,10 @@ class SchedulingUsingCSPOnline:
                 if len(jobs_to_reschedule) > 0:
                     
                     logger.debug("[%s] Master: Start looking for a solution. at time %s", self.env.now,self.env.now)
-                    transfers_, works_ = startMinizincModel(self, jobs_to_reschedule, replicas_locations, nodes_free_time)
-
+                    if self._config['use_minizinc_model']:
+                        transfers_, works_ = startMinizincModel(self, jobs_to_reschedule, replicas_locations, nodes_free_time)
+                    else:
+                        transfers_, works_ = schedulingUsingJavaCSP(self, jobs_to_reschedule, replicas_locations, nodes_free_time)
                 else:
                     transfers_, works_ = {}, {}
                 

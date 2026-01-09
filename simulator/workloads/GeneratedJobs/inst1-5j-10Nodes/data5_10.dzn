@@ -8,3 +8,4 @@ cpus = [1.7033694783036721, 1.2693810391838238, 8.706797949691644, 8.36197004979
 energy_consumptions = [[]];
 nb_works = [18, 14, 3, 17, 18];
 node_free_timespan = [];
+starting_times = [10, 10, 13, 16, 29];

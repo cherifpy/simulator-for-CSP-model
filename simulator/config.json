@@ -1,7 +1,7 @@
 {
-    "total_nb_jobs": 20,
+    "total_nb_jobs":5,
     
-    "total_nb_compute_nodes": 100,
+    "total_nb_compute_nodes": 10,
     "homogeneous": false,
 
     "min_nb_tasks_per_job": 1,
@@ -20,7 +20,7 @@
     "min_compute_node_bw_MBps": 25,
     "max_compute_node_bw_MBps": 1280,
     
-    "lambda_rate":10,
+    "lambda_rate":100,
     
     "max_replica_peer_job":1,
     "max_replica_with_rescheduling":101,
@@ -29,6 +29,8 @@
 
     "threshold": 1,
     "max_theta_user_preferences": 1,
-    "adapting_theta": false
+    "adapting_theta": false,
+
+    "use_minizinc_model": false
     
 }

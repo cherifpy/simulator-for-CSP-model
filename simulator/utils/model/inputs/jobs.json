@@ -1,14 +1,20 @@
 [
     {
-        "job_id":1,
-        "dataset_size":2048,
-        "nb_tasks":8,
+        "job_id":40,
+        "dataset_size":40960,
+        "nb_tasks":5,
         "task_duration":10
     },
     {
-        "job_id":0,
+        "job_id":45,
         "dataset_size":40960,
-        "nb_tasks":4,
-        "task_duration":10
+        "nb_tasks":1,
+        "task_duration":100
+    },
+    {
+        "job_id":49,
+        "dataset_size":20480,
+        "nb_tasks":1,
+        "task_duration":80
     }
 ]

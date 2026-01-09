@@ -52,25 +52,23 @@ def main():
     """ Heterogeneous version """    
     random.seed(42)
     
-    nodes_config = generateHeterogeneousInfrastructureEquilibre(config)
+    
+    for nb_jobs, nb_nodes in [(50,100)]:# ('s','s'),('s','b'),('b','b'),('b','s') (5,10),(10,50),(20,50),(20,100),
+        config['jobs_file_path'] = f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/workloads/GeneratedJobs/instances-100/inst1-{nb_jobs}j-{nb_nodes}Nodes/jobs.json"
+        results_destination = f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/results/results-on-instances-100/inst1-{nb_jobs}j-{nb_nodes}Nodes"
+        exp_name = ""
 
-    config['jobs_file_path'] = f"workloads/jobs-{config['total_nb_jobs']}.json"
-    results_destination = f"results/"
-    exp_name = "Test-minizinc"
+        config['total_nb_jobs'] = nb_jobs
+        config['total_nb_compute_nodes'] = nb_nodes
 
-    nodes_config_save = pd.DataFrame(nodes_config)
-    
-    nodes_config_save.to_csv(f"{results_destination}/nodes_config.csv", index=False)
-    
-    random.seed(42)
-    
-    results, nodes_config_ = simulatorForOptimalPerfsUsingCSPOnline(config=config, jobs=[], overlap=True, poisson=True, varying_load=False,nodes_config=nodes_config)
-    
-    save_results_to_csv(logger, results, results_destination, exp_name)
-            
-    nodes_config_save = pd.DataFrame(nodes_config)
-    
-    nodes_config_save.to_csv(f"{results_destination}/nodes_config.csv", index=False)
+        nodes_config = generateHeterogeneousInfrastructureEquilibre(config, path=f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/workloads/GeneratedJobs/inst1-{nb_jobs}j-{nb_nodes}Nodes/infrastructure.csv")
+                    
+        random.seed(42)
+        results, nodes_config_ = simulatorForOptimalPerfsUsingCSPOnline(config=config, jobs=[], overlap=True, poisson=True, varying_load=False,nodes_config=nodes_config)
+        save_results_to_csv(logger, results, results_destination, exp_name)
+        
+        nodes_config_save = pd.DataFrame(nodes_config)
+        nodes_config_save.to_csv(f"/{results_destination}/nodes_config.csv", index=False)
 
     if args.plot_gantt:
         process = multiprocessing.Process(target=plot_gantt_chart, args=(results.events_history,config['total_nb_compute_nodes'],f'Order {0}'))
