@@ -278,6 +278,8 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     """nodes = [{"bandwidth":n.bandwidth,"cpu": n.compute_capacity, "free_time": nodes_free_time[i]} for i, n in enumerate(master_node.compute_nodes)]
     pd.DataFrame(nodes).to_csv("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/nodes.json", index=False)"""
     
+   
+
     # Run
     #javac   -d bin src/main/Main.java
     result = subprocess.run(
@@ -293,6 +295,7 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
         text=True
     )  
     
+    print(str(result.stderr))
 
     print('Start looking for a solution')
     #java -cp "" main.Main
@@ -309,7 +312,7 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
 
     print("results")
 
-    print(str(result.stdout))
+    
 
     transfers = {}
     works = {}

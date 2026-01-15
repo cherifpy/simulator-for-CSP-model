@@ -8,6 +8,8 @@ import org.chocosolver.solver.variables.IntVar;
 import static org.chocosolver.solver.search.strategy.Search.*;
 
 import gnu.trove.TIntCollection;
+import gnu.trove.list.array.TIntArrayList;
+import gnu.trove.map.hash.TIntObjectHashMap;
 import org.chocosolver.solver.Model;
 import org.chocosolver.solver.Solution;
 import org.chocosolver.solver.Solver;
@@ -47,8 +49,330 @@ import org.chocosolver.solver.variables.Task;
 import org.chocosolver.util.sort.ArraySort;
 import org.chocosolver.util.tools.ArrayUtils;
 
+import org.chocosolver.solver.Solution;
+import org.chocosolver.solver.Solver;
+import org.chocosolver.solver.constraints.Constraint;
+import org.chocosolver.solver.constraints.Propagator;
+import org.chocosolver.solver.exception.ContradictionException;
+import org.chocosolver.solver.search.limits.ICounter;
+import org.chocosolver.solver.search.loop.lns.neighbors.INeighbor;
+import org.chocosolver.solver.search.loop.move.Move;
+import org.chocosolver.solver.search.restart.GeometricalCutoff;
+import org.chocosolver.solver.search.restart.ICutoff;
+import org.chocosolver.solver.search.restart.InnerOuterCutoff;
+import org.chocosolver.solver.search.restart.LubyCutoff;
+import org.chocosolver.solver.search.strategy.decision.RootDecision;
+import org.chocosolver.solver.search.strategy.strategy.AbstractStrategy;
+import org.chocosolver.solver.variables.IntVar;
+import org.chocosolver.solver.variables.Variable;
+import org.chocosolver.solver.variables.events.IntEventType;
+import org.chocosolver.util.ESat;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 public class Main {
+
+
+    public static class MyMoveLNS implements Move {
+
+        /**
+         * the strategy required to complete the generated fragment
+         */
+        protected Move move;
+        /**
+         * IntNeighbor to used
+         */
+        protected INeighbor neighbor;
+        /**
+         * Number of solutions found so far
+         */
+        protected long solutions;
+        /**
+         * Indicates if a solution has been loaded
+         */
+        protected boolean solutionLoaded;
+        /**
+         * Indicate a restart has been triggered
+         */
+        private boolean freshRestart;
+        /**
+         * Restart counter
+         */
+        protected ICounter counter;
+        private final ICutoff restartStrategy;
+        /**
+         * For restart strategy
+         */
+        //private final long frequency;
+
+        protected PropLNS prop;
+
+        private boolean canApplyNeighborhood;
+
+        /**
+         * Create a move which defines a Large Neighborhood Search.
+         *
+         * @param move           how the subtree is explored
+         * @param neighbor       how the fragment are computed
+         * @param restartCounter when a restart should occur
+         */
+        public MyMoveLNS(Move move, INeighbor neighbor, ICounter restartCounter) {
+            this.move = move;
+            this.neighbor = neighbor;
+            this.counter = restartCounter;
+            //this.frequency = counter.getLimitValue();
+            this.restartStrategy =
+                    //new GeometricalCutoff(counter.getLimitValue(), 1.01);
+                    new InnerOuterCutoff(counter.getLimitValue(), 1.01, 1.01);
+            //new LubyCutoff(counter.getLimitValue());
+            this.solutions = 0;
+            this.freshRestart = false;
+            this.solutionLoaded = false;
+        }
+
+        @Override
+        public boolean init() {
+            neighbor.init();
+            return move.init();
+        }
+
+        /**
+         * Return false when:
+         * <ul>
+         * <li>
+         * the underlying search has no more decision to provide,
+         * </li>
+         * </ul>
+         * <p>
+         * Return true when:
+         * <ul>
+         * <li>
+         * a new neighbor is provided,
+         * </li>
+         * <li>
+         * or a new decision is provided by the underlying decision
+         * </li>
+         * <li>
+         * or the fast restart criterion is met.
+         * </li>
+         * </ul>
+         * <p>
+         * Restart when:
+         * <ul>
+         * <li>
+         * a restart criterion is met
+         * </li>
+         * </ul>
+         *
+         * @param solver SearchLoop
+         * @return true if the decision path is extended
+         */
+        @Override
+        public boolean extend(Solver solver) {
+            boolean extend;
+            // when a new fragment is needed (condition: at least one solution has been found)
+            if (solutions > 0 || solutionLoaded) {
+                if (freshRestart) {
+                    assert solver.getDecisionPath().size() == 1;
+                    assert solver.getDecisionPath().getDecision(0) == RootDecision.ROOT;
+                    solver.pushTrail();
+                    if (prop == null) {
+                        prop = new PropLNS(solver.getModel().intVar(2));
+                        new Constraint("LNS", prop).post();
+                    }
+                    solver.getEngine().propagateOnBacktrack(prop);
+                    canApplyNeighborhood = true;
+                    freshRestart = false;
+                    extend = true;
+                } else {
+                    // if fast restart is on
+                    if (counter.isMet()) {
+                        // then is restart is triggered
+                        doRestart(solver);
+                        extend = true;
+                    } else {
+                        extend = move.extend(solver);
+                    }
+                }
+            } else {
+                extend = move.extend(solver);
+            }
+            return extend;
+        }
+
+        /**
+         * Return false when :
+         * <ul>
+         * <li>
+         * move.repair(searchLoop) returns false and neighbor is complete.
+         * </li>
+         * <li>
+         * posting the cut at root node fails
+         * </li>
+         * </ul>
+         * Return true when:
+         * <ul>
+         * <li>
+         * move.repair(searchLoop) returns true,
+         * </li>
+         * <li>
+         * or move.repair(searchLoop) returns false and neighbor is not complete,
+         * </li>
+         * </ul>
+         * <p>
+         * Restart when:
+         * <ul>
+         * <li>
+         * a new solution has been found
+         * </li>
+         * <li>
+         * move.repair(searchLoop) returns false and neighbor is not complete,
+         * </li>
+         * <li>
+         * or the fast restart criterion is met
+         * </li>
+         * </ul>
+         *
+         * @param solver SearchLoop
+         * @return true if the decision path is repaired
+         */
+        @Override
+        public boolean repair(Solver solver) {
+            boolean repair = true;
+            if (solutions > 0
+                    // the second condition is only here for intiale calls, when solutions is not already up to date
+                    || solver.getSolutionCount() > 0
+                    // the third condition is true when a solution was given as input
+                    || solutionLoaded) {
+                // the detection of a new solution can only be met here
+                if (solutions < solver.getSolutionCount()) {
+                    assert solutions == solver.getSolutionCount() - 1;
+                    solutions++;
+                    solutionLoaded = false;
+                    neighbor.recordSolution();
+                    doRestart(solver);
+                    this.restartStrategy.reset();
+                }
+                // when posting the cut directly at root node fails
+                else if (freshRestart) {
+                    repair = false;
+                }
+                // the current sub-tree has been entirely explored
+                else if (!(repair = move.repair(solver))) {
+                    // but the neighbor cannot ensure completeness
+                    if (!neighbor.isSearchComplete()) {
+                        // then a restart is triggered
+                        doRestart(solver);
+                        repair = true;
+                    }
+                }
+                // or a fast restart is on
+                else if (counter.isMet()) {
+                    // then is restart is triggered
+                    doRestart(solver);
+                }
+            } else {
+                repair = move.repair(solver);
+            }
+            return repair;
+        }
+
+        /**
+         * Give an initial solution to begin with if called before executing the solving process
+         * or erase the last recorded one otherwise.
+         *
+         * @param solution a solution to record
+         * @param solver   that manages the LNS
+         */
+        public void loadFromSolution(Solution solution, Solver solver) {
+            neighbor.loadFromSolution(solution);
+            solutionLoaded = true;
+            if (solutions == 0) {
+                freshRestart = true;
+            } else {
+                doRestart(solver);
+            }
+        }
+
+        @Override
+        public void setTopDecisionPosition(int position) {
+            move.setTopDecisionPosition(position);
+        }
+
+        @Override
+        public <V extends Variable> AbstractStrategy<V> getStrategy() {
+            return move.getStrategy();
+        }
+
+        @Override
+        public <V extends Variable> void setStrategy(AbstractStrategy<V> aStrategy) {
+            move.setStrategy(aStrategy);
+        }
+
+        @Override
+        public void removeStrategy() {
+            move.removeStrategy();
+        }
+
+        /**
+         * Extend the neighbor when conditions are met and do the restart
+         *
+         * @param solver SearchLoop
+         */
+        private void doRestart(Solver solver) {
+            if (!freshRestart) {
+                neighbor.restrictLess();
+            }
+            freshRestart = true;
+            long nc = restartStrategy.getNextCutoff();
+            counter.overrideLimit(counter.currentValue() + nc);
+            //System.out.printf("nc : %d%n", nc);
+            solver.restart();
+        }
+
+        @Override
+        public List<Move> getChildMoves() {
+            return Collections.singletonList(move);
+        }
+
+        @Override
+        public void setChildMoves(List<Move> someMoves) {
+            if (someMoves.size() == 1) {
+                this.move = someMoves.get(0);
+            } else {
+                throw new UnsupportedOperationException("Only one child move can be attached to it.");
+            }
+        }
+
+        class PropLNS extends Propagator<IntVar> {
+
+            PropLNS(IntVar var) {
+                super(var);
+                this.vars = new IntVar[0];
+            }
+
+            @Override
+            public int getPropagationConditions(int vIdx) {
+                return IntEventType.VOID.getMask();
+            }
+
+            @Override
+            public void propagate(int evtmask) throws ContradictionException {
+                if (canApplyNeighborhood) {
+                    canApplyNeighborhood = false;
+                    neighbor.fixSomeVariables();
+                }
+            }
+
+            @Override
+            public ESat isEntailed() {
+                return ESat.TRUE;
+            }
+        }
+    }
 
     public class SchedulingWithDiffN {
 
@@ -130,7 +454,7 @@ public class Main {
             writer.close();
         }
 
-        public static SchedulingResult runScheduler(List<Main.Job>  jobs,int nb_nodes, int nb_data, int[] data_sizes, int[][] works, int[] bandwidths, double[] cpus, double[] starting_times, int[][] replicas_location) {
+        public static SchedulingResult runScheduler(List<Main.Job>  jobs,int nb_nodes, int nb_data, int[] data_sizes, int[][] works, int[] bandwidths, double[] cpus, double[] starting_times, int[][]  replicas_location, Model[] models, int pos, boolean solve) {
             final int CPU_UNIT = 1; // to scale cpu speeds
             // compute an upper bound on makespan (same idea as python)
             long makespanLong = 0;
@@ -335,27 +659,67 @@ public class Main {
             Solver solver = model.getSolver();
             List<TransferConfig> transfersList = new ArrayList<>();
             List<WorkConfig> worksList = new ArrayList<>();
-            //model.displayVariableOccurrences();
-            //model.displayPropagatorOccurrences();
+            model.displayVariableOccurrences();
+            model.displayPropagatorOccurrences();
 
             IntVar[] decisionVars = decisionVariables(nb_nodes, nb_data, works, jobNodes, jobStarts, transferHeights, transferTasks);
             hints(nb_nodes, nb_data, data_sizes, works, cpus, solver, jobNodes);
 
             //solver.setNoGoodRecordingFromRestarts();
+            ArraySort<?> sorter = new ArraySort<>(nb_nodes, false, true);
+            int[] cidx = ArrayUtils.array(0, nb_nodes - 1);
+            sorter.sort(cidx, nb_nodes, (i, j) -> (int) ((cpus[i] - cpus[j]) * 1000));
             solver.setSearch(
                     Search.lastConflict(
                             Search.intVarSearch(new InputOrder<>(model),
                                     new IntDomainLast(model.getSolver().defaultSolution(),
-                                            new IntDomainMin(), (i, j) -> true),
+                                            new IntValueSelector() {
+
+                                                @Override
+                                                public int selectValue(IntVar intVar) {
+                                                    if (intVar.getName().startsWith("node_work_d")) {
+                                                        int i = 0;
+                                                        while (i < nb_nodes) {
+                                                            if (intVar.contains(cidx[i])) {
+                                                                return cidx[i];
+                                                            }
+                                                            i++;
+                                                        }
+                                                    }
+                                                    return intVar.getLB();
+                                                }
+                                            }, (i, j) -> true),
                                     decisionVars), 2)
             );
-            solver.setLNS(
-                    new SequenceNeighborhood(
-                            getNeighbor1(nb_data, works,  starting_times, jobNodes, jobStarts, jobEnds)
-                            //getNeighbor0(nb_data, works, starting_times, jobNodes, jobStarts, jobEnds)
-                    ),
-                    new FailCounter(model, 50));
-            solver.setRestarts(i -> solver.getFailCount() > i, new GeometricalCutoff(600, 1.01), 50_000);
+            if (solve || pos == 1) {
+                setLNS(solver,
+                        //new AdaptiveNeighborhood(42,
+                        new SequenceNeighborhood(
+                                getNeighbor1(nb_data, works, jobNodes, jobStarts, jobEnds),
+                                getNeighbor2(nb_data, works,  jobNodes, jobStarts, jobEnds),
+                                getNeighbor3(nb_data, works,  jobNodes, jobStarts, jobEnds),
+                                getNeighbor1bis(nb_data, works,  jobNodes, jobStarts, jobEnds),
+                                getNeighbor2bis(nb_data, works,  jobNodes, jobStarts, jobEnds),
+                                getNeighbor3bis(nb_data, works,  jobNodes, jobStarts, jobEnds),
+                                getNeighbor4bis(nb_data, works,  jobNodes, jobStarts, jobEnds)
+                        ),
+                        new FailCounter(model, nb_data * nb_nodes * 100));
+            } else if (pos == 2) {
+                setLNS(solver,
+                        new SequenceNeighborhood(
+                                getNeighbor1bis(nb_data, works,  jobNodes, jobStarts, jobEnds),
+                                getNeighbor3bis(nb_data, works,  jobNodes, jobStarts, jobEnds)
+                        ),
+                        new FailCounter(model, nb_data * nb_nodes * 50));
+            } else if (pos == 3) {
+                setLNS(solver,
+                        new SequenceNeighborhood(
+                                getNeighbor1(nb_data, works, jobNodes, jobStarts, jobEnds),
+                                getNeighbor2bis(nb_data, works,  jobNodes, jobStarts, jobEnds),
+                                getNeighbor3bis(nb_data, works,  jobNodes, jobStarts, jobEnds)
+                        ),
+                        new FailCounter(model, nb_data * nb_nodes * 100));
+            }
 
             solver.limitTime("300s");
             
@@ -440,8 +804,13 @@ public class Main {
                 }
             }
         }
+        
+        public static void setLNS(Solver solver, INeighbor neighbor, ICounter restartCounter) {
+            MyMoveLNS lns = new MyMoveLNS(solver.getMove(), neighbor, restartCounter);
+            solver.setMove(lns);
+        }
 
-        private static INeighbor getNeighbor0(int nb_data, int[][] works, double[] starting_times, IntVar[][] jobNodes, IntVar[][] jobStarts, IntVar[][] jobEnds) {
+        private static INeighbor getNeighbor0(int nb_data, int[][] works, IntVar[][] jobNodes, IntVar[][] jobStarts, IntVar[][] jobEnds) {
             return new INeighbor() {
                 @Override
                 public void recordSolution() {
@@ -461,7 +830,7 @@ public class Main {
             };
         }
 
-        private static INeighbor getNeighbor1(int nb_data, int[][] works, double[] starting_times, IntVar[][] jobNodes, IntVar[][] jobStarts, IntVar[][] jobEnds) {
+        private static INeighbor getNeighbor1(int nb_data, int[][] works, IntVar[][] jobNodes, IntVar[][] jobStarts, IntVar[][] jobEnds) {
             return new INeighbor() {
                 int[][] jn;
                 int[][] sn;
@@ -496,7 +865,7 @@ public class Main {
 
                 @Override
                 public void fixSomeVariables() throws ContradictionException {
-                    for (int i = 0; i < nb_data && loops < 1000; i++) {
+                    for (int i = 0; i < nb_data /*&& loops < 1000*/; i++) {
                         int ii = imaxs[i];
                         for (int k = 0; k < works[ii].length; k++) {
                             if (i == lim) {
@@ -524,6 +893,496 @@ public class Main {
                 }
             };
         }
+
+        private static INeighbor getNeighbor2(int nb_data, int[][] works, IntVar[][] jobNodes, IntVar[][] jobStarts, IntVar[][] jobEnds) {
+            return new INeighbor() {
+                int[][] jn;
+                int[][] sn;
+                int[] maxs;
+                int[] imaxs;
+                int data = 0;
+                int work = 0;
+                final TIntObjectHashMap<TIntArrayList> mapping = new TIntObjectHashMap<>();
+                final ArraySort<?> sorter = new ArraySort<>(nb_data, false, true);
+
+
+                @Override
+                public void recordSolution() {
+                    jn = new int[nb_data][];
+                    sn = new int[nb_data][];
+                    maxs = new int[nb_data];
+                    imaxs = new int[nb_data];
+                    mapping.clear();
+                    for (int i = 0; i < nb_data; i++) {
+                        jn[i] = new int[works[i].length];
+                        sn[i] = new int[works[i].length];
+                        for (int k = 0; k < works[i].length; k++) {
+                            jn[i][k] = jobNodes[i][k].getValue();
+                            TIntArrayList list = mapping.get(i);
+                            if (list == null) {
+                                list = new TIntArrayList();
+                                mapping.put(i, list);
+                            }
+                            if (!list.contains(jn[i][k])) {
+                                list.add(jn[i][k]);
+                            }
+                            sn[i][k] = jobStarts[i][k].getValue();
+                        }
+                        final int ii = i;
+                        maxs[i] = Arrays.stream(jobEnds[i]).mapToInt(v -> v.getValue() - 0).max().getAsInt();
+                        imaxs[i] = i;
+                    }
+                    sorter.sort(imaxs, nb_data, (i, j) -> maxs[j] - maxs[i]);
+                    data = 0;
+                    work = 0;
+                }
+
+                @Override
+                public void fixSomeVariables() throws ContradictionException {
+                    boolean move = false;
+                    for (int i = 0; i < nb_data; i++) {
+                        int ii = imaxs[i];
+                        TIntArrayList values = mapping.get(ii);
+                        if (i == data) {
+                            for (int k = 0; k < works[ii].length; k++) {
+                                if (jn[ii][k] == values.get(work)) {
+                                    jobNodes[ii][k].removeValue(jn[ii][k], this);
+                                } else {
+                                    jobNodes[ii][k].instantiateTo(jn[ii][k], this);
+                                    jobStarts[ii][k].instantiateTo(sn[ii][k], this);
+                                }
+                            }
+                            work++;
+                            if (work == values.size()) {
+                                move = true;
+                            }
+                        } else {
+                            for (int k = 0; k < works[ii].length; k++) {
+                                jobNodes[ii][k].instantiateTo(jn[ii][k], this);
+                                jobStarts[ii][k].instantiateTo(sn[ii][k], this);
+                            }
+                        }
+                    }
+                    if (move) {
+                        data = (data + 1) % nb_data;
+                        work = 0;
+                    }
+                }
+
+                @Override
+                public void loadFromSolution(Solution solution) {
+
+                }
+
+                @Override
+                public void restrictLess() {
+                }
+            };
+        }
+
+        private static INeighbor getNeighbor3(int nb_data, int[][] works, IntVar[][] jobNodes, IntVar[][] jobStarts, IntVar[][] jobEnds) {
+            return new INeighbor() {
+                int[][] jn;
+                int[][] sn;
+                int[] maxs;
+                int[] imaxs;
+                int node = 0;
+                final TIntObjectHashMap<TIntArrayList> mapping = new TIntObjectHashMap<>();
+                final ArraySort<?> sorter = new ArraySort<>(nb_data, false, true);
+
+
+                @Override
+                public void recordSolution() {
+                    jn = new int[nb_data][];
+                    sn = new int[nb_data][];
+                    maxs = new int[nb_data];
+                    imaxs = new int[nb_data];
+                    mapping.clear();
+                    for (int i = 0; i < nb_data; i++) {
+                        jn[i] = new int[works[i].length];
+                        sn[i] = new int[works[i].length];
+                        for (int k = 0; k < works[i].length; k++) {
+                            jn[i][k] = jobNodes[i][k].getValue();
+                            TIntArrayList list = mapping.get(jn[i][k]);
+                            if (list == null) {
+                                list = new TIntArrayList();
+                                mapping.put(jn[i][k], list);
+                            }
+                            if (!list.contains(i)) {
+                                list.add(i);
+                            }
+                            sn[i][k] = jobStarts[i][k].getValue();
+                        }
+                        final int ii = i;
+                        maxs[i] = Arrays.stream(jobEnds[i]).mapToInt(v -> v.getValue() - 0).max().getAsInt();
+                        imaxs[i] = i;
+                    }
+                    sorter.sort(imaxs, nb_data, (i, j) -> maxs[j] - maxs[i]);
+                    node = 0;
+                }
+
+                @Override
+                public void fixSomeVariables() throws ContradictionException {
+                    TIntArrayList datas = mapping.get(mapping.keys()[node]);
+                    for (int i = 0; i < nb_data; i++) {
+                        if (datas.contains(i)) {
+                            for (int k = 0; k < works[i].length; k++) {
+                                jobNodes[i][k].removeValue(jn[i][k], this);
+                            }
+                        } else {
+                            for (int k = 0; k < works[i].length; k++) {
+                                jobNodes[i][k].instantiateTo(jn[i][k], this);
+                                //jobStarts[i][k].instantiateTo(sn[i][k], this);
+                            }
+                        }
+                    }
+                    node = (node + 1) % mapping.keys().length;
+                }
+
+                @Override
+                public void loadFromSolution(Solution solution) {
+
+                }
+
+                @Override
+                public void restrictLess() {
+                }
+            };
+        }
+
+        private static INeighbor getNeighbor4(int nb_data, int[][] works, IntVar[][] jobNodes, IntVar[][] jobStarts, IntVar[][] jobEnds) {
+            return new INeighbor() {
+                int[][] jn;
+                int[][] sn;
+                List<Integer> fixed = IntStream.range(0, nb_data).boxed().collect(Collectors.toList());
+                java.util.Random rnd = new java.util.Random(42);
+                int nbFixed;
+                int round;
+
+                @Override
+                public void recordSolution() {
+                    jn = new int[nb_data][];
+                    sn = new int[nb_data][];
+                    for (int i = 0; i < nb_data; i++) {
+                        jn[i] = new int[works[i].length];
+                        sn[i] = new int[works[i].length];
+                        for (int k = 0; k < works[i].length; k++) {
+                            jn[i][k] = jobNodes[i][k].getValue();
+                            sn[i][k] = jobStarts[i][k].getValue();
+                        }
+                    }
+                    nbFixed = nb_data - 1;
+                    round = 1;
+                }
+
+                @Override
+                public void fixSomeVariables() throws ContradictionException {
+                    Collections.shuffle(fixed, rnd);
+                    for (int i = 0; i < nbFixed; i++) {
+                        for (int k = 0; k < works[i].length; k++) {
+                            jobNodes[i][k].instantiateTo(jn[i][k], this);
+                            jobStarts[i][k].instantiateTo(sn[i][k], this);
+                        }
+                    }
+                    round++;
+                }
+
+                @Override
+                public void loadFromSolution(Solution solution) {
+
+                }
+
+                @Override
+                public void restrictLess() {
+                    if (round % 400 == 0) {
+                        nbFixed--;
+                    }
+                }
+            };
+        }
+
+        private static INeighbor getNeighbor1bis(int nb_data, int[][] works, IntVar[][] jobNodes, IntVar[][] jobStarts, IntVar[][] jobEnds) {
+            return new INeighbor() {
+                int[][] jn;
+                int[][] sn;
+                int[] maxs;
+                int[] imaxs;
+                int lim = 0;
+                final ArraySort<?> sorter = new ArraySort<>(nb_data, false, true);
+
+
+                @Override
+                public void recordSolution() {
+                    jn = new int[nb_data][];
+                    sn = new int[nb_data][];
+                    maxs = new int[nb_data];
+                    imaxs = new int[nb_data];
+                    for (int i = 0; i < nb_data; i++) {
+                        jn[i] = new int[works[i].length];
+                        sn[i] = new int[works[i].length];
+                        for (int k = 0; k < works[i].length; k++) {
+                            jn[i][k] = jobNodes[i][k].getValue();
+                            sn[i][k] = jobStarts[i][k].getValue();
+                        }
+                        final int ii = i;
+                        maxs[i] = Arrays.stream(jobEnds[i]).mapToInt(v -> v.getValue() - 0).max().getAsInt();
+                        imaxs[i] = i;
+                    }
+                    sorter.sort(imaxs, nb_data, (i, j) -> maxs[j] - maxs[i]);
+                    lim = 0;
+                }
+
+                @Override
+                public void fixSomeVariables() throws ContradictionException {
+                    //System.out.printf("1bis : %d\n", lim);
+                    for (int i = 0; i < nb_data; i++) {
+                        int ii = imaxs[i];
+                        for (int k = 0; k < works[ii].length; k++) {
+                            if (i != lim) {
+                                jobNodes[ii][k].instantiateTo(jn[ii][k], this);
+                                //jobStarts[ii][k].instantiateTo(sn[ii][k], this);
+                            }
+                        }
+                    }
+                }
+
+                @Override
+                public void loadFromSolution(Solution solution) {
+
+                }
+
+                @Override
+                public void restrictLess() {
+                    lim = (lim + 1) % nb_data;
+                }
+            };
+        }
+
+        private static INeighbor getNeighbor2bis(int nb_data, int[][] works, IntVar[][] jobNodes, IntVar[][] jobStarts, IntVar[][] jobEnds) {
+            return new INeighbor() {
+                int[][] jn;
+                int[][] sn;
+                int[] maxs;
+                int[] imaxs;
+                int data = 0;
+                int work = 0;
+                final TIntObjectHashMap<TIntArrayList> mapping = new TIntObjectHashMap<>();
+                final ArraySort<?> sorter = new ArraySort<>(nb_data, false, true);
+
+
+                @Override
+                public void recordSolution() {
+                    jn = new int[nb_data][];
+                    sn = new int[nb_data][];
+                    maxs = new int[nb_data];
+                    imaxs = new int[nb_data];
+                    mapping.clear();
+                    for (int i = 0; i < nb_data; i++) {
+                        jn[i] = new int[works[i].length];
+                        sn[i] = new int[works[i].length];
+                        for (int k = 0; k < works[i].length; k++) {
+                            jn[i][k] = jobNodes[i][k].getValue();
+                            TIntArrayList list = mapping.get(i);
+                            if (list == null) {
+                                list = new TIntArrayList();
+                                mapping.put(i, list);
+                            }
+                            if (!list.contains(jn[i][k])) {
+                                list.add(jn[i][k]);
+                            }
+                            sn[i][k] = jobStarts[i][k].getValue();
+                        }
+                        final int ii = i;
+                        maxs[i] = Arrays.stream(jobEnds[i]).mapToInt(v -> v.getValue() - 0).max().getAsInt();
+                        imaxs[i] = i;
+                    }
+                    sorter.sort(imaxs, nb_data, (i, j) -> maxs[j] - maxs[i]);
+                    data = 0;
+                    work = 0;
+                }
+
+                @Override
+                public void fixSomeVariables() throws ContradictionException {
+                    //System.out.printf("2bis : %d - %d\n", imaxs[data], work);
+                    boolean move = false;
+                    for (int i = 0; i < nb_data; i++) {
+                        int ii = imaxs[i];
+                        TIntArrayList values = mapping.get(ii);
+                        if (i == data) {
+                            for (int k = 0; k < works[ii].length; k++) {
+                                if (jn[ii][k] != values.get(work)) {
+                                    jobNodes[ii][k].instantiateTo(jn[ii][k], this);
+                                    //jobStarts[ii][k].instantiateTo(sn[ii][k], this);
+                                }
+                            }
+                            work++;
+                            if (work == values.size()) {
+                                move = true;
+                            }
+                        } else {
+                            for (int k = 0; k < works[ii].length; k++) {
+                                jobNodes[ii][k].instantiateTo(jn[ii][k], this);
+                                //jobStarts[ii][k].instantiateTo(sn[ii][k], this);
+                            }
+                        }
+                    }
+                    if (move) {
+                        data = (data + 1) % nb_data;
+                        work = 0;
+                    }
+                }
+
+                @Override
+                public void loadFromSolution(Solution solution) {
+
+                }
+
+                @Override
+                public void restrictLess() {
+                }
+            };
+        }
+
+        private static INeighbor getNeighbor3bis(int nb_data, int[][] works, IntVar[][] jobNodes, IntVar[][] jobStarts, IntVar[][] jobEnds) {
+            return new INeighbor() {
+                int[][] jn;
+                int[][] sn;
+                int[] maxs;
+                int[] imaxs;
+                int node = 0;
+                final TIntObjectHashMap<TIntArrayList> mapping = new TIntObjectHashMap<>();
+                final ArraySort<?> sorter = new ArraySort<>(nb_data, false, true);
+
+
+                @Override
+                public void recordSolution() {
+                    jn = new int[nb_data][];
+                    sn = new int[nb_data][];
+                    maxs = new int[nb_data];
+                    imaxs = new int[nb_data];
+                    mapping.clear();
+                    for (int i = 0; i < nb_data; i++) {
+                        jn[i] = new int[works[i].length];
+                        sn[i] = new int[works[i].length];
+                        for (int k = 0; k < works[i].length; k++) {
+                            jn[i][k] = jobNodes[i][k].getValue();
+                            TIntArrayList list = mapping.get(jn[i][k]);
+                            if (list == null) {
+                                list = new TIntArrayList();
+                                mapping.put(jn[i][k], list);
+                            }
+                            if (!list.contains(i)) {
+                                list.add(i);
+                            }
+                            sn[i][k] = jobStarts[i][k].getValue();
+                        }
+                        final int ii = i;
+                        maxs[i] = Arrays.stream(jobEnds[i]).mapToInt(v -> v.getValue() - 0).max().getAsInt();
+                        imaxs[i] = i;
+                    }
+                    sorter.sort(imaxs, nb_data, (i, j) -> maxs[j] - maxs[i]);
+                    node = 0;
+                }
+
+                @Override
+                public void fixSomeVariables() throws ContradictionException {
+                    //System.out.printf("3bis : %d\n", mapping.keys()[node]);
+                    TIntArrayList datas = mapping.get(mapping.keys()[node]);
+                    for (int i = 0; i < nb_data; i++) {
+                        if (!datas.contains(i)) {
+                            for (int k = 0; k < works[i].length; k++) {
+                                jobNodes[i][k].instantiateTo(jn[i][k], this);
+                                //jobStarts[i][k].instantiateTo(sn[i][k], this);
+                            }
+                        }
+                    }
+                    node = (node + 1) % mapping.keys().length;
+                }
+
+                @Override
+                public void loadFromSolution(Solution solution) {
+
+                }
+
+                @Override
+                public void restrictLess() {
+                }
+            };
+        }
+
+        private static INeighbor getNeighbor4bis(int nb_data, int[][] works, IntVar[][] jobNodes, IntVar[][] jobStarts, IntVar[][] jobEnds) {
+            return new INeighbor() {
+                int[][] jn;
+                int[][] sn;
+                int[] maxs;
+                int[] imaxs;
+                int node1 = 0;
+                int node2 = 0;
+                final TIntObjectHashMap<TIntArrayList> mapping = new TIntObjectHashMap<>();
+                final ArraySort<?> sorter = new ArraySort<>(nb_data, false, true);
+
+
+                @Override
+                public void recordSolution() {
+                    jn = new int[nb_data][];
+                    sn = new int[nb_data][];
+                    maxs = new int[nb_data];
+                    imaxs = new int[nb_data];
+                    mapping.clear();
+                    for (int i = 0; i < nb_data; i++) {
+                        jn[i] = new int[works[i].length];
+                        sn[i] = new int[works[i].length];
+                        for (int k = 0; k < works[i].length; k++) {
+                            jn[i][k] = jobNodes[i][k].getValue();
+                            TIntArrayList list = mapping.get(jn[i][k]);
+                            if (list == null) {
+                                list = new TIntArrayList();
+                                mapping.put(jn[i][k], list);
+                            }
+                            if (!list.contains(i)) {
+                                list.add(i);
+                            }
+                            sn[i][k] = jobStarts[i][k].getValue();
+                        }
+                        final int ii = i;
+                        maxs[i] = Arrays.stream(jobEnds[i]).mapToInt(v -> v.getValue() - 0).max().getAsInt();
+                        imaxs[i] = i;
+                    }
+                    sorter.sort(imaxs, nb_data, (i, j) -> maxs[j] - maxs[i]);
+                    node1 = 0;
+                    node2 = 0;
+                }
+
+                @Override
+                public void fixSomeVariables() throws ContradictionException {
+                    //System.out.printf("3bis : %d\n", mapping.keys()[node]);
+                    TIntArrayList datas1 = mapping.get(mapping.keys()[node1]);
+                    TIntArrayList datas2 = mapping.get(mapping.keys()[node2]);
+                    for (int i = 0; i < nb_data; i++) {
+                        if (!datas1.contains(i) && !datas2.contains(i)) {
+                            for (int k = 0; k < works[i].length; k++) {
+                                jobNodes[i][k].instantiateTo(jn[i][k], this);
+                                //jobStarts[i][k].instantiateTo(sn[i][k], this);
+                            }
+                        }
+                    }
+                    node2 = (node2 + 1) % mapping.keys().length;
+                    if (node2 == 0) {
+                        node1 = (node1 + 1) % mapping.keys().length;
+                    }
+                }
+
+                @Override
+                public void loadFromSolution(Solution solution) {
+
+                }
+
+                @Override
+                public void restrictLess() {
+                }
+            };
+        }
+
 
         public static double transferTime(int job_id, int node_id, int dataSize, int bandwidth, int[][] replicas_location) {
             for(int val:replicas_location[job_id]) {
@@ -730,7 +1589,7 @@ public class Main {
 
         // Call scheduler
         SchedulingWithDiffN.SchedulingResult result = SchedulingWithDiffN.runScheduler(
-            jobs,nodes.size(), nbData, data_sizes, works, bandwidths, cpus, nodes_free_time, replicas_location);
+            jobs,nodes.size(), nbData, data_sizes, works, bandwidths, cpus, nodes_free_time, replicas_location,null, 0, true);
 
         String basePath = "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/outputs/";
 

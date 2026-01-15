@@ -9,7 +9,7 @@ import model.Scheduling;
 
 import static org.chocosolver.solver.search.strategy.Search.*;
 import org.chocosolver.solver.Solution;
-import org.chocosolver.solver.Model;
+
 
 import java.io.BufferedReader;
 import java.io.FileReader;
@@ -19,6 +19,40 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+
+import gnu.trove.list.array.TIntArrayList;
+import gnu.trove.map.hash.TIntObjectHashMap;
+
+import org.chocosolver.solver.Settings;
+import org.chocosolver.solver.Solution;
+
+import org.chocosolver.solver.constraints.nary.nvalue.amnv.rules.R;
+import org.chocosolver.solver.exception.ContradictionException;
+import org.chocosolver.solver.search.limits.FailCounter;
+import org.chocosolver.solver.search.limits.ICounter;
+import org.chocosolver.solver.search.loop.lns.neighbors.AdaptiveNeighborhood;
+import org.chocosolver.solver.search.loop.lns.neighbors.INeighbor;
+import org.chocosolver.solver.search.loop.lns.neighbors.SequenceNeighborhood;
+import org.chocosolver.solver.search.loop.move.Move;
+import org.chocosolver.solver.search.loop.move.MoveLNS;
+import org.chocosolver.solver.search.restart.GeometricalCutoff;
+import org.chocosolver.solver.search.strategy.Search;
+import org.chocosolver.solver.search.strategy.selectors.values.*;
+import org.chocosolver.solver.search.strategy.selectors.variables.*;
+import org.chocosolver.solver.variables.BoolVar;
+import org.chocosolver.solver.variables.IntVar;
+import org.chocosolver.solver.variables.Task;
+import org.chocosolver.util.sort.ArraySort;
+import org.chocosolver.util.tools.ArrayUtils;
+
+import java.io.FileWriter;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Random;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 
 public class Main {

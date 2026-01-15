@@ -7,6 +7,11 @@ import argparse
 import multiprocessing
 import pandas as pd
 
+
+
+#terminal d'en haut faut attendre / OK pour lancer les exps
+#celui du bas c'est pour les exps avec un lambda 10 de ts les instance saut la plus grande
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from simulator import (
@@ -54,8 +59,8 @@ def main():
     
     
     for nb_jobs, nb_nodes in [(50,100)]:# ('s','s'),('s','b'),('b','b'),('b','s') (5,10),(10,50),(20,50),(20,100),
-        config['jobs_file_path'] = f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/workloads/GeneratedJobs/instances-100/inst1-{nb_jobs}j-{nb_nodes}Nodes/jobs.json"
-        results_destination = f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/results/results-on-instances-100/inst1-{nb_jobs}j-{nb_nodes}Nodes"
+        config['jobs_file_path'] = f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/workloads/GeneratedJobs/inst1-{nb_jobs}j-{nb_nodes}Nodes/jobs.json"
+        results_destination = f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/results/results-on-instances-10/inst1-{nb_jobs}j-{nb_nodes}Nodes"
         exp_name = ""
 
         config['total_nb_jobs'] = nb_jobs

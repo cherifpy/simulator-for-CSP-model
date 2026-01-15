@@ -20,7 +20,7 @@
     "min_compute_node_bw_MBps": 25,
     "max_compute_node_bw_MBps": 1280,
     
-    "lambda_rate":100,
+    "lambda_rate":10,
     
     "max_replica_peer_job":1,
     "max_replica_with_rescheduling":101,

@@ -315,7 +315,7 @@
         "node_id":52,
         "bandwidth":745.0,
         "compute_capacity":1.2649587517,
-        "free_time":0.0
+        "free_time":12.6495875169
     },
     {
         "node_id":53,
@@ -333,19 +333,19 @@
         "node_id":55,
         "bandwidth":721.0,
         "compute_capacity":1.1412306109,
-        "free_time":1.1412306109
+        "free_time":0.0
     },
     {
         "node_id":56,
         "bandwidth":735.0,
         "compute_capacity":1.1816396549,
-        "free_time":0.0
+        "free_time":1.1816396549
     },
     {
         "node_id":57,
         "bandwidth":654.0,
         "compute_capacity":1.4654517342,
-        "free_time":0.0
+        "free_time":1.4654517342
     },
     {
         "node_id":58,
@@ -399,7 +399,7 @@
         "node_id":66,
         "bandwidth":738.0,
         "compute_capacity":1.5339559491,
-        "free_time":0.0
+        "free_time":1.5339559491
     },
     {
         "node_id":67,
