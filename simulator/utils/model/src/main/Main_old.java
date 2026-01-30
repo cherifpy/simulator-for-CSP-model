@@ -553,13 +553,13 @@ public class Main {
     public static void main(String[] args) throws Exception {
         
         // ---- Load jobs JSON manually ----
-        String jobsText = readFile("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/jobs.json");
+        String jobsText = readFile("/home/csimohammed/simulator/simulator/utils/model/inputs/jobs.json");
 
         JSONArray jobsArray = new JSONArray(jobsText);
         List<Job> jobs = new ArrayList<>();
 
         // ---- Load nodes JSON manually --
-        String nodesText = readFile("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/nodes.json");
+        String nodesText = readFile("/home/csimohammed/simulator/simulator/utils/model/inputs/nodes.json");
         
         JSONArray nodesArray = new JSONArray(nodesText);
         List<NodeConfig> nodes = new ArrayList<>();
@@ -569,7 +569,7 @@ public class Main {
             throw new Exception("Error: missing informations");
         }
 
-        String text = readFile("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/replicas_locations.json");
+        String text = readFile("/home/csimohammed/simulator/simulator/utils/model/inputs/replicas_locations.json");
         JSONArray json = new JSONArray(text);
 
         int[][] replicas_location = new int[json.length()][];
@@ -638,7 +638,7 @@ public class Main {
         // Call scheduler
         Scheduling.SchedulingResult result = Scheduling.runScheduler(jobs,nodes.size(), nbData, data_sizes, works, bandwidths, cpus, nodes_free_time, replicas_location);
 
-        String basePath = "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/outputs/";
+        String basePath = "/home/csimohammed/simulator/simulator/utils/model/outputs/";
 
         // ---- Pure Java JSON saving ----
         String worksJson = toJsonArray(result.worksExec);

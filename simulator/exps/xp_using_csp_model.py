@@ -57,10 +57,11 @@ def main():
     """ Heterogeneous version """    
     random.seed(42)
     
+    # for grid /home/csimohammed/simulator/
     
-    for nb_jobs, nb_nodes in [(50,100)]:# ('s','s'),('s','b'),('b','b'),('b','s') (5,10),(10,50),(20,50),(20,100),
+    for nb_jobs, nb_nodes in [(10,50),(50,100)]:# ('s','s'),('s','b'),('b','b'),('b','s') (20,100),,(5,10),(10,50),(20,50),,(10,50),(20,50)
         config['jobs_file_path'] = f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/workloads/GeneratedJobs/inst1-{nb_jobs}j-{nb_nodes}Nodes/jobs.json"
-        results_destination = f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/results/results-on-instances-10/inst1-{nb_jobs}j-{nb_nodes}Nodes"
+        results_destination = f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/results/results-on-instances-{config['lambda_rate']}/inst1-{nb_jobs}j-{nb_nodes}Nodes"
         exp_name = ""
 
         config['total_nb_jobs'] = nb_jobs
