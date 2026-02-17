@@ -505,7 +505,12 @@ public class Main {
             BoolVar[][] transferHeights = new BoolVar[nb_nodes][nb_data];
 
             // Create transfer tasks: one per (node, data)
+
+            boolean free_only = false;
+            boolean use_the_node = true;
             for (int j = 0; j < nb_nodes; j++) {
+                
+
                 for (int i = 0; i < nb_data; i++) {
 
                     IntVar s = model.intVar("start_transfer_d" + i + "_n" + j, (int) starting_times[j], makespan,true);
@@ -514,7 +519,33 @@ public class Main {
                     
                     IntVar durationVar = model.intVar(d);
                     IntVar end = model.intVar("end_transfer_d" + i + "_n" + j, (int) starting_times[j] + d, makespan,true);
-                    BoolVar h = model.boolVar("height_transfer_d" + i + "_n" + j);
+                    
+                    BoolVar h;
+
+                    if(free_only){
+                        int data_to_schedule = -1;
+                        if(i!=data_to_schedule){
+                            
+                            if(d == 0){
+                                h = model.boolVar("height_transfer_d" + i + "_n" + j, true);
+                                use_the_node = false;
+                            }else{
+                                h = model.boolVar("height_transfer_d" + i + "_n" + j, false);
+                            }
+                        }else{
+                            if (use_the_node){
+                                h = model.boolVar("height_transfer_d" + i + "_n" + j);
+                            }else{
+                                h = model.boolVar("height_transfer_d" + i + "_n" + j, false);
+                            }
+                        }
+                        
+                    }else{
+                        h = model.boolVar("height_transfer_d" + i + "_n" + j);
+                    }
+                    
+                    
+                    
                     Task t = new Task(s, durationVar, end);
                     transferTasks[j][i] = t;
                     transferHeights[j][i] = h;
@@ -557,17 +588,51 @@ public class Main {
             }
 
             //  if a transfer happens, then at least one work must happen on that node for that data
+            //for (int i = 0; i < nb_data; i++) {
+            //    int[] wl = works[i];
+            //    IntVar[] counters = new IntVar[nb_nodes];
+            //    for (int j = 0; j < nb_nodes; j++) {
+            //        counters[j] = model.intVar(0, wl.length);
+            //        model.count(j, jobNodes[i], counters[j]).post();
+            //        model.reifXrelC(counters[j], ">=", 1, transferHeights[j][i]);
+            //    }
+            //    model.sum(counters, "=", wl.length).post();
+            //    for (int k = 0; k < wl.length - 1; k++) {
+            //        jobNodes[i][k].eq(jobNodes[i][k + 1]).imp(jobStarts[i][k].lt(jobStarts[i][k + 1])).post();
+            //        // very strict :
+            //        jobNodes[i][k].le(jobNodes[i][k + 1]).post();
+            //    }
+            //}
+
+            //  if a transfer happens, then at least one work must happen on that node for that data
+            int factor = 1;
             for (int i = 0; i < nb_data; i++) {
                 int[] wl = works[i];
                 IntVar[] counters = new IntVar[nb_nodes];
                 for (int j = 0; j < nb_nodes; j++) {
                     counters[j] = model.intVar(0, wl.length);
-                    model.count(j, jobNodes[i], counters[j]).post();
+                    //model.count(j, jobNodes[i], counters[j]).post();
                     model.reifXrelC(counters[j], ">=", 1, transferHeights[j][i]);
+                    // constraintes redondantes
+                    for (int k = 0; k < wl.length - 1; k++) {
+                        transferHeights[j][i].eq(0).imp(jobNodes[i][k].ne(j)).post();
+                    }
                 }
+                model.globalCardinality(jobNodes[i], ArrayUtils.array(0, nb_nodes - 1), counters, true).post();
                 model.sum(counters, "=", wl.length).post();
+                // Transfer_time <= factor * sum(execution_time)
+                for (int j = 0; j < nb_nodes && factor > 0; j++) {
+                    IntVar[] executions = new IntVar[works[i].length];
+                    for (int k = 0; k < executions.length; k++) {
+                        executions[k] = model.isEq(jobNodes[i][k], j).mul(jobDurations[i][k]).intVar();
+                    }
+                    BoolVar h = counters[j].gt(1).and(transferHeights[j][i]).boolVar();
+                    model.sum(executions, ">=", model.intView(transferTasks[j][i].getDuration().getValue() * factor, h, 0)).post();
+                    //counters[j].gt(1).imp(exe).post();
+                }
+
                 for (int k = 0; k < wl.length - 1; k++) {
-                    jobNodes[i][k].eq(jobNodes[i][k + 1]).imp(jobStarts[i][k].lt(jobStarts[i][k + 1])).post();
+                    jobNodes[i][k].eq(jobNodes[i][k + 1]).imp(jobEnds[i][k].eq(jobStarts[i][k + 1])).post();
                     // very strict :
                     jobNodes[i][k].le(jobNodes[i][k + 1]).post();
                 }
@@ -603,16 +668,16 @@ public class Main {
 
 
             // Transfer_time <= factor * sum(execution_time)
-            int factor=1;
-            for (int i = 0; i < nb_data && factor > 0; i++) {
-                for (int j = 0; j < nb_nodes; j++) {
-                    IntVar[] executions = new IntVar[works[i].length];
-                    for (int k = 0; k < executions.length; k++) {
-                        executions[k] = model.isEq(jobNodes[i][k], j).mul(jobDurations[i][k]).intVar();
-                    }
-                    model.sum(executions, ">=", transferHeights[j][i], transferTasks[j][i].getDuration().getValue() * factor).post();
-                }
-            }
+            //int factor=1;
+            //for (int i = 0; i < nb_data && factor > 0; i++) {
+            //    for (int j = 0; j < nb_nodes; j++) {
+            //        IntVar[] executions = new IntVar[works[i].length];
+            //        for (int k = 0; k < executions.length; k++) {
+            //            executions[k] = model.isEq(jobNodes[i][k], j).mul(jobDurations[i][k]).intVar();
+            //        }
+            //        model.sum(executions, ">=", transferHeights[j][i], transferTasks[j][i].getDuration().getValue() * factor).post();
+            //    }
+            //}
 
             // ----- OBJECTIVE Make span-----
             //makespan var and ensure it's >= all end
