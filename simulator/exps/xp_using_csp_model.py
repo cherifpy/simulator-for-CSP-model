@@ -8,10 +8,6 @@ import multiprocessing
 import pandas as pd
 
 
-
-#terminal d'en haut faut attendre / OK pour lancer les exps
-#celui du bas c'est pour les exps avec un lambda 10 de ts les instance saut la plus grande
-
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from simulator import (
@@ -50,24 +46,23 @@ def main():
     with open(args.config, "r", encoding="utf-8") as f:
         config = json.load(f)
 
-    # Run the simulation
-    logger.info("Simulation begins with config: %s" ,str(config))
     processes = []
     
     """ Heterogeneous version """    
     random.seed(42)
     
-    # for grid /home/csimohammed/simulator/
-    
-    for nb_jobs, nb_nodes in [(20,100)]: #(5,10),(10,50),(20,50),(20,100),(50,100) ('s','s'),('s','b'),('b','b'),('b','s') (20,100),,(5,10),(10,50),(20,50),,(10,50),(20,50)
-        config['jobs_file_path'] = f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/workloads/GeneratedJobs/inst1-{nb_jobs}j-{nb_nodes}Nodes/jobs.json"
-        results_destination = f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/results/results-on-instances-{config['lambda_rate']}/inst1-{nb_jobs}j-{nb_nodes}Nodes"
+    for nb_jobs, nb_nodes in [(10,50),(20,50),(20,100),(50,100),(100,100),]: #(5,10),(10,50),(20,50),(20,100),(50,100) ('s','s'),('s','b'),('b','b'),('b','s') (20,100),,(5,10),(10,50),(20,50),,(10,50),(20,50)
+        config['jobs_file_path'] = f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/workloads/GeneratedJobs/instances-{config['lambda_rate']}/inst1-{nb_jobs}j-{nb_nodes}Nodes/jobs.json"
+        results_destination = f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/results_node_free_time_0/results-on-instances-{config['lambda_rate']}/inst1-{nb_jobs}j-{nb_nodes}Nodes"
         exp_name = ""
 
         config['total_nb_jobs'] = nb_jobs
         config['total_nb_compute_nodes'] = nb_nodes
 
-        nodes_config = generateHeterogeneousInfrastructureEquilibre(config, path=f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/workloads/GeneratedJobs/inst1-{nb_jobs}j-{nb_nodes}Nodes/infrastructure.csv")
+        # Run the simulation
+        logger.info("Simulation begins with config: %s" ,str(config))
+
+        nodes_config = generateHeterogeneousInfrastructureEquilibre(config, path=f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/workloads/GeneratedJobs/instances-{config['lambda_rate']}/inst1-{nb_jobs}j-{nb_nodes}Nodes/infrastructure.csv")
                     
         random.seed(42)
         results, nodes_config_ = simulatorForOptimalPerfsUsingCSPOnline(config=config, jobs=[], overlap=True, poisson=True, varying_load=False,nodes_config=nodes_config)
@@ -76,7 +71,7 @@ def main():
         nodes_config_save = pd.DataFrame(nodes_config)
         nodes_config_save.to_csv(f"/{results_destination}/nodes_config.csv", index=False)
 
-    if args.plot_gantt:
+    if False: # args.plot_gantt:
         process = multiprocessing.Process(target=plot_gantt_chart, args=(results.events_history,config['total_nb_compute_nodes'],f'Order {0}'))
         processes.append(process)
         process.start()

@@ -239,13 +239,14 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     matrix = []
     print("replicas_locations:", replicas_locations)
     print('jobs:', [job.job_id for job in jobs])
-    
+    print("replicas_locations keys:", replicas_locations)
+    jobs = sorted(jobs, key=lambda x: x.job_id)
     for job in jobs:
-        if job in replicas_locations.keys():
+        if job.job_id in replicas_locations.keys():
             matrix.append(replicas_locations[job.job_id])
         else:
             matrix.append([])
-
+    print("matrix:", matrix)
     with open("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/replicas_locations.json", "w") as f:
         json.dump(matrix, f)
 
@@ -311,7 +312,7 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     )  
 
     print("results")
-
+    print(str(result.stdout))
     
 
     transfers = {}

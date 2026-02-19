@@ -516,13 +516,13 @@ public class Main {
                     IntVar s = model.intVar("start_transfer_d" + i + "_n" + j, (int) starting_times[j], makespan,true);
                     
                     int d = (int) Math.ceil(transferTime(i, j, data_sizes[i], bandwidths[j], replicas_location));
-                    
+                    System.out.println("Transfer time for data " + i + " on node " + j + ": " + d);
                     IntVar durationVar = model.intVar(d);
                     IntVar end = model.intVar("end_transfer_d" + i + "_n" + j, (int) starting_times[j] + d, makespan,true);
                     
-                    BoolVar h;
+                    BoolVar h = model.boolVar("height_transfer_d" + i + "_n" + j);
 
-                    if(free_only){
+                    /*if(free_only){
                         int data_to_schedule = -1;
                         if(i!=data_to_schedule){
                             
@@ -542,9 +542,7 @@ public class Main {
                         
                     }else{
                         h = model.boolVar("height_transfer_d" + i + "_n" + j);
-                    }
-                    
-                    
+                    }*/
                     
                     Task t = new Task(s, durationVar, end);
                     transferTasks[j][i] = t;
@@ -786,7 +784,7 @@ public class Main {
                         new FailCounter(model, nb_data * nb_nodes * 100));
             }
 
-            solver.limitTime("300s");
+            solver.limitTime("15s");
             
             boolean[] found = {false};
             solver.onSolution(() -> {
@@ -1586,6 +1584,7 @@ public class Main {
         }
 
         String text = readFile("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/replicas_locations.json");
+        
         JSONArray json = new JSONArray(text);
 
         int[][] replicas_location = new int[json.length()][];
@@ -1594,7 +1593,9 @@ public class Main {
             replicas_location[i] = new int[row.length()];
             for (int j = 0; j < row.length(); j++) {
                 replicas_location[i][j] = row.getInt(j);
+                System.out.println("Loaded replica location for job " + i + ", node " + j + ": " + row.getInt(j));
             }
+            System.out.println("Loaded replicas location for job " + i + ": " + Arrays.toString(replicas_location[i]));
         }
         
         

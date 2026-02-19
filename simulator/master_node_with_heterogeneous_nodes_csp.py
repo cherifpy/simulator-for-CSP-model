@@ -73,7 +73,6 @@ class SchedulingUsingCSPOnline:
         
         dataset_events = {}
         transfers, works = None, None        
-        block = False
 
         for node_id in range(len(self.compute_nodes)):
             self.ongoing_transfers[f'node_{node_id}'] = None
@@ -101,7 +100,7 @@ class SchedulingUsingCSPOnline:
                     here i select the jobs to reschedule 
                     In this case we only schedule a job at time + the actual running jobs 
                 """
-                jobs_to_reschedule =[self.waiting_jobs[0]] + self.getRunningJobs() 
+                jobs_to_reschedule = [self.waiting_jobs[0]] + self.getRunningJobs() 
                 
                 if len(jobs_to_reschedule) > 0:
                     
@@ -149,7 +148,12 @@ class SchedulingUsingCSPOnline:
                         if scheduling_start_time + t_start <= self.env.now:
                         
                             (job_id, _, t_start, t_end, duration) = transfers[f'node_{node_id}'].pop(0)
-                            transfer_time = transferCost(self, self.jobs[job_id].dataset_size, self.compute_nodes[node_id].bandwidth, self._config)
+
+                            transfer_time = duration
+                            #if job_id in self.replicas_locations.keys() and node_id in self.replicas_locations[job_id]:
+                            #    transfer_time = 1
+                            #else:
+                            #    transfer_time =  transferCost(self, self.jobs[job_id].dataset_size, self.compute_nodes[node_id].bandwidth, self._config)
                         
                             t_s = int(self.env.now)+1
                         
@@ -157,14 +161,14 @@ class SchedulingUsingCSPOnline:
                         
                             dataset_events[(node_id, job_id)] = self.env.event()
                         
-                            self.startTransfer(self.compute_nodes[node_id], self.jobs[job_id],dataset_events[(node_id, job_id)])
+                            self.startTransfer(self.compute_nodes[node_id], self.jobs[job_id],dataset_events[(node_id, job_id)], duration=transfer_time)
                         
                             logger.debug("[%s] Master: Transfer of job %s to node %s started.", self.env.now, job_id, node_id)
 
                 "Check if any transfer is finished"
                 if self.ongoing_transfers[f'node_{node_id}'] is not None:
                     job_id, _, t_start, t_end, duration =  self.ongoing_transfers[f'node_{node_id}']
-                    if self.env.now >=  t_start + transferCost(self,self.jobs[job_id].dataset_size, self.compute_nodes[node_id].bandwidth):
+                    if self.env.now >=  t_start + duration : #transferCost(self,self.jobs[job_id].dataset_size, self.compute_nodes[node_id].bandwidth):
                         self.ongoing_transfers[f'node_{node_id}'] = None
                             
                 if len(works[f'node_{node_id}']) > 0:
@@ -248,7 +252,7 @@ class SchedulingUsingCSPOnline:
 
 
 
-    def startTransfer(self,compute_node, job, event):
+    def startTransfer(self,compute_node, job, event, duration=None):
         self.updateRunningJobs(job)
 
         job.replicas_nodes.append(compute_node.node_id)
@@ -260,7 +264,7 @@ class SchedulingUsingCSPOnline:
         
         dataset_ready_event = event
 
-        self.env.process(self.transferData(job.job_id, job.dataset_size, compute_node,dataset_ready_event))
+        self.env.process(self.transferData(job.job_id, job.dataset_size, compute_node,dataset_ready_event, duration=duration))
         
         job.nb_replicas +=1
         job.node_referent = compute_node.node_id
@@ -298,12 +302,6 @@ class SchedulingUsingCSPOnline:
             return False
 
         return True
-    
-    def updateReplicasLocation(self, job_id, node_id):
-        if job_id in self.self.replicas_locations.keys() and node_id not in self.self.replicas_locations[job_id]:
-            self.replicas_locations[job_id].append(node_id)
-        else:
-            self.replicas_locations[job_id] = [node_id]
 
     def updateRunningJobs(self, job):
         if job.job_id not in [j.job_id for j in self.running_jobs]:
@@ -335,9 +333,11 @@ class SchedulingUsingCSPOnline:
                 nodes_free_time[node_id] = 0
         return nodes_free_time
 
-    def transferData(self, job_id, dataset_size, compute_node, dataset_ready_event,task_id= -1, send_task = False):
+    def transferData(self, job_id, dataset_size, compute_node, dataset_ready_event,task_id= -1, send_task = False, duration=None):
 
         if job_id in self.replicas_locations.keys() and compute_node.node_id in self.replicas_locations[job_id]:
+
+            logger.debug("[%s] Compute-%s: Got new dataset transfert of job %s: duration: %s, dataset_size: %s", self.env.now, compute_node.node_id, job_id, duration, dataset_size)
             dataset_ready_event.succeed()
             return
 
@@ -362,5 +362,8 @@ class SchedulingUsingCSPOnline:
             dataset_ready_event.succeed()
 
             self.tracker.log_transfer(job_id, compute_node.node_id, end_time - transfer_time, end_time, dataset_size, task_id=task_id)
-
+            
+            """for key, item in self.ongoing_transfers.items():
+                if key == f'node_{compute_node.node_id}' and item is not None and item[0] == job_id:
+                    self.replicas_locations[job_id].append(compute_node.node_id)"""
             
