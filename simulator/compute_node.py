@@ -67,6 +67,44 @@ class ComputeNode:
 
                 self.free_node = True
                 self.running_task.pop(0)
+    
+    def processTasksV2(self):
+        
+        while True:
+            self.new_task = yield self.queue.get()
+            
+            #logger.debug("[%s] Compute-%s: Got new task of job %s: duration: %s", self.env.now, self.node_id, self.new_task.job_id, self.new_task.duration)
+            #if not self.new_task: continue
+            
+            #if not self.checkForJobs(self.new_task.job_id) and self.new_task != None:
+            #yield self.env.timeout(0.01)
+            
+            #yield self.queue.put(self.new_task)
+
+            #elif self.new_task != None:
+            self.free_node = False
+
+            self.running_task.append(self.new_task)
+
+            #if not self.new_task.job_id in self.datasets:
+            #    
+            #    self.datasets.append(self.new_task.job_id)
+            yield self.new_task.dataset_ready_event
+            
+            start_time = self.env.now
+            self.new_task.status = "Started"
+            self.new_task.node= self.node_id
+            self.new_task.starting_time = start_time
+            self.master.tracker.log_task_start(self.new_task.job_id, self.new_task.task_id, self.node_id, start_time)
+
+            task_duration = self.new_task.duration*self.compute_capacity
+            yield self.env.timeout(task_duration)  # actual processing
+            end_time = self.env.now
+
+            self.master.tracker.log_task_end(self.new_task.job_id, self.new_task.task_id, self.node_id, start_time, end_time)
+
+            self.free_node = True
+            self.running_task.pop(0)
 
     def checkForJobs(self, job_id):
         if job_id not in self.datasets:

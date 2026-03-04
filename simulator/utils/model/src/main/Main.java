@@ -481,7 +481,7 @@ public class Main {
             makespanLong *= 2;
 
 
-            int makespan = 6_000;//(int) Math.min(makespanLong, Integer.MAX_VALUE);
+            int makespan = 10_000;//(int) Math.min(makespanLong, Integer.MAX_VALUE);
 
             //System.out.println("Computed makespan upper bound: " + makespan);
             // print inputs (summary)
@@ -495,11 +495,11 @@ public class Main {
             }*/
 
             // ----- MODEL -----
-            Model model = new Model("Bag of Tasks Scheduling (Java)",
-            Settings.dev()
+            Model model = new Model("Bag of Tasks Scheduling (Java)");
+            /*Settings.dev()
                     .setLCG(false)
                     .setWarnUser(true));
-
+            */    
             // Arrays for transfer tasks and heights
             Task[][] transferTasks = new Task[nb_nodes][nb_data];
             BoolVar[][] transferHeights = new BoolVar[nb_nodes][nb_data];
@@ -516,7 +516,7 @@ public class Main {
                     IntVar s = model.intVar("start_transfer_d" + i + "_n" + j, (int) starting_times[j], makespan,true);
                     
                     int d = (int) Math.ceil(transferTime(i, j, data_sizes[i], bandwidths[j], replicas_location));
-                    System.out.println("Transfer time for data " + i + " on node " + j + ": " + d);
+                    System.out.println("Transfer time for data " + i + " on node " + j + ": " + d + "starting_time: " + starting_times[j]);
                     IntVar durationVar = model.intVar(d);
                     IntVar end = model.intVar("end_transfer_d" + i + "_n" + j, (int) starting_times[j] + d, makespan,true);
                     
@@ -582,6 +582,7 @@ public class Main {
                         // A work can start only after the corresponding transfer is finished on that node,
                         model.impXrelYC(jobStarts[i][k], ">=", transferTasks[j][i].getEnd(), 0, jOnN);
                     }
+                    System.out.println("Duration variable for work " + k + " of data " + i + ": " + jobDurations[i][k]);
                 }
             }
 
@@ -603,7 +604,13 @@ public class Main {
             //}
 
             //  if a transfer happens, then at least one work must happen on that node for that data
-            int factor = 1;
+            IntVar[][] nb_transfers = new IntVar[nb_data][nb_nodes];
+            for (int i = 0; i < nb_data; i++) {
+                for (int j = 0; j < nb_nodes; j++) {
+                    nb_transfers[i][j] = transferHeights[j][i].intVar();
+                }
+            }
+            int factor = 2;
             for (int i = 0; i < nb_data; i++) {
                 int[] wl = works[i];
                 IntVar[] counters = new IntVar[nb_nodes];
@@ -624,8 +631,11 @@ public class Main {
                     for (int k = 0; k < executions.length; k++) {
                         executions[k] = model.isEq(jobNodes[i][k], j).mul(jobDurations[i][k]).intVar();
                     }
-                    BoolVar h = counters[j].gt(1).and(transferHeights[j][i]).boolVar();
-                    model.sum(executions, ">=", model.intView(transferTasks[j][i].getDuration().getValue() * factor, h, 0)).post();
+                    IntVar transfers_counter = model.intVar(0, nb_nodes);
+                    model.sum(nb_transfers[i], "=", transfers_counter).post();
+                    BoolVar h = transfers_counter.gt(1).and(transferHeights[j][i]).boolVar();
+                    int transferTime = (int) Math.ceil((double) data_sizes[i] / bandwidths[j]);
+                    model.sum(executions, ">=", model.intView(transferTime * factor, h, 0)).post();
                     //counters[j].gt(1).imp(exe).post();
                 }
 
@@ -704,10 +714,13 @@ public class Main {
                 for (int i = 0; i < nb_data; i++) {
                     IntVar end_time = model.intVar(0, makespan);
                     model.max(end_time, jobEnds[i]).post();
-                    //IntVar flow = model.intVar(0, makespan);
-                    //model.arithm(end_time, "-", flow, "=", starting_times[i]).post();
-                    IntVar flow = model.intView(1, end_time, 0 ); //-starting_times[i]
-                    all_flow_time[i] = flow;
+
+                    IntVar elapsedTime =  model.intVar(jobs.get(i).timelasped);
+                    
+                    IntVar flow = model.intVar(0, makespan);
+                    model.arithm(end_time, "+", elapsedTime, "=", flow).post();
+                    
+                    all_flow_time[i] = end_time;
                 }
                 IntVar maxFlowTime = model.intVar("max_flow_time", 0, 999_999);
                 model.max(maxFlowTime, all_flow_time).post();
@@ -722,8 +735,8 @@ public class Main {
             Solver solver = model.getSolver();
             List<TransferConfig> transfersList = new ArrayList<>();
             List<WorkConfig> worksList = new ArrayList<>();
-            model.displayVariableOccurrences();
-            model.displayPropagatorOccurrences();
+            //model.displayVariableOccurrences();
+            //model.displayPropagatorOccurrences();
 
             IntVar[] decisionVars = decisionVariables(nb_nodes, nb_data, works, jobNodes, jobStarts, transferHeights, transferTasks);
             hints(nb_nodes, nb_data, data_sizes, works, cpus, solver, jobNodes);
@@ -784,7 +797,7 @@ public class Main {
                         new FailCounter(model, nb_data * nb_nodes * 100));
             }
 
-            solver.limitTime("15s");
+            solver.limitTime("5s");
             
             boolean[] found = {false};
             solver.onSolution(() -> {
@@ -1446,7 +1459,6 @@ public class Main {
             };
         }
 
-
         public static double transferTime(int job_id, int node_id, int dataSize, int bandwidth, int[][] replicas_location) {
             for(int val:replicas_location[job_id]) {
                 if(val == node_id) {
@@ -1485,6 +1497,7 @@ public class Main {
         public int datasetSize;
         public int nbTasks;
         public int taskDuration;
+        public int timelasped;
     }
 
     public static class NodeConfig {
@@ -1604,10 +1617,11 @@ public class Main {
             JSONObject j = nodesArray.getJSONObject(i);
 
             NodeConfig node = new NodeConfig();
-            node.computationNodes = j.getInt("compute_capacity");
+            node.computationNodes = j.getFloat("compute_capacity");
             node.bandwidth = j.getInt("bandwidth");
             node.freeTime = j.getInt("free_time");
             nodes.add(node);
+            System.out.println("Loaded node " + i + ": " + node.computationNodes + " CPUs, " + node.bandwidth + " bandwidth, " + node.freeTime + " free time");
         }
 
 
@@ -1631,6 +1645,7 @@ public class Main {
             job.nbTasks = j.getInt("nb_tasks");
             job.taskDuration = j.getInt("task_duration");
             job.job_id = j.getInt("job_id");
+            job.timelasped = j.getInt("timelasped");
             jobs.add(job);
         }
         
@@ -1648,7 +1663,7 @@ public class Main {
                 tasks.add(job.taskDuration);
             }
             works[ii] = tasks.stream().mapToInt(Integer::intValue).toArray();
-            System.err.println("Loaded job " + job.job_id + " with " + job.nbTasks + " tasks.");
+            //System.out.println("Loaded job " + job.job_id + " with " + job.nbTasks + " tasks.");
             ii++;
             
         }        

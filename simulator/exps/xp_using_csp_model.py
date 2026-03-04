@@ -50,8 +50,8 @@ def main():
     
     """ Heterogeneous version """    
     random.seed(42)
-    
-    for nb_jobs, nb_nodes in [(10,50),(20,50),(20,100),(50,100),(100,100),]: #(5,10),(10,50),(20,50),(20,100),(50,100) ('s','s'),('s','b'),('b','b'),('b','s') (20,100),,(5,10),(10,50),(20,50),,(10,50),(20,50)
+    #(5,10),(20,50),(20,100),(50,100)
+    for nb_jobs, nb_nodes in [(5,10)]: #,(20,100),(50,100)(10,50),(5,10),(10,50),(20,50),(20,100),(50,100) ('s','s'),('s','b'),('b','b'),('b','s') (20,100),,(5,10),(10,50),(20,50),,(10,50),(20,50)
         config['jobs_file_path'] = f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/workloads/GeneratedJobs/instances-{config['lambda_rate']}/inst1-{nb_jobs}j-{nb_nodes}Nodes/jobs.json"
         results_destination = f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/results_node_free_time_0/results-on-instances-{config['lambda_rate']}/inst1-{nb_jobs}j-{nb_nodes}Nodes"
         exp_name = ""
@@ -71,10 +71,10 @@ def main():
         nodes_config_save = pd.DataFrame(nodes_config)
         nodes_config_save.to_csv(f"/{results_destination}/nodes_config.csv", index=False)
 
-    if False: # args.plot_gantt:
-        process = multiprocessing.Process(target=plot_gantt_chart, args=(results.events_history,config['total_nb_compute_nodes'],f'Order {0}'))
-        processes.append(process)
-        process.start()
+        if True: # args.plot_gantt:
+            process = multiprocessing.Process(target=plot_gantt_chart, args=(results.events_history,config['total_nb_compute_nodes'],f'Order {0}'))
+            processes.append(process)
+            process.start()
 
     # Wait for all processes to finish
     for process in processes:

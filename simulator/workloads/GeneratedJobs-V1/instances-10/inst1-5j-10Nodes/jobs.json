@@ -1,0 +1,47 @@
+[
+    {
+        "nb_tasks": 18,
+        "task_duration": 1,
+        "dataset_size": 20480,
+        "id_dataset": 0,
+        "arriving_time": 10.200602872748009,
+        "type_of_job": 0,
+        "job_id": 0
+    },
+    {
+        "nb_tasks": 14,
+        "task_duration": 1,
+        "dataset_size": 1024,
+        "id_dataset": 1,
+        "arriving_time": 10.453891263175398,
+        "type_of_job": 3,
+        "job_id": 1
+    },
+    {
+        "nb_tasks": 3,
+        "task_duration": 10,
+        "dataset_size": 2048,
+        "id_dataset": 2,
+        "arriving_time": 13.670131903925054,
+        "type_of_job": 3,
+        "job_id": 2
+    },
+    {
+        "nb_tasks": 17,
+        "task_duration": 80,
+        "dataset_size": 1024,
+        "id_dataset": 3,
+        "arriving_time": 16.195993760626187,
+        "type_of_job": 1,
+        "job_id": 3
+    },
+    {
+        "nb_tasks": 18,
+        "task_duration": 10,
+        "dataset_size": 40960,
+        "id_dataset": 4,
+        "arriving_time": 29.531920488707016,
+        "type_of_job": 0,
+        "job_id": 4
+    }
+]

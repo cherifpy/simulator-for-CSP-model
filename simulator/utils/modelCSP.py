@@ -230,15 +230,16 @@ def evaluateUtility(master_node, jobs,transfers:dict, works:dict):
     return avg_utility
 
 
-def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, nodes_free_time: list):
+def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, nodes_free_time: list, scheduling_start_time=None):
     """
     Wrapper to call the Java CSP solver via command line.
     """
     import json
 
     matrix = []
+    print(jobs)
     print("replicas_locations:", replicas_locations)
-    print('jobs:', [job.job_id for job in jobs])
+    print('jobs:', jobs)
     print("replicas_locations keys:", replicas_locations)
     jobs = sorted(jobs, key=lambda x: x.job_id)
     for job in jobs:
@@ -257,7 +258,8 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
                 "job_id": job.job_id,
                 "dataset_size": job.dataset_size,
                 "nb_tasks": len([task.duration for task in job.tasks if task.status == "NotStarted"]),
-                "task_duration": job.tasks[0].duration 
+                "task_duration": job.tasks[0].duration ,
+                "timelasped": int(master_node.env.now - job.arriving_time)+1
             })
     jobs_data = sorted(jobs_data, key=lambda x: x['job_id'])
     
@@ -296,9 +298,8 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
         text=True
     )  
     
-    print(str(result.stderr))
-
-    print('Start looking for a solution')
+    #print(str(result.stderr))
+    #print('Start looking for a solution')
     #java -cp "" main.Main
     result = subprocess.run(
         [
@@ -312,7 +313,7 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     )  
 
     print("results")
-    print(str(result.stdout))
+    print(str(result.stderr))
     
 
     transfers = {}
@@ -323,14 +324,13 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     #df_transfers = pd.read_csv(f"{model_output_path}/transfers.csv")
     #df_works = pd.read_csv(f"{model_output_path}/works.csv")
     job_ids = [job['job_id'] for job in jobs_data]
-    works = toDict(f"{model_output_path}/works.csv", job_list=job_ids)
-    transfers = toDict(f"{model_output_path}/transfers.csv", job_list=job_ids)
-    
+    works = toDict(f"{model_output_path}/works.csv", job_list=job_ids, time=scheduling_start_time)
+    transfers = toDict(f"{model_output_path}/transfers.csv", job_list=job_ids, time=scheduling_start_time)
     
     return sortSolution(transfers, works) # Implementation would go here
 
 
-def toDict(path_to_csv, nb_nodes=None, job_list=None):
+def toDict(path_to_csv, nb_nodes=None, job_list=None, time=None):
     import csv
     # Création du dictionnaire
     dict_info = {}
@@ -352,9 +352,9 @@ def toDict(path_to_csv, nb_nodes=None, job_list=None):
             # On remplit la structure works_exec
             
             if 'task_index' in row.keys():
-                dict_info[f"node_{node_index}"].append((job_list[job_index], node_index, task_index, start_time, end_time, end_time - start_time ))
+                dict_info[f"node_{node_index}"].append((job_list[job_index], node_index, task_index, start_time, end_time, end_time - start_time))
             else:
-                dict_info[f"node_{node_index}"].append((job_list[job_index], node_index, start_time, end_time, end_time - start_time ))
+                dict_info[f"node_{node_index}"].append((job_list[job_index], node_index, start_time, end_time, end_time - start_time))
 
     return dict_info
 

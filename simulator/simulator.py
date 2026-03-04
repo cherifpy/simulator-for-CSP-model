@@ -6,7 +6,7 @@ import simpy
 import pandas as pd
 from compute_node import ComputeNode
 from classes.job import Job
-from master_node_with_heterogeneous_nodes_csp import SchedulingUsingCSPOnline
+from master_node_with_heterogeneous_nodes_csp import SchedulingUsingCSPOnline,SchedulingUsingCSPSemiOnline
 from utils.plots import plot_gantt_chart
 from classes.tracker import Tracker
 
@@ -144,6 +144,7 @@ def simulatorForOptimalPerfsUsingCSPOnline(config,jobs=[], overlap = False, thre
                                 energy_consumption=nodes_config[i]['energy_consumption']) for i, node in enumerate(nodes_config)] 
 
     env.process(master.receiveJobs())
+    env.process(master.schedulingNewJob())
     env.process(master.scheduling())
     env.process(master.checkOnJobs())
     
