@@ -259,7 +259,8 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
                 "dataset_size": job.dataset_size,
                 "nb_tasks": len([task.duration for task in job.tasks if task.status == "NotStarted"]),
                 "task_duration": job.tasks[0].duration ,
-                "timelasped": int(master_node.env.now - job.arriving_time)+1
+                "timelasped": int(master_node.env.now - job.arriving_time)+1,
+                "job_arriving_time": job.arriving_time,
             })
     jobs_data = sorted(jobs_data, key=lambda x: x['job_id'])
     
@@ -297,9 +298,9 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
         capture_output=True,
         text=True
     )  
-    
-    #print(str(result.stderr))
-    #print('Start looking for a solution')
+    print("Compilation Error")
+    print(str(result.stderr))
+    print('Start looking for a solution')
     #java -cp "" main.Main
     result = subprocess.run(
         [
@@ -313,7 +314,7 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     )  
 
     print("results")
-    print(str(result.stderr))
+    print(str(result.stdout))
     
 
     transfers = {}
@@ -324,13 +325,13 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     #df_transfers = pd.read_csv(f"{model_output_path}/transfers.csv")
     #df_works = pd.read_csv(f"{model_output_path}/works.csv")
     job_ids = [job['job_id'] for job in jobs_data]
-    works = toDict(f"{model_output_path}/works.csv", job_list=job_ids, time=scheduling_start_time)
-    transfers = toDict(f"{model_output_path}/transfers.csv", job_list=job_ids, time=scheduling_start_time)
+    works = toDict(f"{model_output_path}/works.csv", job_list=job_ids, master_node=master_node )
+    transfers = toDict(f"{model_output_path}/transfers.csv", job_list=job_ids, master_node=master_node)
     
     return sortSolution(transfers, works) # Implementation would go here
 
 
-def toDict(path_to_csv, nb_nodes=None, job_list=None, time=None):
+def toDict(path_to_csv, nb_nodes=None, job_list=None, time=None,master_node=None):
     import csv
     # Création du dictionnaire
     dict_info = {}
@@ -350,11 +351,13 @@ def toDict(path_to_csv, nb_nodes=None, job_list=None, time=None):
             node_index = int(row["node_index"])
             
             # On remplit la structure works_exec
-            
+            now = master_node.env.now
             if 'task_index' in row.keys():
-                dict_info[f"node_{node_index}"].append((job_list[job_index], node_index, task_index, start_time, end_time, end_time - start_time))
+                dict_info[f"node_{node_index}"].append((job_list[job_index], node_index, task_index, now+start_time, now+end_time, end_time - start_time))
+                print(f"node_{node_index} - job {job_list[job_index]} - task {task_index} - start: {now+start_time} - end: {now+end_time}")
             else:
-                dict_info[f"node_{node_index}"].append((job_list[job_index], node_index, start_time, end_time, end_time - start_time))
+                dict_info[f"node_{node_index}"].append((job_list[job_index], node_index, now+start_time, now+end_time, end_time - start_time))
+                print(f"node_{node_index} - transfer {job_list[job_index]} - start: {now+start_time} - end: {now+end_time}")
 
     return dict_info
 

@@ -440,7 +440,7 @@ public class Main {
 
             // header
             writer.write("job_index,start_time,end_time,node_index\n");
-
+            //System.out.println("Transfers confidguration");
             // rows
             for (TransferConfig t : transfers) {
                 writer.write(
@@ -449,12 +449,13 @@ public class Main {
                                 t.endTime + "," +
                                 t.nodeIndex + "\n"
                 );
+                //System.out.println("Transfer for job " + t.jobIndex + " on node " + t.nodeIndex + " from " + t.startTime + " to " + t.endTime);
             }
-
+            
             writer.close();
         }
 
-        public static SchedulingResult runScheduler(List<Main.Job>  jobs,int nb_nodes, int nb_data, int[] data_sizes, int[][] works, int[] bandwidths, double[] cpus, double[] starting_times, int[][]  replicas_location, Model[] models, int pos, boolean solve) {
+        public static SchedulingResult runScheduler(List<Main.Job>  jobs,int nb_nodes, int nb_data, int[] data_sizes, int[][] works, int[] bandwidths, double[] cpus, double[] starting_times, int[][]  replicas_location, Model[] models, int pos, boolean solve, double[] job_arriving_times) {
             final int CPU_UNIT = 1; // to scale cpu speeds
             // compute an upper bound on makespan (same idea as python)
             long makespanLong = 0;
@@ -516,33 +517,13 @@ public class Main {
                     IntVar s = model.intVar("start_transfer_d" + i + "_n" + j, (int) starting_times[j], makespan,true);
                     
                     int d = (int) Math.ceil(transferTime(i, j, data_sizes[i], bandwidths[j], replicas_location));
-                    System.out.println("Transfer time for data " + i + " on node " + j + ": " + d + "starting_time: " + starting_times[j]);
+                    //System.out.println("Transfer time for data " + i + " on node " + j + ": " + d + "starting_time: " + starting_times[j]);
                     IntVar durationVar = model.intVar(d);
                     IntVar end = model.intVar("end_transfer_d" + i + "_n" + j, (int) starting_times[j] + d, makespan,true);
                     
                     BoolVar h = model.boolVar("height_transfer_d" + i + "_n" + j);
 
-                    /*if(free_only){
-                        int data_to_schedule = -1;
-                        if(i!=data_to_schedule){
-                            
-                            if(d == 0){
-                                h = model.boolVar("height_transfer_d" + i + "_n" + j, true);
-                                use_the_node = false;
-                            }else{
-                                h = model.boolVar("height_transfer_d" + i + "_n" + j, false);
-                            }
-                        }else{
-                            if (use_the_node){
-                                h = model.boolVar("height_transfer_d" + i + "_n" + j);
-                            }else{
-                                h = model.boolVar("height_transfer_d" + i + "_n" + j, false);
-                            }
-                        }
-                        
-                    }else{
-                        h = model.boolVar("height_transfer_d" + i + "_n" + j);
-                    }*/
+
                     
                     Task t = new Task(s, durationVar, end);
                     transferTasks[j][i] = t;
@@ -562,7 +543,7 @@ public class Main {
                 jobDurations[i] = new IntVar[wl.length];
                 jobEnds[i] = new IntVar[wl.length];
                 jobNodes[i] = new IntVar[wl.length];
-                System.out.println("Creating work tasks for data " + i + " with " + wl.length + " works.");
+                //System.out.println("Creating work tasks for data " + i + " with " + wl.length + " works.");
                 for (int k = 0; k < wl.length; k++) {
                     int w = wl[k];
                     jobStarts[i][k] = model.intVar("start_work_d" + i + "_w" + k, 0, makespan,true); //(int) starting_times[j]
@@ -582,26 +563,11 @@ public class Main {
                         // A work can start only after the corresponding transfer is finished on that node,
                         model.impXrelYC(jobStarts[i][k], ">=", transferTasks[j][i].getEnd(), 0, jOnN);
                     }
-                    System.out.println("Duration variable for work " + k + " of data " + i + ": " + jobDurations[i][k]);
+                    //System.out.println("Duration variable for work " + k + " of data " + i + ": " + jobDurations[i][k]);
                 }
             }
 
-            //  if a transfer happens, then at least one work must happen on that node for that data
-            //for (int i = 0; i < nb_data; i++) {
-            //    int[] wl = works[i];
-            //    IntVar[] counters = new IntVar[nb_nodes];
-            //    for (int j = 0; j < nb_nodes; j++) {
-            //        counters[j] = model.intVar(0, wl.length);
-            //        model.count(j, jobNodes[i], counters[j]).post();
-            //        model.reifXrelC(counters[j], ">=", 1, transferHeights[j][i]);
-            //    }
-            //    model.sum(counters, "=", wl.length).post();
-            //    for (int k = 0; k < wl.length - 1; k++) {
-            //        jobNodes[i][k].eq(jobNodes[i][k + 1]).imp(jobStarts[i][k].lt(jobStarts[i][k + 1])).post();
-            //        // very strict :
-            //        jobNodes[i][k].le(jobNodes[i][k + 1]).post();
-            //    }
-            //}
+
 
             //  if a transfer happens, then at least one work must happen on that node for that data
             IntVar[][] nb_transfers = new IntVar[nb_data][nb_nodes];
@@ -610,7 +576,7 @@ public class Main {
                     nb_transfers[i][j] = transferHeights[j][i].intVar();
                 }
             }
-            int factor = 2;
+            int factor = 1;
             for (int i = 0; i < nb_data; i++) {
                 int[] wl = works[i];
                 IntVar[] counters = new IntVar[nb_nodes];
@@ -694,19 +660,7 @@ public class Main {
             if (makespan_obj) {
                 /*IntVar makespanVar = model.intVar("makespan", 0, makespan);
 
-                // collect all work ends
-                IntVar[] endsArr = new IntVar[workTasks.size()];
-                int index = 0;
-                for (Main.WorkEntry we : workTasks) {
-                    endsArr[index] = model.intVar(0, we.task.getEnd().getUB());
-                    model.impXrelYC(we.task.getEnd(), "=", endsArr[index], 0, we.height.asBoolVar());
-                    model.impXrelC(endsArr[index], "=", 0, we.height.asBoolVar().not());
-                    index++;
-                }
-                //
-                new Constraint("max", new PropMax(endsArr, makespanVar)).post();
-                //model.max(makespanVar, endsArr).post();// -- post max constraint between makespanVar and all ends
-                // minimize makespan
+                
                 model.setObjective(false, makespanVar); // false => MINIMIZE (see Choco API)*/
             } else {
 
@@ -797,7 +751,7 @@ public class Main {
                         new FailCounter(model, nb_data * nb_nodes * 100));
             }
 
-            solver.limitTime("5s");
+            solver.limitTime("120s");
             
             boolean[] found = {false};
             solver.onSolution(() -> {
@@ -1498,6 +1452,7 @@ public class Main {
         public int nbTasks;
         public int taskDuration;
         public int timelasped;
+        public double job_arriving_time;
     }
 
     public static class NodeConfig {
@@ -1519,7 +1474,7 @@ public class Main {
 
         // Header
         writer.write("task_index,job_index,start_time,end_time,node_index\n");
-
+        //System.out.println("Writing work configuration ");
         // Rows
         for (SchedulingWithDiffN.WorkConfig w : works) {
             writer.write(
@@ -1529,6 +1484,7 @@ public class Main {
                             w.endTime + "," +
                             w.nodeIndex + "\n"
             );
+            //System.out.println("Written work: task " + w.taskindex + " of job " + w.jobIndex + " on node " + w.nodeIndex + " from " + w.startTime + " to " + w.endTime);
         }
 
         writer.close();
@@ -1606,9 +1562,9 @@ public class Main {
             replicas_location[i] = new int[row.length()];
             for (int j = 0; j < row.length(); j++) {
                 replicas_location[i][j] = row.getInt(j);
-                System.out.println("Loaded replica location for job " + i + ", node " + j + ": " + row.getInt(j));
+                //System.out.println("Loaded replica location for job " + i + ", node " + j + ": " + row.getInt(j));
             }
-            System.out.println("Loaded replicas location for job " + i + ": " + Arrays.toString(replicas_location[i]));
+            //System.out.println("Loaded replicas location for job " + i + ": " + Arrays.toString(replicas_location[i]));
         }
         
         
@@ -1621,14 +1577,14 @@ public class Main {
             node.bandwidth = j.getInt("bandwidth");
             node.freeTime = j.getInt("free_time");
             nodes.add(node);
-            System.out.println("Loaded node " + i + ": " + node.computationNodes + " CPUs, " + node.bandwidth + " bandwidth, " + node.freeTime + " free time");
+            //System.out.println("Loaded node " + i + ": " + node.computationNodes + " CPUs, " + node.bandwidth + " bandwidth, " + node.freeTime + " free time");
         }
 
 
         int[] bandwidths = new int[nodes.size()];
         double[] cpus = new double[nodes.size()];
         double[] nodes_free_time = new double[nodes.size()];
-
+        double[] jobs_arrival_time = new double[jobsArray.length()];
         
         for (int i = 0; i < nodes.size(); i++) {
             NodeConfig node = nodes.get(i);
@@ -1646,7 +1602,9 @@ public class Main {
             job.taskDuration = j.getInt("task_duration");
             job.job_id = j.getInt("job_id");
             job.timelasped = j.getInt("timelasped");
+            job.job_arriving_time = j.getFloat("job_arriving_time");
             jobs.add(job);
+            jobs_arrival_time[i] = job.job_arriving_time;
         }
         
                 
@@ -1670,7 +1628,7 @@ public class Main {
 
         // Call scheduler
         SchedulingWithDiffN.SchedulingResult result = SchedulingWithDiffN.runScheduler(
-            jobs,nodes.size(), nbData, data_sizes, works, bandwidths, cpus, nodes_free_time, replicas_location,null, 0, true);
+            jobs,nodes.size(), nbData, data_sizes, works, bandwidths, cpus, nodes_free_time, replicas_location,null, 0, true,null);
 
         String basePath = "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/outputs/";
 

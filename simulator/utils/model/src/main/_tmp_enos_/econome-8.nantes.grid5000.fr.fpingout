@@ -1,0 +1,19 @@
+172.16.192.9  : 200 200 200 200 200 200 200 200 200 200
+172.16.192.8  : 0.041 0.032 0.035 0.032 0.037 0.033 0.040 0.032 0.034 0.033
+172.16.192.20 : 200 200 200 200 200 200 200 200 200 200
+
+       3 targets
+       3 alive
+       0 unreachable
+       0 unknown addresses
+
+       0 timeouts (waiting for response)
+      30 ICMP Echos sent
+      30 ICMP Echo Replies received
+       0 other ICMP received
+
+ 0.032 ms (min round trip time)
+ 134 ms (avg round trip time)
+ 200 ms (max round trip time)
+        9.221 sec (elapsed real time)
+

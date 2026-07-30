@@ -58,6 +58,12 @@ class SchedulingUsingCSPOnline:
         logging.debug(f"Master node with {self.nb_nodes} compute nodes started")
 
     def receiveJobs(self,):
+        self.ongoing_transfers = {}
+        self.ongoing_works = {}  
+        
+        for node_id in range(len(self.compute_nodes)):
+            self.ongoing_transfers[f'node_{node_id}'] = None
+            self.ongoing_works[f'node_{node_id}'] = None     
         while True:
             logger.debug("[%s] Master: Waiting for new job", self.env.now)
             new_job = yield self.queue.get()
@@ -77,7 +83,6 @@ class SchedulingUsingCSPOnline:
                 if finished:
                     break
     
-
     def schedulingNewJob(self):
            
         while True:
@@ -121,15 +126,13 @@ class SchedulingUsingCSPOnline:
                         if key in transfers_.keys() and len(transfers_[key]) > 0:
                             for k in range(len(transfers_[key])):
                                 (job_id, _, t_start, t_end, duration) = transfers_[key][k]
-                                t_start += t_now
-                                t_end += t_now
+                                
                                 self.transfers[key].append((job_id, _, t_start, t_end, duration))
                             
                             if len(works_[key]) > 0:
                                 for k in range(len(works_[key])):
                                     (job_id, _, k, t_start, t_end, duration) = works_[key][k]
-                                    t_start += t_now
-                                    t_end += t_now
+                                    
                                     self.works[key].append((job_id, _, k, t_start, t_end, duration))
                     """
                         # remove the scheduled job from the waiting list
@@ -138,12 +141,12 @@ class SchedulingUsingCSPOnline:
                         if len(self.waiting_jobs) > 0:
                             self.waiting_jobs.pop(0)
 
-                    self.ongoing_transfers = {}
-                    self.ongoing_works = {}  
-
-                    for node_id in range(len(self.compute_nodes)):
-                        self.ongoing_transfers[f'node_{node_id}'] = None
-                        self.ongoing_works[f'node_{node_id}'] = None              
+                    #self.ongoing_transfers = {}
+                    #self.ongoing_works = {}  
+                    #
+                    #for node_id in range(len(self.compute_nodes)):
+                    #    self.ongoing_transfers[f'node_{node_id}'] = None
+                    #    self.ongoing_works[f'node_{node_id}'] = None              
                     
                     """
                     for node_id in range(len(self.compute_nodes)):
@@ -341,39 +344,55 @@ class SchedulingUsingCSPOnline:
         if job.job_id not in [j.job_id for j in self.running_jobs]:
             self.running_jobs.append(job)
 
+    #def nodesFreeTime(self, ongoing_transfers, ongoing_works, transfers, works, job, first = False):
     def nodesFreeTime(self, ongoing_transfers, ongoing_works):
+        
         nodes_free_time = {node_id: 0 for node_id in range(len(self.compute_nodes))}
-        #print("Free nodes at time ", self.env.now, "")
+        transfer_node_free_time = {node_id: 0 for node_id in range(len(self.compute_nodes))}        
+        #print("nodes free at time ", self.env.now, " For job ", job.job_id)  
+        for_first = []
+        
+        #print("Node free time for job ", job.job_id, " at time ", self.env.now)
+        
         for node_id in range(len(self.compute_nodes)):
-
+            
             if f'node_{node_id}' in ongoing_transfers.keys() and ongoing_transfers[f'node_{node_id}'] is not None:
-                _, node_id, t_start, _, duration =  ongoing_transfers[f'node_{node_id}']    
-                nodes_free_time[node_id] += int(t_start + duration - self.env.now)
-                
+                t_job_id, node_id, _, t_end, duration =  ongoing_transfers[f'node_{node_id}'] 
+                nodes_free_time[node_id] = int(t_end - self.env.now)+1
+                #transfer_node_free_time[node_id] = int(t_end - self.env.now)
+                if nodes_free_time[node_id] < 0: print("Allleeeeerrttt negativeeee S1")
+
+
             if f'node_{node_id}' in ongoing_works.keys() and ongoing_works[f'node_{node_id}'] is not None:
-                
-                job_id, node_id, k, t_start, _, duration =  ongoing_works[f'node_{node_id}']
+                job_id, node_id, k, t_start, t_end, duration =  ongoing_works[f'node_{node_id}']
                 
                 task = self.jobs[job_id].tasks[k]
+
                 if task.status == "Started":
                     execution_time = task.duration * self.compute_nodes[node_id].compute_capacity
-                    nodes_free_time[node_id] += int(t_start + duration - self.env.now)
-                if task.status == "Finished":
-                    nodes_free_time[node_id] = 0
+                    #if t_start + execution_time < self.env.now:    
+                        #print("Allleeeeerrttt negativeeee S2 execution time: ", execution_time, " t_start: ", t_start, " now: ", self.env.now, " job id: ", job_id, " task id: ", task.task_id, " node id:", node_id) 
+
+                    nodes_free_time[node_id] = int(t_start + execution_time - self.env.now) + 1
+                    #transfer_node_free_time[node_id] = transferCost(self,self.jobs[job_id].dataset_size, self.compute_nodes[node_id].bandwidth, self._config) - int(t_end - self.env.now)
+
+                elif task.status == "Finished":
+                    nodes_free_time[node_id] = task.duration * self.compute_nodes[node_id].compute_capacity
+                    #transfer_node_free_time[node_id] = 0
+
                 else:
                     execution_time = task.duration * self.compute_nodes[node_id].compute_capacity
-                    nodes_free_time[node_id] += execution_time
+                    nodes_free_time[node_id] = execution_time
+                #transfer_node_free_time[node_id] = transferCost(self,self.jobs[job_id].dataset_size, self.compute_nodes[node_id].bandwidth, self._config) - duration
 
-            """if ongoing_works[f'node_{node_id}'] is None or ongoing_transfers[f'node_{node_id}'] is None:
-                nodes_free_time[node_id] = 0"""
-            print(f"Node {node_id} free in {nodes_free_time[node_id]} seconds. ")
+            print("node free time for node ", node_id, " is ", nodes_free_time[node_id])#, " transfer free time: ", transfer_node_free_time[node_id])
         return nodes_free_time
-
+    
     def transferData(self, job_id, dataset_size, compute_node, dataset_ready_event,task_id= -1, send_task = False, duration=None):
 
         if job_id in self.replicas_locations.keys() and compute_node.node_id in self.replicas_locations[job_id]:
 
-            logger.debug("[%s] Compute-%s: Got new dataset transfert of job %s: duration: %s, dataset_size: %s", self.env.now, compute_node.node_id, job_id, duration, dataset_size)
+            #logger.debug("[%s] Compute-%s: Got new dataset transfert of job %s: duration: %s, dataset_size: %s", self.env.now, compute_node.node_id, job_id, duration, dataset_size)
             dataset_ready_event.succeed()
             return
 
@@ -388,7 +407,7 @@ class SchedulingUsingCSPOnline:
             
             yield node_req  
             
-            logger.debug("[%s] Compute-%s: Got new dataset transfert of job %s: duration: %s, dataset_size: %s", self.env.now, compute_node.node_id, job_id, transfer_time, dataset_size)
+            #logger.debug("[%s] Compute-%s: Got new dataset transfert of job %s: duration: %s, dataset_size: %s", self.env.now, compute_node.node_id, job_id, transfer_time, dataset_size)
             yield self.env.timeout(transfer_time)
             end_time = self.env.now            
             
@@ -405,8 +424,7 @@ class SchedulingUsingCSPOnline:
                 if key == f'node_{compute_node.node_id}' and item is not None and item[0] == job_id:
                     self.replicas_locations[job_id].append(compute_node.node_id)"""
             
-        
-
+    
 class SchedulingUsingCSPSemiOnline:
     
     """Master node handles job submissions."""

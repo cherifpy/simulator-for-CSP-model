@@ -51,9 +51,9 @@ def main():
     """ Heterogeneous version """    
     random.seed(42)
     #(5,10),(20,50),(20,100),(50,100)
-    for nb_jobs, nb_nodes in [(5,10)]: #,(20,100),(50,100)(10,50),(5,10),(10,50),(20,50),(20,100),(50,100) ('s','s'),('s','b'),('b','b'),('b','s') (20,100),,(5,10),(10,50),(20,50),,(10,50),(20,50)
-        config['jobs_file_path'] = f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/workloads/GeneratedJobs/instances-{config['lambda_rate']}/inst1-{nb_jobs}j-{nb_nodes}Nodes/jobs.json"
-        results_destination = f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/results_node_free_time_0/results-on-instances-{config['lambda_rate']}/inst1-{nb_jobs}j-{nb_nodes}Nodes"
+    for nb_jobs, nb_nodes in [(50,100)]: #,(20,100),(50,100)(10,50),(5,10),(10,50),(20,50),(20,100),(50,100) ('s','s'),('s','b'),('b','b'),('b','s') (20,100),,(5,10),(10,50),(20,50),,(10,50),(20,50)
+        config['jobs_file_path'] = f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/workloads/GeneratedJobs-LowCPU/instances-{config['lambda_rate']}/inst1-{nb_jobs}j-{nb_nodes}Nodes/jobs.json"
+        results_destination = f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/results_node_free_time_0-V1/results-on-instances-{config['lambda_rate']}/inst1-{nb_jobs}j-{nb_nodes}Nodes"
         exp_name = ""
 
         config['total_nb_jobs'] = nb_jobs
@@ -62,7 +62,7 @@ def main():
         # Run the simulation
         logger.info("Simulation begins with config: %s" ,str(config))
 
-        nodes_config = generateHeterogeneousInfrastructureEquilibre(config, path=f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/workloads/GeneratedJobs/instances-{config['lambda_rate']}/inst1-{nb_jobs}j-{nb_nodes}Nodes/infrastructure.csv")
+        nodes_config = generateHeterogeneousInfrastructureEquilibre(config, path=f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/workloads/GeneratedJobs-LowCPU/instances-{config['lambda_rate']}/inst1-{nb_jobs}j-{nb_nodes}Nodes/infrastructure.csv")
                     
         random.seed(42)
         results, nodes_config_ = simulatorForOptimalPerfsUsingCSPOnline(config=config, jobs=[], overlap=True, poisson=True, varying_load=False,nodes_config=nodes_config)

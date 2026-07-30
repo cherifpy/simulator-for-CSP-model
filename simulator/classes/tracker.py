@@ -35,8 +35,8 @@ class Tracker:
             'transferred_bytes': dataset_size
         })
 
-        logger.debug("[%s] Transfer for job %s to node %s took %s",
-                     self.env.now, job_id, node_id, end_time-start_time)
+        #logger.debug("[%s] Transfer for job %s to node %s took %s",
+        #             self.env.now, job_id, node_id, end_time-start_time)
         self.stats_on_tasks.append({
             "job":job_id,
             "task":-1,
@@ -88,7 +88,7 @@ class Tracker:
         if str(job_id)+"-"+str(task_id) in self.ongoing_tasks:
             del self.ongoing_tasks[str(job_id)+"-"+str(task_id)]
 
-        logger.debug("[%s] Task %s of Job %s completed on Node-%s.", self.env.now, task_id, job_id, node_id)
+        #logger.debug("[%s] Task %s of Job %s completed on Node-%s.", self.env.now, task_id, job_id, node_id)
         self.total_nb_tasks_processed += 1
         self.total_tasks_duration += (end_time - start_time)
         self.total_wall_time = max(end_time, self.total_wall_time)
