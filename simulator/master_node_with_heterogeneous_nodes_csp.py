@@ -103,8 +103,8 @@ class SchedulingUsingCSPOnline:
                     here i select the jobs to reschedule 
                     In this case we only schedule a job at time + the actual running jobs 
                 """
-                jobs_to_reschedule = [job for job in self.waiting_jobs] + self.getRunningJobs() 
-                
+                jobs_to_reschedule = [job for job in self.waiting_jobs] + self.getRunningJobs()
+
                 if len(jobs_to_reschedule) > 0:
                     logger.debug("[%s] Master: Start looking for a solution. at time %s", self.env.now,self.env.now)
                     if self._config['use_minizinc_model']:
@@ -355,35 +355,41 @@ class SchedulingUsingCSPOnline:
         #print("Node free time for job ", job.job_id, " at time ", self.env.now)
         
         for node_id in range(len(self.compute_nodes)):
-            
+
+            free_via_transfer = 0
+            free_via_work = 0
+
             if f'node_{node_id}' in ongoing_transfers.keys() and ongoing_transfers[f'node_{node_id}'] is not None:
-                t_job_id, node_id, _, t_end, duration =  ongoing_transfers[f'node_{node_id}'] 
-                nodes_free_time[node_id] = int(t_end - self.env.now)+1
+                t_job_id, node_id, _, t_end, duration =  ongoing_transfers[f'node_{node_id}']
+                free_via_transfer = int(t_end - self.env.now)+1
                 #transfer_node_free_time[node_id] = int(t_end - self.env.now)
-                if nodes_free_time[node_id] < 0: print("Allleeeeerrttt negativeeee S1")
+                if free_via_transfer < 0: print("Allleeeeerrttt negativeeee S1")
 
 
             if f'node_{node_id}' in ongoing_works.keys() and ongoing_works[f'node_{node_id}'] is not None:
                 job_id, node_id, k, t_start, t_end, duration =  ongoing_works[f'node_{node_id}']
-                
+
                 task = self.jobs[job_id].tasks[k]
 
                 if task.status == "Started":
                     execution_time = task.duration * self.compute_nodes[node_id].compute_capacity
-                    #if t_start + execution_time < self.env.now:    
-                        #print("Allleeeeerrttt negativeeee S2 execution time: ", execution_time, " t_start: ", t_start, " now: ", self.env.now, " job id: ", job_id, " task id: ", task.task_id, " node id:", node_id) 
+                    #if t_start + execution_time < self.env.now:
+                        #print("Allleeeeerrttt negativeeee S2 execution time: ", execution_time, " t_start: ", t_start, " now: ", self.env.now, " job id: ", job_id, " task id: ", task.task_id, " node id:", node_id)
 
-                    nodes_free_time[node_id] = int(t_start + execution_time - self.env.now) + 1
+                    free_via_work = int(t_start + execution_time - self.env.now) + 1
                     #transfer_node_free_time[node_id] = transferCost(self,self.jobs[job_id].dataset_size, self.compute_nodes[node_id].bandwidth, self._config) - int(t_end - self.env.now)
 
                 elif task.status == "Finished":
-                    nodes_free_time[node_id] = task.duration * self.compute_nodes[node_id].compute_capacity
+                    free_via_work = task.duration * self.compute_nodes[node_id].compute_capacity
                     #transfer_node_free_time[node_id] = 0
 
                 else:
                     execution_time = task.duration * self.compute_nodes[node_id].compute_capacity
-                    nodes_free_time[node_id] = execution_time
+                    free_via_work = execution_time
                 #transfer_node_free_time[node_id] = transferCost(self,self.jobs[job_id].dataset_size, self.compute_nodes[node_id].bandwidth, self._config) - duration
+
+            # a node is free only once BOTH its ongoing transfer and its ongoing task are done
+            nodes_free_time[node_id] = max(free_via_transfer, free_via_work)
 
             print("node free time for node ", node_id, " is ", nodes_free_time[node_id])#, " transfer free time: ", transfer_node_free_time[node_id])
         return nodes_free_time
