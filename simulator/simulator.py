@@ -6,7 +6,7 @@ import simpy
 import pandas as pd
 from compute_node import ComputeNode
 from classes.job import Job
-from master_node_with_heterogeneous_nodes_csp import SchedulingUsingCSPOnline,SchedulingUsingCSPSemiOnline
+from master_node_with_heterogeneous_nodes_csp import SchedulingUsingCSPOnline,SchedulingUsingCSPSemiOnline,SchedulingUsingCSPIncremental
 from utils.plots import plot_gantt_chart
 from classes.tracker import Tracker
 
@@ -128,20 +128,21 @@ def configure_logging(log_level):
 
 
 
-def simulatorForOptimalPerfsUsingCSPOnline(config,jobs=[], overlap = False, threshold = 1, poisson = False, varying_load = False, nodes_config=[]):
+def simulatorForOptimalPerfsUsingCSPOnline(config,jobs=[], overlap = False, threshold = 1, poisson = False, varying_load = False, nodes_config=[], master_class=SchedulingUsingCSPOnline):
     env = simpy.Environment()
     tracker = Tracker(env)
 
     if len(nodes_config) == 0:
         logging.error("No nodes configuration provided for heterogeneous nodes.")
 
-    master = SchedulingUsingCSPOnline(env, [], tracker, config, overlap=overlap)
+    master = master_class(env, [], tracker, config, overlap=overlap)
     
     
-    compute_nodes = [ComputeNode(env, i, master,  
+    compute_nodes = [ComputeNode(env, i, master,
                                 bandwidth=nodes_config[i]['bandwidth'],
-                                compute_capacity=nodes_config[i]['computation_nodes'], 
-                                energy_consumption=nodes_config[i]['energy_consumption']) for i, node in enumerate(nodes_config)] 
+                                compute_capacity=nodes_config[i]['computation_nodes'],
+                                energy_consumption=nodes_config[i]['energy_consumption'],
+                                storage_capacity=nodes_config[i].get('storage_capacity', float('inf'))) for i, node in enumerate(nodes_config)]
 
     env.process(master.receiveJobs())
     env.process(master.schedulingNewJob())
@@ -175,19 +176,23 @@ def generateHeterogeneousInfrastructureEquilibre(config, node_homogeneous = True
     def extract_bandwidth_cpu(csv_path):
         bandwidth_list = []
         cpu_list = []
+        storage_list = []
 
         with open(csv_path, "r") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 bandwidth_list.append(float(row["bandwidth"]))
                 cpu_list.append(float(row["computation_nodes"]))
+                # Optional column: falls back to unlimited storage for infrastructures
+                # generated before the storage constraint existed.
+                storage_list.append(float(row["storage_capacity"]) if "storage_capacity" in row else float('inf'))
 
-        return bandwidth_list, cpu_list
+        return bandwidth_list, cpu_list, storage_list
 
 
     #if path:
-    bandwidth_list, cpu_list = extract_bandwidth_cpu(path)
-    nodes_config = [{'bandwidth': bandwidth_list[i], 'computation_nodes': cpu_list[i], 'energy_consumption': random.uniform(0.1, 2.1)} for i in range(len(bandwidth_list))]
+    bandwidth_list, cpu_list, storage_list = extract_bandwidth_cpu(path)
+    nodes_config = [{'bandwidth': bandwidth_list[i], 'computation_nodes': cpu_list[i], 'energy_consumption': random.uniform(0.1, 2.1), 'storage_capacity': storage_list[i]} for i in range(len(bandwidth_list))]
     return nodes_config
 
     categories = 4 # Number of categories

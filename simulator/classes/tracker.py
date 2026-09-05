@@ -50,6 +50,14 @@ class Tracker:
         self.total_nb_transfers += 1
         self.total_nb_transferred_bytes += dataset_size
 
+    def log_deletion(self, job_id, node_id, time):
+        """A replica the CSP chose to abandon was actually removed from this node's storage."""
+        self.events_history.append({
+            'job_id': job_id,
+            'node_id': node_id,
+            'type': 'deletion',
+            'time': time,
+        })
 
     def log_task_start(self, job_id, task_id, node_id, start_time):
         self.events_history.append({

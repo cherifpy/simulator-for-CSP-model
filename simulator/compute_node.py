@@ -28,7 +28,8 @@ class ComputeNode:
         
         self.compute_capacity:float = compute_capacity if master._config['homogeneous'] == False else 1
         self.energy_consumption:float = energy_consumption
-        
+        self.storage_capacity = storage_capacity
+
         self.link_occuped = False
         self.new_task = None
         

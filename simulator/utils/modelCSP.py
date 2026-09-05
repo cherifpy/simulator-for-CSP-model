@@ -267,13 +267,33 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
 
     pd.DataFrame(jobs_data).to_json("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/jobs.json", orient="records", indent=4)
 
+    # Storage already occupied by jobs NOT part of this solve's batch (e.g. jobs placed by an
+    # earlier, separate solve that are still resident and not up for reconsideration here) is
+    # invisible to the CSP's own cumulative-storage constraint, since that constraint only sums
+    # usage across the jobs it was actually given. Reserve that space up front by shrinking the
+    # capacity we report, so a batch of 1 (incremental scheduling) can't ignore what other jobs
+    # are already sitting on a node.
+    batch_job_ids = {job.job_id for job in jobs}
+    reserved_storage = {}
+    for jid, node_ids in replicas_locations.items():
+        if jid in batch_job_ids:
+            continue
+        job_dataset_size = master_node.jobs[jid].dataset_size if jid < len(master_node.jobs) else 0
+        for node_id in node_ids:
+            reserved_storage[node_id] = reserved_storage.get(node_id, 0) + job_dataset_size
+
     nodes_list = []
     for node_id, node in enumerate(master_node.compute_nodes):
+        storage_capacity = getattr(node, 'storage_capacity', float('inf'))
+        if storage_capacity != float('inf'):
+            storage_capacity = max(0, storage_capacity - reserved_storage.get(node_id, 0))
         nodes_list.append({
             "node_id": node_id,
             "bandwidth": node.bandwidth,
             "compute_capacity": node.compute_capacity,
-            "free_time": nodes_free_time[node_id]
+            "free_time": nodes_free_time[node_id],
+            # JSON/Java have no "infinity": cap at a value the CSP treats as effectively unlimited.
+            "storage_capacity": int(storage_capacity) if storage_capacity != float('inf') else 2**30
         })
     pd.DataFrame(nodes_list).to_json("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/nodes.json", orient="records", indent=4)
 
@@ -315,7 +335,10 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
 
     print("results")
     print(str(result.stdout))
-    
+    if result.returncode != 0:
+        print("Java scheduler exited with code", result.returncode)
+        print(str(result.stderr))
+
 
     transfers = {}
     works = {}
@@ -327,8 +350,18 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     job_ids = [job['job_id'] for job in jobs_data]
     works = toDict(f"{model_output_path}/works.csv", job_list=job_ids, master_node=master_node )
     transfers = toDict(f"{model_output_path}/transfers.csv", job_list=job_ids, master_node=master_node)
-    
-    return sortSolution(transfers, works) # Implementation would go here
+    deletions = loadDeletions(f"{model_output_path}/deletions.csv", job_list=job_ids, master_node=master_node)
+
+    # toDict()/loadDeletions() always pre-populate one key per node (even with an empty CSV), so
+    # their dicts are never actually empty -- callers can't tell "no solution" apart from "solved"
+    # by checking len(keys()) > 0, which is always true. A real solution always assigns every
+    # NotStarted task in the batch a work slot, so an all-empty `works` is the real "solver found
+    # nothing" signal; surface it as the {} sentinel callers already use for "nothing to solve".
+    if not any(len(v) > 0 for v in works.values()):
+        return {}, {}, {}
+
+    transfers, works = sortSolution(transfers, works)
+    return transfers, works, deletions
 
 
 def toDict(path_to_csv, nb_nodes=None, job_list=None, time=None,master_node=None):
@@ -358,6 +391,34 @@ def toDict(path_to_csv, nb_nodes=None, job_list=None, time=None,master_node=None
             else:
                 dict_info[f"node_{node_index}"].append((job_list[job_index], node_index, now+start_time, now+end_time, end_time - start_time))
                 print(f"node_{node_index} - transfer {job_list[job_index]} - start: {now+start_time} - end: {now+end_time}")
+
+    return dict_info
+
+
+def loadDeletions(path_to_csv, nb_nodes=None, job_list=None, master_node=None):
+    """
+    Read the CSP's keep-vs-abandon decisions: for each (job, node) it chose to abandon
+    within the horizon, when to actually free that node's storage (real deletion, not
+    just the model dropping the pair from consideration).
+    """
+    import csv
+
+    dict_info = {}
+    for node_id in range(nb_nodes if nb_nodes is not None else 100):
+        dict_info[f"node_{node_id}"] = []
+
+    with open(path_to_csv, newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
+        now = master_node.env.now
+        for row in reader:
+            job_index = int(row["job_index"])
+            node_index = int(row["node_index"])
+            deletion_time = int(row["deletion_time"])
+            dict_info[f"node_{node_index}"].append((job_list[job_index], now + deletion_time))
+            print(f"node_{node_index} - deletion of job {job_list[job_index]} scheduled at {now + deletion_time}")
+
+    for key, item in dict_info.items():
+        dict_info[key] = sorted(item, key=lambda x: x[1])
 
     return dict_info
 
@@ -442,9 +503,10 @@ def startMinizincModel(master_node, jobs: list, replicas_locations: dict, nodes_
         with open("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/minizincModel/outputs/sortie.json", "w") as f:
             f.write('{}')
 
-        return sortSolution(transfers, works)
+        transfers, works = sortSolution(transfers, works)
+        return transfers, works, {}  # no storage constraint / deletions in the Minizinc model
 
-    return {}, {}
+    return {}, {}, {}
 
 
 def getResults(jobs, master_node, nb_data, nb_nodes, nb_works, output_path: str):

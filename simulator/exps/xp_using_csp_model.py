@@ -1,8 +1,10 @@
+import os
+os.environ.setdefault("MPLBACKEND", "Agg")  # headless: gantt charts are saved to file, not shown interactively
+
 import json
 import logging
 import random
 import sys
-import os
 import argparse
 import multiprocessing
 import pandas as pd
@@ -48,13 +50,15 @@ def main():
 
     processes = []
     
-    """ Heterogeneous version """    
+    """ Heterogeneous version """
     random.seed(42)
-    #(5,10),(20,50),(20,100),(50,100)
-    for nb_jobs, nb_nodes in [(50,100)]: #,(20,100),(50,100)(10,50),(5,10),(10,50),(20,50),(20,100),(50,100) ('s','s'),('s','b'),('b','b'),('b','s') (20,100),,(5,10),(10,50),(20,50),,(10,50),(20,50)
-        config['jobs_file_path'] = f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/workloads/GeneratedJobs-LowCPU/instances-{config['lambda_rate']}/inst1-{nb_jobs}j-{nb_nodes}Nodes/jobs.json"
-        results_destination = f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/results_node_free_time_0-V1/results-on-instances-{config['lambda_rate']}/inst1-{nb_jobs}j-{nb_nodes}Nodes"
+    for nb_jobs, nb_nodes in [(5,10),(10,50),(20,50),(20,100),(50,100)]:
+        instance_dir = f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/workloads/GeneratedJobs/instances-{config['lambda_rate']}/inst1-{nb_jobs}j-{nb_nodes}Nodes"
+        config['jobs_file_path'] = f"{instance_dir}/jobs.json"
+        results_destination = f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/results-with-storage-contrainte/results-on-instances-{config['lambda_rate']}/inst1-{nb_jobs}j-{nb_nodes}Nodes"
         exp_name = ""
+
+        os.makedirs(results_destination, exist_ok=True)
 
         config['total_nb_jobs'] = nb_jobs
         config['total_nb_compute_nodes'] = nb_nodes
@@ -62,17 +66,22 @@ def main():
         # Run the simulation
         logger.info("Simulation begins with config: %s" ,str(config))
 
-        nodes_config = generateHeterogeneousInfrastructureEquilibre(config, path=f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/workloads/GeneratedJobs-LowCPU/instances-{config['lambda_rate']}/inst1-{nb_jobs}j-{nb_nodes}Nodes/infrastructure.csv")
-                    
+        nodes_config = generateHeterogeneousInfrastructureEquilibre(config, path=f"{instance_dir}/infrastructure.csv")
+
         random.seed(42)
         results, nodes_config_ = simulatorForOptimalPerfsUsingCSPOnline(config=config, jobs=[], overlap=True, poisson=True, varying_load=False,nodes_config=nodes_config)
         save_results_to_csv(logger, results, results_destination, exp_name)
-        
+
         nodes_config_save = pd.DataFrame(nodes_config)
         nodes_config_save.to_csv(f"/{results_destination}/nodes_config.csv", index=False)
 
         if True: # args.plot_gantt:
-            process = multiprocessing.Process(target=plot_gantt_chart, args=(results.events_history,config['total_nb_compute_nodes'],f'Order {0}'))
+            gantt_path = f"{results_destination}/gantt.png"
+            process = multiprocessing.Process(
+                target=plot_gantt_chart,
+                args=(results.events_history, config['total_nb_compute_nodes'], f'inst1-{nb_jobs}j-{nb_nodes}Nodes'),
+                kwargs={'save_path': gantt_path},
+            )
             processes.append(process)
             process.start()
 

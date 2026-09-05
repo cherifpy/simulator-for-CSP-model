@@ -5,7 +5,7 @@ import matplotlib.patches as mpatches
 plt.set_loglevel (level = 'warning')
 logging.getLogger('PIL').setLevel(logging.WARNING)
 
-def plot_gantt_chart(task_data, num_nodes, title="Task Execution and Data Transfers"):
+def plot_gantt_chart(task_data, num_nodes, title="Task Execution and Data Transfers", save_path=None):
     """Visualize the Gantt chart."""
     _, ax = plt.subplots(figsize=(12, 8))
     colors = {'processing': 'blue', 'transfer': 'red'}
@@ -13,6 +13,11 @@ def plot_gantt_chart(task_data, num_nodes, title="Task Execution and Data Transf
     bar_height = 0.3  # Reduced height to fit both bars in one row
 
     for entry in task_data:
+        if entry['type'] not in ('processing', 'transfer'):
+            continue  # e.g. 'deletion' events: not a task/transfer bar, skip
+        if entry['type'] == 'processing' and 'end' not in entry:
+            continue  # the task-start bookkeeping entry: superseded by its matching task-end entry
+
         node_id = entry['node_id']
         start = entry['start']
         end = entry.get('end', start + 1)  # Default to 1 unit if no end time
@@ -67,7 +72,11 @@ def plot_gantt_chart(task_data, num_nodes, title="Task Execution and Data Transf
     ax.set_ylabel("Compute Nodes")
     ax.set_title(title)
     plt.tight_layout()
-    plt.show()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+    else:
+        plt.show()
 
 
 def plot_line(data, title, xlabel, ylabel):

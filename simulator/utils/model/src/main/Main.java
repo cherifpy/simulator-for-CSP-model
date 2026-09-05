@@ -407,13 +407,27 @@ public class Main {
             }
         }
 
+        public static class DeletionConfig {
+            int jobIndex;
+            int nodeIndex;
+            int deletionTime;
+
+            public DeletionConfig(int jobIndex, int nodeIndex, int deletionTime) {
+                this.jobIndex = jobIndex;
+                this.nodeIndex = nodeIndex;
+                this.deletionTime = deletionTime;
+            }
+        }
+
         public static class SchedulingResult {
             public List<TransferConfig> transfers = new ArrayList<>();
             public List<WorkConfig> worksExec = new ArrayList<>();
+            public List<DeletionConfig> deletions = new ArrayList<>();
 
-            public SchedulingResult(List<TransferConfig> transfers, List<WorkConfig> worksExec) {
+            public SchedulingResult(List<TransferConfig> transfers, List<WorkConfig> worksExec, List<DeletionConfig> deletions) {
                 this.transfers = transfers;
                 this.worksExec = worksExec;
+                this.deletions = deletions;
             }
         }
 
@@ -421,14 +435,15 @@ public class Main {
             FileWriter writer = new FileWriter(path);
 
             // header
-            writer.write("bandwidth,computation_nodes,energy_consumption\n");
+            writer.write("bandwidth,computation_nodes,energy_consumption,storage_capacity\n");
 
             // rows
             for (Main.NodeConfig n : nodes) {
                 writer.write(
                         n.bandwidth + "," +
                                 n.computationNodes + "," +
-                                n.energyConsumption + "\n"
+                                n.energyConsumption + "," +
+                                n.storageCapacity + "\n"
                 );
             }
 
@@ -455,7 +470,24 @@ public class Main {
             writer.close();
         }
 
-        public static SchedulingResult runScheduler(List<Main.Job>  jobs,int nb_nodes, int nb_data, int[] data_sizes, int[][] works, int[] bandwidths, double[] cpus, double[] starting_times, int[][]  replicas_location, Model[] models, int pos, boolean solve, double[] job_arriving_times) {
+        public static void writeDeletionConfigCSV(List<SchedulingWithDiffN.DeletionConfig> deletions, String path) throws Exception {
+            FileWriter writer = new FileWriter(path);
+
+            // header
+            writer.write("job_index,node_index,deletion_time\n");
+            // rows
+            for (DeletionConfig del : deletions) {
+                writer.write(
+                        del.jobIndex + "," +
+                                del.nodeIndex + "," +
+                                del.deletionTime + "\n"
+                );
+            }
+
+            writer.close();
+        }
+
+        public static SchedulingResult runScheduler(List<Main.Job>  jobs,int nb_nodes, int nb_data, int[] data_sizes, int[][] works, int[] bandwidths, double[] cpus, int[] storage_capacity, double[] starting_times, int[][]  replicas_location, Model[] models, int pos, boolean solve, double[] job_arriving_times) {
             final int CPU_UNIT = 1; // to scale cpu speeds
             // compute an upper bound on makespan (same idea as python)
             long makespanLong = 0;
@@ -521,7 +553,13 @@ public class Main {
                     IntVar durationVar = model.intVar(d);
                     IntVar end = model.intVar("end_transfer_d" + i + "_n" + j, (int) starting_times[j] + d, makespan,true);
                     
-                    BoolVar h = model.boolVar("height_transfer_d" + i + "_n" + j);
+                    BoolVar h;
+                    if (data_sizes[i] > storage_capacity[j]) {
+                        h = model.boolVar("height_transfer_d" + i + "_n" + j, false);
+                        //model.arithm(h, "=", 0).post();
+                    }else{
+                        h = model.boolVar("height_transfer_d" + i + "_n" + j);
+                    }
 
 
                     
@@ -537,12 +575,33 @@ public class Main {
             IntVar[][] jobDurations = new IntVar[nb_data][];
             IntVar[][] jobEnds = new IntVar[nb_data][];
             IntVar[][] jobNodes = new IntVar[nb_data][];
+
+
+            
+
             for (int i = 0; i < nb_data; i++) {
                 int[] wl = works[i]; 
                 jobStarts[i] = new IntVar[wl.length];
                 jobDurations[i] = new IntVar[wl.length];
                 jobEnds[i] = new IntVar[wl.length];
                 jobNodes[i] = new IntVar[wl.length];
+
+
+
+                // Reduction de l'espace de recherche : un noeud dont la capacite de
+                // stockage est trop petite pour la donnee i ne peut de toute facon
+                // jamais recevoir son transfert (transferHeights fixe a 0 plus haut),
+                // donc aucune tache liee a cette donnee ne peut s'y executer non plus.
+                // On retire directement ces noeuds du domaine de jobNodes.
+                List<Integer> validNodesList = new ArrayList<>();
+                for (int j = 0; j < nb_nodes; j++) {
+                    if (data_sizes[i] <= storage_capacity[j]) validNodesList.add(j);
+                }
+                int[] validNodes = validNodesList.isEmpty()
+                        ? ArrayUtils.array(0, nb_nodes - 1) // instance infaisable ; on laisse les autres contraintes le detecter
+                        : validNodesList.stream().mapToInt(Integer::intValue).toArray();
+
+
                 //System.out.println("Creating work tasks for data " + i + " with " + wl.length + " works.");
                 for (int k = 0; k < wl.length; k++) {
                     int w = wl[k];
@@ -554,7 +613,7 @@ public class Main {
                     int min = Arrays.stream(durations).min().getAsInt();
                     int max = Arrays.stream(durations).max().getAsInt();
                     jobDurations[i][k] = model.intVar("duration_work_d" + i + "_w" + k, min, max);
-                    jobNodes[i][k] = model.intVar("node_work_d" + i + "_w" + k, 0, nb_nodes - 1);
+                    jobNodes[i][k] = model.intVar("node_work_d" + i + "_w" + k, validNodes);
                     model.element(jobDurations[i][k], durations, jobNodes[i][k]).post();
                     jobEnds[i][k] = model.intVar("end_work_d" + i + "_w" + k, 0, makespan,true);//(int) starting_times[j]
                     model.arithm(jobStarts[i][k], "+", jobDurations[i][k], "=", jobEnds[i][k]).post();
@@ -612,6 +671,61 @@ public class Main {
                 }
             }
 
+
+            // ----- STORAGE CONSTRAINT -----
+            // Data i occupies storage on node j from the moment it's present there until an
+            // explicit deletionTime: the model is free to pick deletionTime anywhere from "as
+            // soon as the last work using it there finishes" (abandon it, freeing the space)
+            // up to makespan (keep it indefinitely, the safe default since nothing ever deletes
+            // data on its own). This is the keep-vs-abandon choice.
+            //
+            // For data already on node j before this solve (replicas_location says so),
+            // "effective start" is pinned to 0: it's been resident since before this planning
+            // window began, not a free variable -- otherwise the solver could place its
+            // (cost-free, duration-0) transfer start arbitrarily late and "hide" storage it is
+            // physically already occupying, which is what let other jobs overbook that node.
+            Task[][] storageTasks = new Task[nb_nodes][nb_data];
+            IntVar[][] storageHeights = new IntVar[nb_nodes][nb_data];
+            IntVar[][] deletionTimes = new IntVar[nb_nodes][nb_data];
+            boolean[][] alreadyResident = new boolean[nb_nodes][nb_data];
+            for (int i = 0; i < nb_data; i++) {
+                int[] wl = works[i];
+                for (int n : replicas_location[i]) {
+                    if (n >= 0 && n < nb_nodes) alreadyResident[n][i] = true;
+                }
+
+                for (int j = 0; j < nb_nodes; j++) {
+                    IntVar effectiveStart = alreadyResident[j][i]
+                            ? model.intVar(0)
+                            : transferTasks[j][i].getStart();
+
+                    // release_lower_bound_ij = max end time among works of data i actually assigned
+                    // to node j; falls back to effectiveStart when no work of i is on j (storage
+                    // then irrelevant since storageHeights[j][i] will be 0).
+                    IntVar[] candidateEnds = new IntVar[wl.length];
+                    for (int k = 0; k < wl.length; k++) {
+                        BoolVar onJ = jobNodes[i][k].eq(j).boolVar();
+                        IntVar cand = model.intVar("release_cand_d" + i + "_n" + j + "_w" + k, 0, makespan, true);
+                        model.impXrelYC(cand, "=", jobEnds[i][k], 0, onJ);
+                        model.impXrelYC(cand, "=", effectiveStart, 0, onJ.not());
+                        candidateEnds[k] = cand;
+                    }
+                    IntVar releaseLowerBound = model.intVar("release_lb_d" + i + "_n" + j, 0, makespan, true);
+                    model.max(releaseLowerBound, candidateEnds).post();
+
+                    // The keep-vs-abandon choice: deletionTime anywhere in [releaseLowerBound, makespan].
+                    IntVar deletionTime = model.intVar("deletion_time_d" + i + "_n" + j, 0, makespan, true);
+                    model.arithm(deletionTime, ">=", releaseLowerBound).post();
+                    deletionTimes[j][i] = deletionTime;
+
+                    IntVar storageDuration = model.intVar("storage_duration_d" + i + "_n" + j, 0, makespan, true);
+                    storageTasks[j][i] = new Task(effectiveStart, storageDuration, deletionTime);
+                    storageHeights[j][i] = transferHeights[j][i].mul(data_sizes[i]).intVar();
+                }
+            }
+            for (int j = 0; j < nb_nodes; j++) {
+                model.cumulative(storageTasks[j], storageHeights[j], model.intVar(storage_capacity[j])).post();
+            }
 
             // ----- CONSTRAINTS -----
             // Cumulative constraints for transfers on each node (capacity = 1)
@@ -689,11 +803,13 @@ public class Main {
             Solver solver = model.getSolver();
             List<TransferConfig> transfersList = new ArrayList<>();
             List<WorkConfig> worksList = new ArrayList<>();
+            List<DeletionConfig> deletionsList = new ArrayList<>();
             //model.displayVariableOccurrences();
             //model.displayPropagatorOccurrences();
 
-            IntVar[] decisionVars = decisionVariables(nb_nodes, nb_data, works, jobNodes, jobStarts, transferHeights, transferTasks);
-            hints(nb_nodes, nb_data, data_sizes, works, cpus, solver, jobNodes);
+            IntVar[] decisionVars = decisionVariables(nb_nodes, nb_data, works, jobNodes, jobStarts, transferHeights, transferTasks, deletionTimes);
+            // TEMP: hints disabled to check whether they're locking in the job11-style idle gaps
+            // hints(nb_nodes, nb_data, data_sizes, works, cpus, solver, jobNodes);
 
             //solver.setNoGoodRecordingFromRestarts();
             ArraySort<?> sorter = new ArraySort<>(nb_nodes, false, true);
@@ -751,7 +867,7 @@ public class Main {
                         new FailCounter(model, nb_data * nb_nodes * 100));
             }
 
-            solver.limitTime("120s");
+            solver.limitTime("30s");
             
             boolean[] found = {false};
             solver.onSolution(() -> {
@@ -760,12 +876,13 @@ public class Main {
 
                     transfersList.clear();
                     worksList.clear();
+                    deletionsList.clear();
 
                     for (int j = 0; j < nb_nodes; j++) {
 
                         for (int i = 0; i < nb_data; i++) {
                             if (transferHeights[j][i].getValue() == 1) {
-                                
+
                                 int[] wl = works[i];
                                 for (int k = 0; k < wl.length; k++) {
                                     if (jobNodes[i][k].isInstantiatedTo(j)) {
@@ -777,6 +894,19 @@ public class Main {
 
                                 TransferConfig tmp_transfer = new TransferConfig(i, transferTasks[j][i].getStart().getValue(), transferTasks[j][i].getEnd().getValue(), j);
                                 transfersList.add(tmp_transfer);
+                            }
+
+                            // Storage on (j,i) is occupied within this solve either because it's
+                            // used now (height=1) or because it was already resident before this
+                            // solve even if abandoned here (height=0). Either way, if the model
+                            // picked a deletionTime inside the horizon, tell the simulator to
+                            // actually free that space then -- this is what makes "abandon" (as
+                            // opposed to "keep it indefinitely") a real, effective choice.
+                            if (transferHeights[j][i].getValue() == 1 || alreadyResident[j][i]) {
+                                int deletionTime = deletionTimes[j][i].getValue();
+                                if (deletionTime < makespan) {
+                                    deletionsList.add(new DeletionConfig(i, j, deletionTime));
+                                }
                             }
                         }
                     }
@@ -790,12 +920,12 @@ public class Main {
                 System.out.println("No solution found");
             }
 
-            SchedulingResult result = new SchedulingResult(transfersList, worksList);
+            SchedulingResult result = new SchedulingResult(transfersList, worksList, deletionsList);
 
             return result;
         }
 
-        private static IntVar[] decisionVariables(int nb_nodes, int nb_data, int[][] works, IntVar[][] jobNodes, IntVar[][] jobStarts, BoolVar[][] transferHeights, Task[][] transferTasks) {
+        private static IntVar[] decisionVariables(int nb_nodes, int nb_data, int[][] works, IntVar[][] jobNodes, IntVar[][] jobStarts, BoolVar[][] transferHeights, Task[][] transferTasks, IntVar[][] deletionTimes) {
             List<IntVar> vars = new ArrayList<>();
             for (int i = 0; i < nb_data; i++) {
                 for (int k = 0; k < works[i].length; k++) {
@@ -807,6 +937,9 @@ public class Main {
                 for (int i = 0; i < nb_data; i++) {
                     vars.add(transferHeights[j][i]);
                     vars.add(transferTasks[j][i].getStart());
+                    // Part of the search too: otherwise the keep-vs-abandon choice can be left
+                    // unresolved (a valid range, not a single value) at solution time.
+                    vars.add(deletionTimes[j][i]);
                 }
             }
             IntVar[] decisionVars = vars.toArray(new IntVar[0]);
@@ -828,13 +961,16 @@ public class Main {
             sorter.sort(cidx, nb_nodes, (i, j) -> (int) ((cpus[i] - cpus[j]) * 1000));
             for (int i = 0; i < nb_data; i++) {
                 int k = 0;
-                int ii = cidx[i];
+                // cidx only has nb_nodes entries: cycle through them once there are more
+                // data items than nodes (pre-existing bug, previously untriggered because
+                // every shipped instance had nb_nodes >= nb_data).
+                int ii = cidx[i % nb_nodes];
                 for (; k < works[i].length; k++) {
                     solver.addHint(jobNodes[i][k], ii);
                 }
             }
         }
-        
+
         public static void setLNS(Solver solver, INeighbor neighbor, ICounter restartCounter) {
             MyMoveLNS lns = new MyMoveLNS(solver.getMove(), neighbor, restartCounter);
             solver.setMove(lns);
@@ -1460,6 +1596,10 @@ public class Main {
         public double computationNodes;
         public double energyConsumption;
         public double freeTime;
+        // Practically unlimited by default: the Python side does not export a real
+        // per-node storage capacity yet, so the storage constraint stays non-binding
+        // until nodes.json actually provides "storage_capacity".
+        public int storageCapacity = Integer.MAX_VALUE / 2;
         public NodeConfig() {}
         public NodeConfig(int bw, double cpu, double energy, double freeTime) {
             this.bandwidth = bw;
@@ -1534,7 +1674,7 @@ public class Main {
     }
 
     public static void main(String[] args) throws Exception {
-        
+
         // ---- Load jobs JSON manually ----
         String jobsText = readFile("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/jobs.json");
 
@@ -1576,6 +1716,9 @@ public class Main {
             node.computationNodes = j.getFloat("compute_capacity");
             node.bandwidth = j.getInt("bandwidth");
             node.freeTime = j.getInt("free_time");
+            if (j.has("storage_capacity")) {
+                node.storageCapacity = j.getInt("storage_capacity");
+            }
             nodes.add(node);
             //System.out.println("Loaded node " + i + ": " + node.computationNodes + " CPUs, " + node.bandwidth + " bandwidth, " + node.freeTime + " free time");
         }
@@ -1584,13 +1727,15 @@ public class Main {
         int[] bandwidths = new int[nodes.size()];
         double[] cpus = new double[nodes.size()];
         double[] nodes_free_time = new double[nodes.size()];
+        int[] storage_capacity = new int[nodes.size()];
         double[] jobs_arrival_time = new double[jobsArray.length()];
-        
+
         for (int i = 0; i < nodes.size(); i++) {
             NodeConfig node = nodes.get(i);
             bandwidths[i] = node.bandwidth;
             cpus[i] = node.computationNodes;
             nodes_free_time[i] = node.freeTime;
+            storage_capacity[i] = node.storageCapacity;
         }
 
         for (int i = 0; i < jobsArray.length(); i++) {
@@ -1628,7 +1773,7 @@ public class Main {
 
         // Call scheduler
         SchedulingWithDiffN.SchedulingResult result = SchedulingWithDiffN.runScheduler(
-            jobs,nodes.size(), nbData, data_sizes, works, bandwidths, cpus, nodes_free_time, replicas_location,null, 0, true,null);
+            jobs,nodes.size(), nbData, data_sizes, works, bandwidths, cpus, storage_capacity, nodes_free_time, replicas_location,null, 0, true,null);
 
         String basePath = "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/outputs/";
 
@@ -1642,6 +1787,7 @@ public class Main {
         SchedulingWithDiffN.writeNodeConfigCSV(nodes, basePath + "/nodes_.csv");
         SchedulingWithDiffN.writeTransferConfigCSV(result.transfers, basePath + "/transfers.csv");
         writeWorkConfigCSV(result.worksExec, basePath + "/works.csv");
+        SchedulingWithDiffN.writeDeletionConfigCSV(result.deletions, basePath + "/deletions.csv");
 
     }
 }
