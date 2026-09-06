@@ -567,16 +567,7 @@ public class MainOnline {
                 // File missing/unreadable: no ghost entries (matches behavior before this existed).
             }
 
-            //System.out.println("Computed makespan upper bound: " + makespan);
-            // print inputs (summary)
-            //System.out.println("DATA");
-            /*for (int i = 0; i < nb_data; i++) {
-                System.out.println(" Data " + i + ": size=" + data_sizes[i] + " MB, works=" + Arrays.toString(works[i]) + " arrival=" + starting_times[i]);
-            }
-            System.out.println("NODES");
-            for (int j = 0; j < nb_nodes; j++) {
-                System.out.println(" Node " + j + ": bandwidth=" + bandwidths[j] + " MB/s, cpu=" + cpus[j] + " units/s");
-            }*/
+
 
             // ----- MODEL -----
             Model model = new Model("Bag of Tasks Scheduling (Java)");
@@ -611,8 +602,6 @@ public class MainOnline {
                     }else{
                         h = model.boolVar("height_transfer_d" + i + "_n" + j);
                     }
-
-
                     
                     Task t = new Task(s, durationVar, end);
                     transferTasks[j][i] = t;
@@ -723,84 +712,98 @@ public class MainOnline {
             }
 
 
-            // ----- STORAGE CONSTRAINT -----
-            // Data i occupies storage on node j from the moment it's present there until an
-            // explicit deletionTime: the model is free to pick deletionTime anywhere from "as
-            // soon as the last work using it there finishes" (abandon it, freeing the space)
-            // up to makespan (keep it indefinitely, the safe default since nothing ever deletes
-            // data on its own). This is the keep-vs-abandon choice.
+            //// ----- STORAGE CONSTRAINT -----
+            //// Data i occupies storage on node j from its effective start until the last work
+            //// assigned to that node for that data finishes (release time) -- that's when it can
+            //// be deleted locally. No separate keep-vs-abandon decision variable: if the solver
+            //// never routes a task for data i to node j, transferHeights[j][i] is forced to 0 (via
+            //// the counters/reification link below), storageHeights[j][i] collapses to 0, and
+            //// release falls back to effectiveStart -- i.e. the model itself already treats
+            //// "nothing uses it here" as "abandon it now", with nothing extra to branch on.
+            //Task[][] storageTasks = new Task[nb_nodes][nb_data];
+            //IntVar[][] storageHeights = new IntVar[nb_nodes][nb_data];
+            //IntVar[][] releases = new IntVar[nb_nodes][nb_data];
+            //boolean[][] alreadyResident = new boolean[nb_nodes][nb_data];
+            //for (int i = 0; i < nb_data; i++) {
+            //    int[] wl = works[i];
+            //    for (int n : replicas_location[i]) {
+            //        if (n >= 0 && n < nb_nodes) alreadyResident[n][i] = true;
+            //    }
+            //    for (int j = 0; j < nb_nodes; j++) {
+            //        // if a data is already present on a node, its effective start is 0, not the transfer start
+            //        IntVar effectiveStart = alreadyResident[j][i]
+            //                ? model.intVar(0)
+            //                : transferTasks[j][i].getStart();
+            //        // release_ij = max end time among works of data i actually assigned to node j;
+            //        // falls back to effectiveStart when no work of i is on j (storage then
+            //        // irrelevant since storageHeights[j][i] will be 0 in that case).
+            //        IntVar[] candidateEnds = new IntVar[wl.length];
+            //        for (int k = 0; k < wl.length; k++) {
+            //            BoolVar onJ = jobNodes[i][k].eq(j).boolVar();
+            //            IntVar cand = model.intVar("release_cand_d" + i + "_n" + j + "_w" + k, 0, makespan, true);
+            //            model.impXrelYC(cand, "=", jobEnds[i][k], 0, onJ);
+            //            model.impXrelYC(cand, "=", effectiveStart, 0, onJ.not());
+            //            candidateEnds[k] = cand;
+            //        }
+            //        IntVar release = model.intVar("release_d" + i + "_n" + j, 0, makespan, true);
+            //        model.max(release, candidateEnds).post();
+            //        releases[j][i] = release;
+            //        IntVar storageDuration = model.intVar("storage_duration_d" + i + "_n" + j, 0, makespan, true);
+            //        storageTasks[j][i] = new Task(effectiveStart, storageDuration, release);
+            //        storageHeights[j][i] = transferHeights[j][i].mul(data_sizes[i]).intVar();
+            //    }
+            //}
+            //for (int j = 0; j < nb_nodes; j++) {
+            //    List<Task> nodeStorageTasks = new ArrayList<>(Arrays.asList(storageTasks[j]));
+            //    List<IntVar> nodeStorageHeights = new ArrayList<>(Arrays.asList(storageHeights[j]));
+            //    for (GhostStorage g : ghostStorage) {
+            //        if (g.nodeId != j) continue;
+            //        // Fixed (non-decision) task: occupies g.size from 0 until its known/assumed
+            //        // release time, exactly like alreadyResident data, just not schedulable here.
+            //        Task ghostTask = new Task(model.intVar(0), model.intVar(g.deletionTime), model.intVar(g.deletionTime));
+            //        nodeStorageTasks.add(ghostTask);
+            //        nodeStorageHeights.add(model.intVar(g.size));
+            //    }
+            //    model.cumulative(
+            //            nodeStorageTasks.toArray(new Task[0]),
+            //            nodeStorageHeights.toArray(new IntVar[0]),
+            //            model.intVar(storage_capacity[j])
+            //    ).post();
             //
-            // For data already on node j before this solve (replicas_location says so),
-            // "effective start" is pinned to 0: it's been resident since before this planning
-            // window began, not a free variable -- otherwise the solver could place its
-            // (cost-free, duration-0) transfer start arbitrarily late and "hide" storage it is
-            // physically already occupying, which is what let other jobs overbook that node.
+            //}
+
+            // ----- STORAGE CONSTRAINT -----
+            // Data i occupies storage on node j from the moment its transfer to j
+            // starts until the last work assigned to that node for that data
+            // finishes (release time) -- that's when it can be deleted locally.
             Task[][] storageTasks = new Task[nb_nodes][nb_data];
             IntVar[][] storageHeights = new IntVar[nb_nodes][nb_data];
-            IntVar[][] deletionTimes = new IntVar[nb_nodes][nb_data];
-            boolean[][] alreadyResident = new boolean[nb_nodes][nb_data];
             for (int i = 0; i < nb_data; i++) {
                 int[] wl = works[i];
-                for (int n : replicas_location[i]) {
-                    if (n >= 0 && n < nb_nodes) alreadyResident[n][i] = true;
-                }
-
                 for (int j = 0; j < nb_nodes; j++) {
-                    IntVar effectiveStart = alreadyResident[j][i]
-                            ? model.intVar(0)
-                            : transferTasks[j][i].getStart();
+                    IntVar transferStart = transferTasks[j][i].getStart();
 
-                    // release_lower_bound_ij = max end time among works of data i actually assigned
-                    // to node j; falls back to effectiveStart when no work of i is on j (storage
-                    // then irrelevant since storageHeights[j][i] will be 0).
+                    // release_ij = max end time among works of data i actually assigned to node j;
+                    // falls back to transferStart when no work of i is on j (storage then irrelevant
+                    // since storageHeights[j][i] will be 0).
                     IntVar[] candidateEnds = new IntVar[wl.length];
                     for (int k = 0; k < wl.length; k++) {
                         BoolVar onJ = jobNodes[i][k].eq(j).boolVar();
-                        IntVar cand = model.intVar("release_cand_d" + i + "_n" + j + "_w" + k, 0, makespan, true);
+                        IntVar cand = model.intVar("release_cand_d" + i + "_n" + j + "_w" + k, starting_times[i], makespan, true);
                         model.impXrelYC(cand, "=", jobEnds[i][k], 0, onJ);
-                        model.impXrelYC(cand, "=", effectiveStart, 0, onJ.not());
+                        model.impXrelYC(cand, "=", transferStart, 0, onJ.not());
                         candidateEnds[k] = cand;
                     }
-                    IntVar releaseLowerBound = model.intVar("release_lb_d" + i + "_n" + j, 0, makespan, true);
-                    model.max(releaseLowerBound, candidateEnds).post();
-
-                    // The keep-vs-abandon choice: deletionTime anywhere in [releaseLowerBound, makespan].
-                    IntVar deletionTime = model.intVar("deletion_time_d" + i + "_n" + j, 0, makespan, true);
-                    model.arithm(deletionTime, ">=", releaseLowerBound).post();
-                    deletionTimes[j][i] = deletionTime;
+                    IntVar release = model.intVar("release_d" + i + "_n" + j, starting_times[i], makespan, true);
+                    model.max(release, candidateEnds).post();
 
                     IntVar storageDuration = model.intVar("storage_duration_d" + i + "_n" + j, 0, makespan, true);
-                    storageTasks[j][i] = new Task(effectiveStart, storageDuration, deletionTime);
-                    // Data already physically on node j occupies real space for the whole
-                    // [effectiveStart, deletionTime] window regardless of transferHeights[j][i]:
-                    // "abandon" (height=0) only means "stop routing new work here", it does NOT
-                    // make the bytes vanish before deletionTime actually fires. Tying storage
-                    // height to transferHeights let an abandoned-but-still-resident replica be
-                    // counted as consuming zero space, so another job could be co-scheduled into
-                    // storage that was, in reality, still occupied -- a real capacity violation.
-                    // For a brand-new (not yet resident) candidate transfer, height still
-                    // correctly gates whether it ever consumes storage at all.
-                    storageHeights[j][i] = alreadyResident[j][i]
-                            ? model.intVar(data_sizes[i])
-                            : transferHeights[j][i].mul(data_sizes[i]).intVar();
+                    storageTasks[j][i] = new Task(transferStart, storageDuration, release);
+                    storageHeights[j][i] = transferHeights[j][i].mul(data_sizes[i]).intVar();
                 }
             }
             for (int j = 0; j < nb_nodes; j++) {
-                List<Task> nodeStorageTasks = new ArrayList<>(Arrays.asList(storageTasks[j]));
-                List<IntVar> nodeStorageHeights = new ArrayList<>(Arrays.asList(storageHeights[j]));
-                for (GhostStorage g : ghostStorage) {
-                    if (g.nodeId != j) continue;
-                    // Fixed (non-decision) task: occupies g.size from 0 until its known/assumed
-                    // release time, exactly like alreadyResident data, just not schedulable here.
-                    Task ghostTask = new Task(model.intVar(0), model.intVar(g.deletionTime), model.intVar(g.deletionTime));
-                    nodeStorageTasks.add(ghostTask);
-                    nodeStorageHeights.add(model.intVar(g.size));
-                }
-                model.cumulative(
-                        nodeStorageTasks.toArray(new Task[0]),
-                        nodeStorageHeights.toArray(new IntVar[0]),
-                        model.intVar(storage_capacity[j])
-                ).post();
+                model.cumulative(storageTasks[j], storageHeights[j], model.intVar(storage_capacity[j])).post();
             }
 
             // ----- CONSTRAINTS -----
@@ -829,19 +832,6 @@ public class MainOnline {
                     ArrayUtils.flatten(jobDurations),
                     Arrays.stream(ArrayUtils.flatten(jobNodes)).map(j -> model.intVar(1)).toArray(IntVar[]::new),
                     true).post();
-
-
-            // Transfer_time <= factor * sum(execution_time)
-            //int factor=1;
-            //for (int i = 0; i < nb_data && factor > 0; i++) {
-            //    for (int j = 0; j < nb_nodes; j++) {
-            //        IntVar[] executions = new IntVar[works[i].length];
-            //        for (int k = 0; k < executions.length; k++) {
-            //            executions[k] = model.isEq(jobNodes[i][k], j).mul(jobDurations[i][k]).intVar();
-            //        }
-            //        model.sum(executions, ">=", transferHeights[j][i], transferTasks[j][i].getDuration().getValue() * factor).post();
-            //    }
-            //}
 
             // ----- OBJECTIVE Make span-----
             //makespan var and ensure it's >= all end
@@ -883,7 +873,7 @@ public class MainOnline {
             //model.displayVariableOccurrences();
             //model.displayPropagatorOccurrences();
 
-            IntVar[] decisionVars = decisionVariables(nb_nodes, nb_data, works, jobNodes, jobStarts, transferHeights, transferTasks, deletionTimes);
+            IntVar[] decisionVars = decisionVariables(nb_nodes, nb_data, works, jobNodes, jobStarts, transferHeights, transferTasks);
             // TEMP: hints disabled to check whether they're locking in the job11-style idle gaps
             // hints(nb_nodes, nb_data, data_sizes, works, cpus, solver, jobNodes);
 
@@ -982,15 +972,14 @@ public class MainOnline {
                             }
 
                             // Storage on (j,i) is occupied within this solve either because it's
-                            // used now (height=1) or because it was already resident before this
-                            // solve even if abandoned here (height=0). Either way, if the model
-                            // picked a deletionTime inside the horizon, tell the simulator to
-                            // actually free that space then -- this is what makes "abandon" (as
-                            // opposed to "keep it indefinitely") a real, effective choice.
+                            // used now (height=1, release = when the last task using it there
+                            // finishes) or because it was already resident before this solve but
+                            // is abandoned here (height=0, so release collapses to effectiveStart
+                            // -- i.e. delete it right away since nothing here needs it anymore).
                             if (transferHeights[j][i].getValue() == 1 || alreadyResident[j][i]) {
-                                int deletionTime = deletionTimes[j][i].getValue();
-                                if (deletionTime < makespan) {
-                                    deletionsList.add(new DeletionConfig(i, j, deletionTime));
+                                int releaseTime = releases[j][i].getValue();
+                                if (releaseTime < makespan) {
+                                    deletionsList.add(new DeletionConfig(i, j, releaseTime));
                                 }
                             }
                         }
@@ -1010,7 +999,7 @@ public class MainOnline {
             return result;
         }
 
-        private static IntVar[] decisionVariables(int nb_nodes, int nb_data, int[][] works, IntVar[][] jobNodes, IntVar[][] jobStarts, BoolVar[][] transferHeights, Task[][] transferTasks, IntVar[][] deletionTimes) {
+        private static IntVar[] decisionVariables(int nb_nodes, int nb_data, int[][] works, IntVar[][] jobNodes, IntVar[][] jobStarts, BoolVar[][] transferHeights, Task[][] transferTasks) {
             List<IntVar> vars = new ArrayList<>();
             for (int i = 0; i < nb_data; i++) {
                 for (int k = 0; k < works[i].length; k++) {
@@ -1022,9 +1011,6 @@ public class MainOnline {
                 for (int i = 0; i < nb_data; i++) {
                     vars.add(transferHeights[j][i]);
                     vars.add(transferTasks[j][i].getStart());
-                    // Part of the search too: otherwise the keep-vs-abandon choice can be left
-                    // unresolved (a valid range, not a single value) at solution time.
-                    vars.add(deletionTimes[j][i]);
                 }
             }
             IntVar[] decisionVars = vars.toArray(new IntVar[0]);
@@ -1637,7 +1623,16 @@ public class MainOnline {
         public static double transferTime(int job_id, int node_id, int dataSize, int bandwidth, int[][] replicas_location) {
             for(int val:replicas_location[job_id]) {
                 if(val == node_id) {
-                    return (double) 0;
+                    // Not a real transfer (data's already there), but NOT free either: a
+                    // zero-duration "reuse" task doesn't actually occupy any time in the
+                    // node's capacity=1 transfer cumulative, so two different jobs both
+                    // already resident there could get instantiated to "reuse" at the exact
+                    // same instant with nothing forcing their (chained) work starts apart --
+                    // the only thing standing between two different jobs' compute on the same
+                    // node, since there's no separate capacity=1 constraint on work itself.
+                    // A 1-unit minimum keeps that chain meaningfully sequential; negligible
+                    // next to real task durations (tens to hundreds of units).
+                    return (double) 1;
                 }
             }
             return (double) dataSize / (double) bandwidth;
