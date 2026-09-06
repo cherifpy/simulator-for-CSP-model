@@ -242,14 +242,51 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     print('jobs:', jobs)
     print("replicas_locations keys:", replicas_locations)
     jobs = sorted(jobs, key=lambda x: x.job_id)
+    # A transfer that has started but not yet completed doesn't appear in replicas_locations
+    # yet (that's only updated on completion), so without this a job's data mid-flight to a
+    # node looks like a brand-new, freely re-plannable candidate to the CSP -- letting a later
+    # solve treat that node's storage as available and place something else there too, even
+    # though the in-flight transfer is physically unstoppable and will land regardless. Fold
+    # in every node currently transferring this job's data so it's marked alreadyResident too.
+    ongoing_nodes_by_job = {}
+    for key, ongoing in master_node.ongoing_transfers.items():
+        if ongoing is not None:
+            ongoing_job_id, ongoing_node_id = ongoing[0], ongoing[1]
+            ongoing_nodes_by_job.setdefault(ongoing_job_id, set()).add(ongoing_node_id)
+
     for job in jobs:
-        if job.job_id in replicas_locations.keys():
-            matrix.append(replicas_locations[job.job_id])
-        else:
-            matrix.append([])
+        resident_nodes = list(replicas_locations.get(job.job_id, []))
+        for node_id in ongoing_nodes_by_job.get(job.job_id, ()):
+            if node_id not in resident_nodes:
+                resident_nodes.append(node_id)
+        matrix.append(resident_nodes)
     print("matrix:", matrix)
     with open("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/replicas_locations.json", "w") as f:
         json.dump(matrix, f)
+
+    # Optional hard node filter: only written when the caller opts in (restrict_to_free_nodes),
+    # so Online/plain Incremental keep considering every (storage-eligible) node, unrestricted,
+    # as before. A node counts as "free" only if it has nothing ongoing AND nothing already
+    # queued -- no notion of when a busy node would become available, just in/out right now.
+    free_nodes_path = "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/free_nodes.txt"
+    if getattr(master_node, 'restrict_to_free_nodes', False):
+        free_node_ids = []
+        for node_id in range(len(master_node.compute_nodes)):
+            key = f'node_{node_id}'
+            idle = (
+                master_node.ongoing_transfers.get(key) is None
+                and master_node.ongoing_works.get(key) is None
+                and len(master_node.transfers.get(key, [])) == 0
+                and len(master_node.works.get(key, [])) == 0
+            )
+            if idle:
+                free_node_ids.append(node_id)
+        print("free nodes:", free_node_ids)
+        with open(free_nodes_path, "w") as f:
+            f.write(",".join(str(n) for n in free_node_ids))
+    else:
+        with open(free_nodes_path, "w") as f:
+            f.write("")
 
     jobs_data = []
     for job in jobs:
@@ -267,26 +304,37 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
 
     pd.DataFrame(jobs_data).to_json("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/jobs.json", orient="records", indent=4)
 
-    # Storage already occupied by jobs NOT part of this solve's batch (e.g. jobs placed by an
-    # earlier, separate solve that are still resident and not up for reconsideration here) is
-    # invisible to the CSP's own cumulative-storage constraint, since that constraint only sums
-    # usage across the jobs it was actually given. Reserve that space up front by shrinking the
-    # capacity we report, so a batch of 1 (incremental scheduling) can't ignore what other jobs
-    # are already sitting on a node.
+    # Per-scheduler-class solver time budget (e.g. Online vs Incremental can be compared at
+    # different budgets); Main.java falls back to 120s if this file is missing/unreadable.
+    solver_time_limit_s = master_node._config.get('solver_time_limit_s', 120)
+    with open("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/solver_time_limit.txt", "w") as f:
+        f.write(str(int(solver_time_limit_s)))
+
+    # Ghost storage: jobs NOT part of this solve's batch (e.g. a job that already had every
+    # task dispatched and dropped out of reconsideration, or -- for Incremental -- literally
+    # every other job) but whose data is still physically resident somewhere. The CSP can't
+    # reconsider them, but it still needs to know that space is taken -- and, crucially, WHEN
+    # it frees up, using the same deletion time already decided for it if one exists, rather
+    # than blindly shrinking capacity for the entire horizon.
     batch_job_ids = {job.job_id for job in jobs}
-    reserved_storage = {}
+    ghost_lines = []
     for jid, node_ids in replicas_locations.items():
-        if jid in batch_job_ids:
+        if jid in batch_job_ids or jid >= len(master_node.jobs):
             continue
-        job_dataset_size = master_node.jobs[jid].dataset_size if jid < len(master_node.jobs) else 0
+        size = master_node.jobs[jid].dataset_size
         for node_id in node_ids:
-            reserved_storage[node_id] = reserved_storage.get(node_id, 0) + job_dataset_size
+            deletion_time = -1
+            for pending_jid, pending_time in master_node.deletions.get(f'node_{node_id}', []):
+                if pending_jid == jid:
+                    deletion_time = max(0, int(pending_time - master_node.env.now))
+                    break
+            ghost_lines.append(f"{node_id},{int(size)},{deletion_time}")
+    with open("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/ghost_storage.txt", "w") as f:
+        f.write("\n".join(ghost_lines))
 
     nodes_list = []
     for node_id, node in enumerate(master_node.compute_nodes):
         storage_capacity = getattr(node, 'storage_capacity', float('inf'))
-        if storage_capacity != float('inf'):
-            storage_capacity = max(0, storage_capacity - reserved_storage.get(node_id, 0))
         nodes_list.append({
             "node_id": node_id,
             "bandwidth": node.bandwidth,
@@ -305,33 +353,35 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
    
 
     # Run
-    #javac   -d bin src/main/Main.java
+    # Each scheduler class points at its own Java entry point (MainOnline / MainIncremental)
+    # via a `java_main_class` attribute; falls back to the original shared "Main" for any
+    # scheduler that doesn't set one (e.g. SemiOnline).
+    java_main_class = getattr(master_node, 'java_main_class', 'Main')
     result = subprocess.run(
         [
-            "javac", 
+            "javac",
             "-cp",
             "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/lib/*",
             "-d",
             "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/bin",
-            "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/src/main/Main.java"
+            f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/src/main/{java_main_class}.java"
         ],
         capture_output=True,
         text=True
-    )  
+    )
     print("Compilation Error")
     print(str(result.stderr))
     print('Start looking for a solution')
-    #java -cp "" main.Main
     result = subprocess.run(
         [
-            "java", 
+            "java",
             "-cp",
-            "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/bin:/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/lib/*",    
-            "main.Main"
+            "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/bin:/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/lib/*",
+            f"main.{java_main_class}"
         ],
         capture_output=True,
         text=True
-    )  
+    )
 
     print("results")
     print(str(result.stdout))

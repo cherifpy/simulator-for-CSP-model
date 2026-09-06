@@ -22,6 +22,9 @@ def transferCost(self,dataset_size, node_bw = None, config = None):
 class SchedulingUsingCSPOnline:
 
     """Master node: receives job submissions and drives CSP-based scheduling over a set of heterogeneous compute nodes."""
+    # Dedicated Java entry point (utils/model/src/main/MainOnline.java) so Online-specific
+    # storage handling can evolve independently of Incremental's.
+    java_main_class = 'MainOnline'
     def __init__(self, env, compute_nodes, tracker, config, overlap=False):
         self.env = env
         self.queue = simpy.Store(env)
@@ -440,6 +443,7 @@ class SchedulingUsingCSPIncremental(SchedulingUsingCSPOnline):
     is already queued (not just the single currently-executing item), so a new job's
     plan cannot collide with work already committed to other jobs.
     """
+    java_main_class = 'MainIncremental'
 
     def nodesFreeTimeIncremental(self, ongoing_transfers, ongoing_works):
         """Like nodesFreeTime, but also adds the backlog already queued (not yet started)
@@ -496,6 +500,17 @@ class SchedulingUsingCSPIncremental(SchedulingUsingCSPOnline):
 
             if self._allJobsCompleted():
                 break
+
+
+class SchedulingUsingCSPIncrementalFreeNodesOnly(SchedulingUsingCSPIncremental):
+    """
+    Same as SchedulingUsingCSPIncremental (one job at a time, never reconsidered), but the CSP
+    is only allowed to pick among nodes that are completely idle RIGHT NOW (nothing ongoing,
+    nothing already queued) -- a hard filter, with no notion of when a busy node would become
+    free. A busy node is simply not a candidate for this solve, period (still also subject to
+    the existing storage-size filter).
+    """
+    restrict_to_free_nodes = True
 
 
 class SchedulingUsingCSPSemiOnline:

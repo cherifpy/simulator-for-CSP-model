@@ -15,7 +15,7 @@ from simulator import (
     save_results_to_csv,
     configure_logging,
 )
-from master_node_with_heterogeneous_nodes_csp import SchedulingUsingCSPOnline, SchedulingUsingCSPIncremental
+from master_node_with_heterogeneous_nodes_csp import SchedulingUsingCSPOnline, SchedulingUsingCSPIncremental, SchedulingUsingCSPIncrementalFreeNodesOnly
 from utils.plots import plot_gantt_chart
 
 logger = logging.getLogger(__name__)
@@ -27,6 +27,14 @@ RESULTS_BASE = "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulat
 APPROACHES = {
     "online": SchedulingUsingCSPOnline,
     "incremental": SchedulingUsingCSPIncremental,
+    # free-nodes-only variant kept in the codebase (SchedulingUsingCSPIncrementalFreeNodesOnly)
+    # but set aside for now -- back to validating online vs incremental with storage.
+}
+
+SOLVER_TIME_LIMIT_S = {
+    "online": 60,
+    "incremental": 60,
+    "incremental_free_nodes_only": 60,
 }
 
 
@@ -35,6 +43,7 @@ def run_one(name, master_class, config_template):
     config['total_nb_jobs'] = NB_JOBS
     config['total_nb_compute_nodes'] = NB_NODES
     config['jobs_file_path'] = f"{INSTANCE_DIR}/jobs.json"
+    config['solver_time_limit_s'] = SOLVER_TIME_LIMIT_S[name]
 
     results_destination = f"{RESULTS_BASE}/{name}"
     os.makedirs(results_destination, exist_ok=True)
@@ -113,7 +122,7 @@ def analyze(name, results_destination):
 def main():
     with open("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/config.json", "r", encoding="utf-8") as f:
         config_template = json.load(f)
-    config_template['lambda_rate'] = 30
+    config_template['lambda_rate'] = 60
 
     configure_logging(logging.WARNING)
 

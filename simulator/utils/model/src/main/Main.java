@@ -516,6 +516,26 @@ public class Main {
 
             int makespan = 10_000;//(int) Math.min(makespanLong, Integer.MAX_VALUE);
 
+            // Optional hard node filter: when present, a node NOT listed is completely excluded
+            // from this solve's candidates -- no notion of "will be free in X time units", just
+            // in/out. Absent file (the default, used by Online/regular Incremental) means every
+            // node stays a candidate (subject to the storage-size filter below), unchanged from
+            // prior behavior.
+            boolean[] nodeFree = new boolean[nb_nodes];
+            java.util.Arrays.fill(nodeFree, true);
+            try {
+                String freeNodesText = readFile("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/free_nodes.txt").trim();
+                if (!freeNodesText.isEmpty()) {
+                    java.util.Arrays.fill(nodeFree, false);
+                    for (String tok : freeNodesText.split(",")) {
+                        if (!tok.trim().isEmpty()) nodeFree[Integer.parseInt(tok.trim())] = true;
+                    }
+                }
+            } catch (Exception e) {
+                // File missing/unreadable: keep every node free (no restriction), matching the
+                // behavior before this filter existed.
+            }
+
             //System.out.println("Computed makespan upper bound: " + makespan);
             // print inputs (summary)
             //System.out.println("DATA");
@@ -554,7 +574,7 @@ public class Main {
                     IntVar end = model.intVar("end_transfer_d" + i + "_n" + j, (int) starting_times[j] + d, makespan,true);
                     
                     BoolVar h;
-                    if (data_sizes[i] > storage_capacity[j]) {
+                    if (data_sizes[i] > storage_capacity[j] || !nodeFree[j]) {
                         h = model.boolVar("height_transfer_d" + i + "_n" + j, false);
                         //model.arithm(h, "=", 0).post();
                     }else{
@@ -595,7 +615,7 @@ public class Main {
                 // On retire directement ces noeuds du domaine de jobNodes.
                 List<Integer> validNodesList = new ArrayList<>();
                 for (int j = 0; j < nb_nodes; j++) {
-                    if (data_sizes[i] <= storage_capacity[j]) validNodesList.add(j);
+                    if (data_sizes[i] <= storage_capacity[j] && nodeFree[j]) validNodesList.add(j);
                 }
                 int[] validNodes = validNodesList.isEmpty()
                         ? ArrayUtils.array(0, nb_nodes - 1) // instance infaisable ; on laisse les autres contraintes le detecter
@@ -720,7 +740,18 @@ public class Main {
 
                     IntVar storageDuration = model.intVar("storage_duration_d" + i + "_n" + j, 0, makespan, true);
                     storageTasks[j][i] = new Task(effectiveStart, storageDuration, deletionTime);
-                    storageHeights[j][i] = transferHeights[j][i].mul(data_sizes[i]).intVar();
+                    // Data already physically on node j occupies real space for the whole
+                    // [effectiveStart, deletionTime] window regardless of transferHeights[j][i]:
+                    // "abandon" (height=0) only means "stop routing new work here", it does NOT
+                    // make the bytes vanish before deletionTime actually fires. Tying storage
+                    // height to transferHeights let an abandoned-but-still-resident replica be
+                    // counted as consuming zero space, so another job could be co-scheduled into
+                    // storage that was, in reality, still occupied -- a real capacity violation.
+                    // For a brand-new (not yet resident) candidate transfer, height still
+                    // correctly gates whether it ever consumes storage at all.
+                    storageHeights[j][i] = alreadyResident[j][i]
+                            ? model.intVar(data_sizes[i])
+                            : transferHeights[j][i].mul(data_sizes[i]).intVar();
                 }
             }
             for (int j = 0; j < nb_nodes; j++) {
@@ -867,7 +898,16 @@ public class Main {
                         new FailCounter(model, nb_data * nb_nodes * 100));
             }
 
-            solver.limitTime("30s");
+            int timeLimitSeconds = 120;
+            try {
+                String timeLimitText = readFile("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/solver_time_limit.txt").trim();
+                timeLimitSeconds = Integer.parseInt(timeLimitText);
+            } catch (Exception e) {
+                // File missing/unreadable (e.g. an older Python caller that doesn't write it
+                // yet): keep the 120s default rather than fail the whole solve over this.
+            }
+            System.out.println("Solver time limit: " + timeLimitSeconds + "s");
+            solver.limitTime(timeLimitSeconds + "s");
             
             boolean[] found = {false};
             solver.onSolution(() -> {
