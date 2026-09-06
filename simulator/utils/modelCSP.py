@@ -310,6 +310,12 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     with open("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/solver_time_limit.txt", "w") as f:
         f.write(str(int(solver_time_limit_s)))
 
+    # Java only ever works in a LOCAL frame (0 = "now" for this solve) -- it has no idea what
+    # the simulator's absolute clock reads. Pass it along purely so debug prints can show
+    # absolute times directly comparable to the final solution's "start:"/"end:" values.
+    with open("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/current_sim_time.txt", "w") as f:
+        f.write(str(master_node.env.now))
+
     # Ghost storage: jobs NOT part of this solve's batch (e.g. a job that already had every
     # task dispatched and dropped out of reconsideration, or -- for Incremental -- literally
     # every other job) but whose data is still physically resident somewhere. The CSP can't

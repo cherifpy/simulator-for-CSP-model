@@ -489,6 +489,18 @@ public class MainOnline {
 
         public static SchedulingResult runScheduler(List<MainOnline.Job>  jobs,int nb_nodes, int nb_data, int[] data_sizes, int[][] works, int[] bandwidths, double[] cpus, int[] storage_capacity, double[] starting_times, int[][]  replicas_location, Model[] models, int pos, boolean solve, double[] job_arriving_times) {
             final int CPU_UNIT = 1; // to scale cpu speeds
+
+            // starting_times[j] (how long node j stays busy) comes from the Python simulator as
+            // a float, computed from real (float) simulation time -- Choco's IntVars only take
+            // ints. A plain (int) cast truncates toward zero, so a node that's actually free at
+            // t=45.7 would be treated as free at t=45, letting the model schedule something
+            // 0.7 units before the node is really available. Round up AND add a full extra unit
+            // of margin on top (per the same float/int mismatch on the Python side, where not
+            // every code path already adds its own margin) so this bound is never optimistic.
+            int[] nodeStartingTimes = new int[nb_nodes];
+            for (int j = 0; j < nb_nodes; j++) {
+                nodeStartingTimes[j] = (int) Math.ceil(starting_times[j]) + 1;
+            }
             // compute an upper bound on makespan (same idea as python)
             long makespanLong = 0;
 
@@ -514,7 +526,7 @@ public class MainOnline {
             makespanLong *= 2;
 
 
-            int makespan = 10_000;//(int) Math.min(makespanLong, Integer.MAX_VALUE);
+            int makespan = 10_000; //(int) Math.min(makespanLong, Integer.MAX_VALUE);
 
             // Optional hard node filter: when present, a node NOT listed is completely excluded
             // from this solve's candidates -- no notion of "will be free in X time units", just
@@ -567,7 +579,15 @@ public class MainOnline {
             //    // File missing/unreadable: no ghost entries (matches behavior before this existed).
             //}
 
-
+            // Absolute simulator clock at the moment this solve was launched, purely for debug
+            // prints below -- lets us show times directly comparable to the "start:"/"end:"
+            // values Python prints for the final solution (which are also now+local).
+            double currentSimTime = 0.0;
+            try {
+                currentSimTime = Double.parseDouble(readFile("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/current_sim_time.txt").trim());
+            } catch (Exception e) {
+                // File missing/unreadable: debug prints just show 0 for "now" instead of crashing.
+            }
 
             // ----- MODEL -----
             Model model = new Model("Bag of Tasks Scheduling (Java)");
@@ -605,9 +625,22 @@ public class MainOnline {
                     // branch set h, or the Task below is contradictory and the WHOLE model
                     // becomes infeasible the moment any single node is too small for any single
                     // job -- even though h=false already means this pair can never be selected.
-                    s = model.intVar("start_transfer_d" + i + "_n" + j, (int) starting_times[j], makespan, true);
-                    d = (int) Math.ceil(transferTime(i, j, data_sizes[i], bandwidths[j], replicas_location));
-                    end = model.intVar("end_transfer_d" + i + "_n" + j, (int) starting_times[j] + d, makespan, true);
+                    final int jForResidentCheck = j;
+                    boolean isResident = Arrays.stream(replicas_location[i]).anyMatch(n -> n == jForResidentCheck);
+                    if (isResident) {
+                        // Data is already physically on this node from a previous solve: pin its
+                        // storage-occupancy start to "now" (nodeStartingTimes[j]) instead of leaving
+                        // it a free variable the solver could push arbitrarily far into the future to
+                        // manufacture spare capacity for other placements -- that free-start gap is
+                        // what let already-resident data go uncounted against real storage usage.
+                        s = model.intVar("start_transfer_d" + i + "_n" + j, nodeStartingTimes[j], nodeStartingTimes[j], true);
+                        d = 1;
+                        end = model.intVar("end_transfer_d" + i + "_n" + j, nodeStartingTimes[j] + d, nodeStartingTimes[j] + d, true);
+                    } else {
+                        s = model.intVar("start_transfer_d" + i + "_n" + j, nodeStartingTimes[j], makespan, true);
+                        d = (int) Math.ceil(transferTime(i, j, data_sizes[i], bandwidths[j], replicas_location));
+                        end = model.intVar("end_transfer_d" + i + "_n" + j, nodeStartingTimes[j] + d, makespan, true);
+                    }
                     IntVar durationVar = model.intVar(d);
                     
                     Task t = new Task(s, durationVar, end);
@@ -623,17 +656,12 @@ public class MainOnline {
             IntVar[][] jobEnds = new IntVar[nb_data][];
             IntVar[][] jobNodes = new IntVar[nb_data][];
 
-
-            
-
             for (int i = 0; i < nb_data; i++) {
                 int[] wl = works[i]; 
                 jobStarts[i] = new IntVar[wl.length];
                 jobDurations[i] = new IntVar[wl.length];
                 jobEnds[i] = new IntVar[wl.length];
                 jobNodes[i] = new IntVar[wl.length];
-
-
 
                 // Reduction de l'espace de recherche : un noeud dont la capacite de
                 // stockage est trop petite pour la donnee i ne peut de toute facon
@@ -783,7 +811,6 @@ public class MainOnline {
             // Data i occupies storage on node j from the moment its transfer to j
             // starts until the last work assigned to that node for that data
             // finishes (release time) -- that's when it can be deleted locally.
-
             Task[][] storageTasks = new Task[nb_nodes][nb_data];
             IntVar[][] storageHeights = new IntVar[nb_nodes][nb_data];
             for (int i = 0; i < nb_data; i++) {
@@ -797,7 +824,7 @@ public class MainOnline {
                     IntVar[] candidateEnds = new IntVar[wl.length];
                     for (int k = 0; k < wl.length; k++) {
                         BoolVar onJ = jobNodes[i][k].eq(j).boolVar();
-                        IntVar cand = model.intVar("release_cand_d" + i + "_n" + j + "_w" + k, (int) starting_times[j], makespan, true);
+                        IntVar cand = model.intVar("release_cand_d" + i + "_n" + j + "_w" + k, (int)starting_times[j], makespan, true);
                         model.impXrelYC(cand, "=", jobEnds[i][k], 0, onJ);
                         model.impXrelYC(cand, "=", transferStart, 0, onJ.not());
                         candidateEnds[k] = cand;
@@ -813,6 +840,24 @@ public class MainOnline {
             for (int j = 0; j < nb_nodes; j++) {
                 model.cumulative(storageTasks[j], storageHeights[j], model.intVar(storage_capacity[j])).post();
             }
+
+            //for (int j = 0; j < nb_nodes; j++) {
+            //    List<Task> nodeStorageTasks = new ArrayList<>(Arrays.asList(storageTasks[j]));
+            //    List<IntVar> nodeStorageHeights = new ArrayList<>(Arrays.asList(storageHeights[j]));
+            //    for (GhostStorage g : ghostStorage) {
+            //        if (g.nodeId != j) continue;
+            //        // Fixed (non-decision) task: occupies g.size from 0 until its known/assumed
+            //        // release time, exactly like alreadyResident data, just not schedulable here.
+            //        Task ghostTask = new Task(model.intVar(0), model.intVar(g.deletionTime), model.intVar(g.deletionTime));
+            //        nodeStorageTasks.add(ghostTask);
+            //        nodeStorageHeights.add(model.intVar(g.size));
+            //    }
+            //    model.cumulative(
+            //            nodeStorageTasks.toArray(new Task[0]),
+            //            nodeStorageHeights.toArray(new IntVar[0]),
+            //            model.intVar(storage_capacity[j])
+            //    ).post();
+            //}
 
             // ----- CONSTRAINTS -----
             // Cumulative constraints for transfers on each node (capacity = 1)
@@ -940,7 +985,7 @@ public class MainOnline {
                         new FailCounter(model, nb_data * nb_nodes * 100));
             }
 
-            int timeLimitSeconds = 120;
+            int timeLimitSeconds = 30;
             try {
                 String timeLimitText = readFile("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/solver_time_limit.txt").trim();
                 timeLimitSeconds = Integer.parseInt(timeLimitText);
@@ -980,8 +1025,14 @@ public class MainOnline {
 
                             final int jFinal = j;
                             if(transferHeights[j][i].getValue() == 0 && replicas_location[i].length > 0 && Arrays.stream(replicas_location[i]).anyMatch(n -> n == jFinal)) {
-
-                                    deletionsList.add(new DeletionConfig(i, j, 0));
+                                // Not 0 (immediate): nodeStartingTimes[j] already reflects when
+                                // node j's CURRENTLY ongoing transfer/task (whoever it belongs
+                                // to) actually finishes. Deleting any earlier risks yanking data
+                                // out from under a task that's mid-execution but no longer
+                                // visible to this solve (already-Started tasks aren't part of
+                                // the work list, so an abandon decision here has no way to know
+                                // about them otherwise).
+                                deletionsList.add(new DeletionConfig(i, j, nodeStartingTimes[j]));
                             }
 
 
@@ -1002,6 +1053,12 @@ public class MainOnline {
                 /*System.out.printf("%d;%d;%.2f;%d\n",
                         objectives[0].getValue(), objectives[1].getValue(), solver.getTimeCount(), solver.getSolutionCount());*/
             });
+
+            System.out.printf("Node free/release times before solving (sim clock now=%.4f):%n", currentSimTime);
+            for (int j = 0; j < nb_nodes; j++) {
+                System.out.printf("  node_%d: raw=%.4f -> used=%d  (absolute: now+used=%.4f)%n",
+                        j, starting_times[j], nodeStartingTimes[j], currentSimTime + nodeStartingTimes[j]);
+            }
 
             solver.findOptimalSolution(objectives[0], false);
             if (!found[0]) {

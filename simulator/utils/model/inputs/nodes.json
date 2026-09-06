@@ -3,14 +3,14 @@
         "node_id":0,
         "bandwidth":15.0,
         "compute_capacity":1.7033694783,
-        "free_time":602,
+        "free_time":130,
         "storage_capacity":5120
     },
     {
         "node_id":1,
         "bandwidth":106.0,
         "compute_capacity":1.245531812,
-        "free_time":1133,
+        "free_time":102,
         "storage_capacity":81920
     },
     {
@@ -24,63 +24,63 @@
         "node_id":3,
         "bandwidth":39.0,
         "compute_capacity":1.0327769414,
-        "free_time":1041,
+        "free_time":6,
         "storage_capacity":40961
     },
     {
         "node_id":4,
         "bandwidth":37.0,
         "compute_capacity":1.0291895667,
-        "free_time":847,
+        "free_time":66,
         "storage_capacity":81920
     },
     {
         "node_id":5,
         "bandwidth":40.0,
         "compute_capacity":1.5994356287,
-        "free_time":840,
+        "free_time":90,
         "storage_capacity":7169
     },
     {
         "node_id":6,
         "bandwidth":12.0,
         "compute_capacity":1.8903735023,
-        "free_time":588,
+        "free_time":137,
         "storage_capacity":5120
     },
     {
         "node_id":7,
         "bandwidth":55.0,
         "compute_capacity":1.7679533345,
-        "free_time":482,
+        "free_time":13,
         "storage_capacity":5120
     },
     {
         "node_id":8,
         "bandwidth":55.0,
         "compute_capacity":2.0529343794,
-        "free_time":820,
+        "free_time":73,
         "storage_capacity":10240
     },
     {
         "node_id":9,
         "bandwidth":120.0,
         "compute_capacity":1.1063880145,
-        "free_time":1140,
+        "free_time":139,
         "storage_capacity":7169
     },
     {
         "node_id":10,
         "bandwidth":105.0,
         "compute_capacity":1.8878411006,
-        "free_time":62,
+        "free_time":0,
         "storage_capacity":2050
     },
     {
         "node_id":11,
         "bandwidth":60.0,
         "compute_capacity":2.0704273404,
-        "free_time":800,
+        "free_time":6,
         "storage_capacity":7169
     },
     {
@@ -94,21 +94,21 @@
         "node_id":13,
         "bandwidth":102.0,
         "compute_capacity":8.309408581,
-        "free_time":944,
+        "free_time":180,
         "storage_capacity":81920
     },
     {
         "node_id":14,
         "bandwidth":49.0,
         "compute_capacity":6.9115931026,
-        "free_time":152,
+        "free_time":0,
         "storage_capacity":5120
     },
     {
         "node_id":15,
         "bandwidth":60.0,
         "compute_capacity":9.465934667,
-        "free_time":775,
+        "free_time":0,
         "storage_capacity":81920
     },
     {
@@ -122,21 +122,21 @@
         "node_id":17,
         "bandwidth":101.0,
         "compute_capacity":8.6807006975,
-        "free_time":993,
+        "free_time":4,
         "storage_capacity":81920
     },
     {
         "node_id":18,
         "bandwidth":93.0,
         "compute_capacity":6.2856100383,
-        "free_time":567,
+        "free_time":522,
         "storage_capacity":81920
     },
     {
         "node_id":19,
         "bandwidth":71.0,
         "compute_capacity":6.9792437006,
-        "free_time":775,
+        "free_time":130,
         "storage_capacity":81920
     },
     {
@@ -150,70 +150,70 @@
         "node_id":21,
         "bandwidth":16.0,
         "compute_capacity":6.9161922879,
-        "free_time":594,
+        "free_time":104,
         "storage_capacity":10240
     },
     {
         "node_id":22,
         "bandwidth":39.0,
         "compute_capacity":7.0709635039,
-        "free_time":1010,
+        "free_time":0,
         "storage_capacity":40961
     },
     {
         "node_id":23,
         "bandwidth":52.0,
         "compute_capacity":9.5054705059,
-        "free_time":804,
+        "free_time":99,
         "storage_capacity":10240
     },
     {
         "node_id":24,
         "bandwidth":94.0,
         "compute_capacity":7.5825276042,
-        "free_time":145,
+        "free_time":146,
         "storage_capacity":7169
     },
     {
         "node_id":25,
         "bandwidth":790.0,
         "compute_capacity":1.1535933515,
-        "free_time":1059,
+        "free_time":9,
         "storage_capacity":7169
     },
     {
         "node_id":26,
         "bandwidth":709.0,
         "compute_capacity":1.8217151928,
-        "free_time":966,
+        "free_time":169,
         "storage_capacity":10240
     },
     {
         "node_id":27,
         "bandwidth":635.0,
         "compute_capacity":1.3981960881,
-        "free_time":15,
+        "free_time":0,
         "storage_capacity":2050
     },
     {
         "node_id":28,
         "bandwidth":628.0,
         "compute_capacity":1.8313603733,
-        "free_time":537,
+        "free_time":79,
         "storage_capacity":5120
     },
     {
         "node_id":29,
         "bandwidth":708.0,
         "compute_capacity":1.8712873008,
-        "free_time":1011,
+        "free_time":146,
         "storage_capacity":10240
     },
     {
         "node_id":30,
         "bandwidth":719.0,
         "compute_capacity":1.4197812152,
-        "free_time":1016,
+        "free_time":26,
         "storage_capacity":40961
     },
     {
@@ -227,21 +227,21 @@
         "node_id":32,
         "bandwidth":737.0,
         "compute_capacity":1.7498814059,
-        "free_time":1094,
+        "free_time":30,
         "storage_capacity":81920
     },
     {
         "node_id":33,
         "bandwidth":675.0,
         "compute_capacity":1.3741930203,
-        "free_time":1095,
+        "free_time":29,
         "storage_capacity":10240
     },
     {
         "node_id":34,
         "bandwidth":784.0,
         "compute_capacity":1.0035698477,
-        "free_time":1138,
+        "free_time":81,
         "storage_capacity":7169
     },
     {
@@ -255,14 +255,14 @@
         "node_id":36,
         "bandwidth":676.0,
         "compute_capacity":1.9575704268,
-        "free_time":1038,
+        "free_time":25,
         "storage_capacity":40961
     },
     {
         "node_id":37,
         "bandwidth":639.0,
         "compute_capacity":8.4358808458,
-        "free_time":151,
+        "free_time":152,
         "storage_capacity":5120
     },
     {
@@ -276,77 +276,77 @@
         "node_id":39,
         "bandwidth":725.0,
         "compute_capacity":8.3957783378,
-        "free_time":78,
+        "free_time":82,
         "storage_capacity":7169
     },
     {
         "node_id":40,
         "bandwidth":678.0,
         "compute_capacity":9.5148875113,
-        "free_time":553,
+        "free_time":616,
         "storage_capacity":5120
     },
     {
         "node_id":41,
         "bandwidth":620.0,
         "compute_capacity":9.5120383968,
-        "free_time":553,
+        "free_time":616,
         "storage_capacity":10240
     },
     {
         "node_id":42,
         "bandwidth":794.0,
         "compute_capacity":9.2640930137,
-        "free_time":191,
+        "free_time":580,
         "storage_capacity":5120
     },
     {
         "node_id":43,
         "bandwidth":721.0,
         "compute_capacity":6.513565858,
-        "free_time":583,
+        "free_time":3,
         "storage_capacity":5120
     },
     {
         "node_id":44,
         "bandwidth":755.0,
         "compute_capacity":7.0602265158,
-        "free_time":581,
+        "free_time":11,
         "storage_capacity":5120
     },
     {
         "node_id":45,
         "bandwidth":793.0,
         "compute_capacity":9.715653972,
-        "free_time":568,
+        "free_time":632,
         "storage_capacity":5120
     },
     {
         "node_id":46,
         "bandwidth":702.0,
         "compute_capacity":8.8517958913,
-        "free_time":894,
+        "free_time":172,
         "storage_capacity":81920
     },
     {
         "node_id":47,
         "bandwidth":732.0,
         "compute_capacity":7.4936820101,
-        "free_time":112,
+        "free_time":48,
         "storage_capacity":5120
     },
     {
         "node_id":48,
         "bandwidth":686.0,
         "compute_capacity":6.8987893481,
-        "free_time":599,
+        "free_time":44,
         "storage_capacity":40961
     },
     {
         "node_id":49,
         "bandwidth":656.0,
         "compute_capacity":6.9204589304,
-        "free_time":614,
+        "free_time":47,
         "storage_capacity":81920
     }
 ]

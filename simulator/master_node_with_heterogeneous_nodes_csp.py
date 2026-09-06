@@ -387,11 +387,15 @@ class SchedulingUsingCSPOnline:
                     free_via_work = int(t_start + execution_time - self.env.now) + 1
 
                 elif task.status == "Finished":
-                    free_via_work = task.duration * self.compute_nodes[node_id].compute_capacity
+                    # Same +1 margin as the other branches: this value gets truncated to an int
+                    # again on the Java side (JSON has no distinct int/float, and getInt() just
+                    # truncates), so leaving it as a bare float here would silently lose the
+                    # fractional part with no safety margin at all.
+                    free_via_work = int(task.duration * self.compute_nodes[node_id].compute_capacity) + 1
 
                 else:
                     execution_time = task.duration * self.compute_nodes[node_id].compute_capacity
-                    free_via_work = execution_time
+                    free_via_work = int(execution_time) + 1
 
             # A node is free only once BOTH its ongoing transfer and its ongoing task are done.
             nodes_free_time[node_id] = max(free_via_transfer, free_via_work)
