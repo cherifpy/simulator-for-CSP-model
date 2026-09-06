@@ -521,20 +521,20 @@ public class MainOnline {
             // in/out. Absent file (the default, used by Online/regular Incremental) means every
             // node stays a candidate (subject to the storage-size filter below), unchanged from
             // prior behavior.
-            boolean[] nodeFree = new boolean[nb_nodes];
-            java.util.Arrays.fill(nodeFree, true);
-            try {
-                String freeNodesText = readFile("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/free_nodes.txt").trim();
-                if (!freeNodesText.isEmpty()) {
-                    java.util.Arrays.fill(nodeFree, false);
-                    for (String tok : freeNodesText.split(",")) {
-                        if (!tok.trim().isEmpty()) nodeFree[Integer.parseInt(tok.trim())] = true;
-                    }
-                }
-            } catch (Exception e) {
-                // File missing/unreadable: keep every node free (no restriction), matching the
-                // behavior before this filter existed.
-            }
+            //boolean[] nodeFree = new boolean[nb_nodes];
+            //java.util.Arrays.fill(nodeFree, true);
+            //try {
+            //    String freeNodesText = readFile("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/free_nodes.txt").trim();
+            //    if (!freeNodesText.isEmpty()) {
+            //        java.util.Arrays.fill(nodeFree, false);
+            //        for (String tok : freeNodesText.split(",")) {
+            //            if (!tok.trim().isEmpty()) nodeFree[Integer.parseInt(tok.trim())] = true;
+            //        }
+            //    }
+            //} catch (Exception e) {
+            //    // File missing/unreadable: keep every node free (no restriction), matching the
+            //    // behavior before this filter existed.
+            //}
 
             // Ghost storage entries: data that belongs to jobs NOT part of this solve's batch at
             // all (e.g. a job that already had every task dispatched and dropped out of
@@ -544,28 +544,28 @@ public class MainOnline {
             // until a known (or, if not yet decided, indefinite) release time, folded into that
             // node's SAME storage cumulative constraint below so real capacity is never
             // overbooked by something this solve otherwise can't see at all.
-            class GhostStorage {
-                int nodeId; int size; int deletionTime;
-                GhostStorage(int n, int s, int d) { nodeId = n; size = s; deletionTime = d; }
-            }
-            List<GhostStorage> ghostStorage = new ArrayList<>();
-            try {
-                String ghostText = readFile("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/ghost_storage.txt").trim();
-                if (!ghostText.isEmpty()) {
-                    for (String line : ghostText.split("\n")) {
-                        if (line.trim().isEmpty()) continue;
-                        String[] parts = line.trim().split(",");
-                        int gNode = Integer.parseInt(parts[0].trim());
-                        int gSize = Integer.parseInt(parts[1].trim());
-                        int gDeletion = Integer.parseInt(parts[2].trim());
-                        // -1 means "no deletion decided yet for this (job,node)": treat as kept
-                        // indefinitely within this horizon, same safe default as regular data.
-                        ghostStorage.add(new GhostStorage(gNode, gSize, gDeletion < 0 ? makespan : gDeletion));
-                    }
-                }
-            } catch (Exception e) {
-                // File missing/unreadable: no ghost entries (matches behavior before this existed).
-            }
+            //class GhostStorage {
+            //    int nodeId; int size; int deletionTime;
+            //    GhostStorage(int n, int s, int d) { nodeId = n; size = s; deletionTime = d; }
+            //}
+            //List<GhostStorage> ghostStorage = new ArrayList<>();
+            //try {
+            //    String ghostText = readFile("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/ghost_storage.txt").trim();
+            //    if (!ghostText.isEmpty()) {
+            //        for (String line : ghostText.split("\n")) {
+            //            if (line.trim().isEmpty()) continue;
+            //            String[] parts = line.trim().split(",");
+            //            int gNode = Integer.parseInt(parts[0].trim());
+            //            int gSize = Integer.parseInt(parts[1].trim());
+            //            int gDeletion = Integer.parseInt(parts[2].trim());
+            //            // -1 means "no deletion decided yet for this (job,node)": treat as kept
+            //            // indefinitely within this horizon, same safe default as regular data.
+            //            ghostStorage.add(new GhostStorage(gNode, gSize, gDeletion < 0 ? makespan : gDeletion));
+            //        }
+            //    }
+            //} catch (Exception e) {
+            //    // File missing/unreadable: no ghost entries (matches behavior before this existed).
+            //}
 
 
 
@@ -588,20 +588,27 @@ public class MainOnline {
 
                 for (int i = 0; i < nb_data; i++) {
 
-                    IntVar s = model.intVar("start_transfer_d" + i + "_n" + j, (int) starting_times[j], makespan,true);
+                    IntVar s; // = model.intVar("start_transfer_d" + i + "_n" + j, (int) starting_times[j], makespan,true);
                     
-                    int d = (int) Math.ceil(transferTime(i, j, data_sizes[i], bandwidths[j], replicas_location));
+                    int d; // = (int) Math.ceil(transferTime(i, j, data_sizes[i], bandwidths[j], replicas_location));
                     //System.out.println("Transfer time for data " + i + " on node " + j + ": " + d + "starting_time: " + starting_times[j]);
-                    IntVar durationVar = model.intVar(d);
-                    IntVar end = model.intVar("end_transfer_d" + i + "_n" + j, (int) starting_times[j] + d, makespan,true);
+                    //IntVar durationVar = model.intVar(d);
+                    IntVar end;// = model.intVar("end_transfer_d" + i + "_n" + j, (int) starting_times[j] + d, makespan,true);
                     
                     BoolVar h;
-                    if (data_sizes[i] > storage_capacity[j] || !nodeFree[j]) {
+                    if (data_sizes[i] > storage_capacity[j]) {
                         h = model.boolVar("height_transfer_d" + i + "_n" + j, false);
-                        //model.arithm(h, "=", 0).post();
                     }else{
                         h = model.boolVar("height_transfer_d" + i + "_n" + j);
                     }
+                    // s/end must stay internally consistent (s + d = end) regardless of which
+                    // branch set h, or the Task below is contradictory and the WHOLE model
+                    // becomes infeasible the moment any single node is too small for any single
+                    // job -- even though h=false already means this pair can never be selected.
+                    s = model.intVar("start_transfer_d" + i + "_n" + j, (int) starting_times[j], makespan, true);
+                    d = (int) Math.ceil(transferTime(i, j, data_sizes[i], bandwidths[j], replicas_location));
+                    end = model.intVar("end_transfer_d" + i + "_n" + j, (int) starting_times[j] + d, makespan, true);
+                    IntVar durationVar = model.intVar(d);
                     
                     Task t = new Task(s, durationVar, end);
                     transferTasks[j][i] = t;
@@ -635,7 +642,7 @@ public class MainOnline {
                 // On retire directement ces noeuds du domaine de jobNodes.
                 List<Integer> validNodesList = new ArrayList<>();
                 for (int j = 0; j < nb_nodes; j++) {
-                    if (data_sizes[i] <= storage_capacity[j] && nodeFree[j]) validNodesList.add(j);
+                    if (data_sizes[i] <= storage_capacity[j]) validNodesList.add(j);
                 }
                 int[] validNodes = validNodesList.isEmpty()
                         ? ArrayUtils.array(0, nb_nodes - 1) // instance infaisable ; on laisse les autres contraintes le detecter
@@ -776,6 +783,7 @@ public class MainOnline {
             // Data i occupies storage on node j from the moment its transfer to j
             // starts until the last work assigned to that node for that data
             // finishes (release time) -- that's when it can be deleted locally.
+
             Task[][] storageTasks = new Task[nb_nodes][nb_data];
             IntVar[][] storageHeights = new IntVar[nb_nodes][nb_data];
             for (int i = 0; i < nb_data; i++) {
@@ -789,12 +797,12 @@ public class MainOnline {
                     IntVar[] candidateEnds = new IntVar[wl.length];
                     for (int k = 0; k < wl.length; k++) {
                         BoolVar onJ = jobNodes[i][k].eq(j).boolVar();
-                        IntVar cand = model.intVar("release_cand_d" + i + "_n" + j + "_w" + k, starting_times[i], makespan, true);
+                        IntVar cand = model.intVar("release_cand_d" + i + "_n" + j + "_w" + k, (int) starting_times[j], makespan, true);
                         model.impXrelYC(cand, "=", jobEnds[i][k], 0, onJ);
                         model.impXrelYC(cand, "=", transferStart, 0, onJ.not());
                         candidateEnds[k] = cand;
                     }
-                    IntVar release = model.intVar("release_d" + i + "_n" + j, starting_times[i], makespan, true);
+                    IntVar release = model.intVar("release_d" + i + "_n" + j, (int)starting_times[j], makespan, true);
                     model.max(release, candidateEnds).post();
 
                     IntVar storageDuration = model.intVar("storage_duration_d" + i + "_n" + j, 0, makespan, true);
@@ -886,7 +894,6 @@ public class MainOnline {
                             Search.intVarSearch(new InputOrder<>(model),
                                     new IntDomainLast(model.getSolver().defaultSolution(),
                                             new IntValueSelector() {
-
                                                 @Override
                                                 public int selectValue(IntVar intVar) {
                                                     if (intVar.getName().startsWith("node_work_d")) {
@@ -971,17 +978,24 @@ public class MainOnline {
                                 transfersList.add(tmp_transfer);
                             }
 
+                            final int jFinal = j;
+                            if(transferHeights[j][i].getValue() == 0 && replicas_location[i].length > 0 && Arrays.stream(replicas_location[i]).anyMatch(n -> n == jFinal)) {
+
+                                    deletionsList.add(new DeletionConfig(i, j, 0));
+                            }
+
+
                             // Storage on (j,i) is occupied within this solve either because it's
                             // used now (height=1, release = when the last task using it there
                             // finishes) or because it was already resident before this solve but
                             // is abandoned here (height=0, so release collapses to effectiveStart
                             // -- i.e. delete it right away since nothing here needs it anymore).
-                            if (transferHeights[j][i].getValue() == 1 || alreadyResident[j][i]) {
-                                int releaseTime = releases[j][i].getValue();
-                                if (releaseTime < makespan) {
-                                    deletionsList.add(new DeletionConfig(i, j, releaseTime));
-                                }
-                            }
+                            //if (transferHeights[j][i].getValue() == 1 || alreadyResident[j][i]) {
+                            //    // int releaseTime = releases[j][i].getValue();
+                            //    if (releaseTime < makespan) {
+                            //        deletionsList.add(new DeletionConfig(i, j, 0)); // releaseTime));
+                            //    }
+                            //}
                         }
                     }
 
