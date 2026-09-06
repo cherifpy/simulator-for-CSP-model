@@ -218,6 +218,26 @@ class SchedulingUsingCSPOnline:
                     if task.status == "Finished":
                         self.ongoing_works[f'node_{node_id}'] = None
 
+                        # The job's data is only needed on this node for as long as one of
+                        # its tasks is still queued to run here. No task of this job left in
+                        # this node's queue -> the data can be released right away, instead of
+                        # waiting on a CSP-decided deletion time that can go stale once the job
+                        # drops out of the reconsideration batch (no "NotStarted" tasks left) and
+                        # is never revisited by a later solve.
+                        still_needed_here = any(w[0] == job_id for w in self.works[f'node_{node_id}'])
+                        if not still_needed_here and job_id in self.replicas_locations and node_id in self.replicas_locations[job_id]:
+                            compute_node = self.compute_nodes[node_id]
+                            self.replicas_locations[job_id].remove(node_id)
+                            if job_id in compute_node.datasets:
+                                compute_node.datasets.remove(job_id)
+                            # Drop any CSP-scheduled deletion still pending for this pair so it
+                            # doesn't fire a redundant (and now stale) deletion later.
+                            self.deletions[f'node_{node_id}'] = [
+                                d for d in self.deletions[f'node_{node_id}'] if d[0] != job_id
+                            ]
+                            self.tracker.log_deletion(job_id, node_id, self.env.now)
+                            logger.debug("[%s] Master: released job %s's data from node %s (no task of this job left there)", self.env.now, job_id, node_id)
+
                 if len(self.works[f'node_{node_id}']) > 0 and self.ongoing_works[f'node_{node_id}'] is None:
 
                     (job_id, _, k, t_start, _, _) = self.works[f'node_{node_id}'][0]
