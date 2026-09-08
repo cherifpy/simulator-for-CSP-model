@@ -10,7 +10,7 @@
     {
         "job_id":1,
         "dataset_size":20480,
-        "nb_tasks":10,
+        "nb_tasks":8,
         "task_duration":80,
         "timelasped":357,
         "job_arriving_time":62.7233475791
@@ -24,9 +24,17 @@
         "job_arriving_time":82.0207914236
     },
     {
+        "job_id":3,
+        "dataset_size":20480,
+        "nb_tasks":1,
+        "task_duration":70,
+        "timelasped":322,
+        "job_arriving_time":97.1759625638
+    },
+    {
         "job_id":4,
         "dataset_size":4096,
-        "nb_tasks":9,
+        "nb_tasks":6,
         "task_duration":100,
         "timelasped":242,
         "job_arriving_time":177.1915229322
@@ -34,7 +42,7 @@
     {
         "job_id":5,
         "dataset_size":2048,
-        "nb_tasks":5,
+        "nb_tasks":6,
         "task_duration":120,
         "timelasped":174,
         "job_arriving_time":244.9419034602

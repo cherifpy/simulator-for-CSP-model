@@ -395,6 +395,14 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     result = subprocess.run(
         [
             "java",
+            # Some JDK builds (25+) enable the Graal-based JIT (JVMCI) by default, which fails
+            # at startup with "graal_create_isolate error" in memory-constrained environments
+            # (e.g. a tightly cgroup-limited Grid5000 job) -- forcing the standard JIT sidesteps
+            # that isolate-allocation failure entirely, and Choco Solver needs nothing from Graal.
+            # UnlockExperimentalVMOptions is required on JDKs where JVMCI is still gated as
+            # experimental; it's a harmless no-op on newer ones where it no longer is.
+            "-XX:+UnlockExperimentalVMOptions",
+            "-XX:-UseJVMCICompiler",
             "-cp",
             os.path.join(MODEL_DIR, "bin") + ":" + os.path.join(MODEL_DIR, "lib", "*"),
             f"main.{java_main_class}"

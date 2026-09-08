@@ -2,3 +2,4 @@ env/*
 simulator/utils/CSPModel/lib/*
 simulator/workloads/*
 simulator/results*
+simulator-for-CSP-model/*
