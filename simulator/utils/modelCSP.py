@@ -1,10 +1,19 @@
 import re
+import os
 from pychoco import *
 import pandas as pd
 import random as rnd
 import math
 import numpy as np
 import copy
+
+# Portable base paths: computed from this file's own location instead of hardcoded to any one
+# machine's home directory, so the whole `simulator/` folder can be copied anywhere (e.g. to
+# Grid5000, under a different username/home path) and still work unchanged.
+UTILS_DIR = os.path.dirname(os.path.abspath(__file__))
+SIMULATOR_DIR = os.path.dirname(UTILS_DIR)
+MODEL_DIR = os.path.join(UTILS_DIR, "model")
+MINIZINC_DIR = os.path.join(UTILS_DIR, "minizincModel")
 
 CPU_UNIT = 1  # defines one unit of work per second
 #rnd.seed(42)
@@ -261,14 +270,21 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
                 resident_nodes.append(node_id)
         matrix.append(resident_nodes)
     print("matrix:", matrix)
-    with open("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/replicas_locations.json", "w") as f:
+    with open(os.path.join(MODEL_DIR, "inputs", "replicas_locations.json"), "w") as f:
         json.dump(matrix, f)
 
     # Optional hard node filter: only written when the caller opts in (restrict_to_free_nodes),
     # so Online/plain Incremental keep considering every (storage-eligible) node, unrestricted,
-    # as before. A node counts as "free" only if it has nothing ongoing AND nothing already
-    # queued -- no notion of when a busy node would become available, just in/out right now.
-    free_nodes_path = "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/free_nodes.txt"
+    # as before. A node counts as "free" if it has nothing ongoing RIGHT NOW (no active transfer,
+    # no active task) -- already-queued-but-not-yet-started future work doesn't disqualify it,
+    # since nodes_free_time (built from nodesFreeTimeIncremental, which sums that queued backlog's
+    # duration on top of whatever's ongoing) already tells the CSP exactly when this node truly
+    # becomes free, so it won't be double-booked against that backlog either way. Requiring the
+    # backlog itself to be empty was much stricter than necessary: a job with many tasks chained
+    # on one node can occupy it, as far as this filter is concerned, for the job's entire
+    # remaining lifetime, so the pool of "free" nodes could shrink toward zero and never recover
+    # under sustained load, starving whichever job is waiting.
+    free_nodes_path = os.path.join(MODEL_DIR, "inputs", "free_nodes.txt")
     if getattr(master_node, 'restrict_to_free_nodes', False):
         free_node_ids = []
         for node_id in range(len(master_node.compute_nodes)):
@@ -276,8 +292,6 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
             idle = (
                 master_node.ongoing_transfers.get(key) is None
                 and master_node.ongoing_works.get(key) is None
-                and len(master_node.transfers.get(key, [])) == 0
-                and len(master_node.works.get(key, [])) == 0
             )
             if idle:
                 free_node_ids.append(node_id)
@@ -302,18 +316,18 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     jobs_data = sorted(jobs_data, key=lambda x: x['job_id'])
     
 
-    pd.DataFrame(jobs_data).to_json("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/jobs.json", orient="records", indent=4)
+    pd.DataFrame(jobs_data).to_json(os.path.join(MODEL_DIR, "inputs", "jobs.json"), orient="records", indent=4)
 
     # Per-scheduler-class solver time budget (e.g. Online vs Incremental can be compared at
     # different budgets); Main.java falls back to 120s if this file is missing/unreadable.
     solver_time_limit_s = master_node._config.get('solver_time_limit_s', 120)
-    with open("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/solver_time_limit.txt", "w") as f:
+    with open(os.path.join(MODEL_DIR, "inputs", "solver_time_limit.txt"), "w") as f:
         f.write(str(int(solver_time_limit_s)))
 
     # Java only ever works in a LOCAL frame (0 = "now" for this solve) -- it has no idea what
     # the simulator's absolute clock reads. Pass it along purely so debug prints can show
     # absolute times directly comparable to the final solution's "start:"/"end:" values.
-    with open("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/current_sim_time.txt", "w") as f:
+    with open(os.path.join(MODEL_DIR, "inputs", "current_sim_time.txt"), "w") as f:
         f.write(str(master_node.env.now))
 
     # Ghost storage: jobs NOT part of this solve's batch (e.g. a job that already had every
@@ -335,7 +349,7 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
                     deletion_time = max(0, int(pending_time - master_node.env.now))
                     break
             ghost_lines.append(f"{node_id},{int(size)},{deletion_time}")
-    with open("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/ghost_storage.txt", "w") as f:
+    with open(os.path.join(MODEL_DIR, "inputs", "ghost_storage.txt"), "w") as f:
         f.write("\n".join(ghost_lines))
 
     nodes_list = []
@@ -349,12 +363,12 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
             # JSON/Java have no "infinity": cap at a value the CSP treats as effectively unlimited.
             "storage_capacity": int(storage_capacity) if storage_capacity != float('inf') else 2**30
         })
-    pd.DataFrame(nodes_list).to_json("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/nodes.json", orient="records", indent=4)
+    pd.DataFrame(nodes_list).to_json(os.path.join(MODEL_DIR, "inputs", "nodes.json"), orient="records", indent=4)
 
     import subprocess
 
     """nodes = [{"bandwidth":n.bandwidth,"cpu": n.compute_capacity, "free_time": nodes_free_time[i]} for i, n in enumerate(master_node.compute_nodes)]
-    pd.DataFrame(nodes).to_csv("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/nodes.json", index=False)"""
+    pd.DataFrame(nodes).to_csv(os.path.join(MODEL_DIR, "inputs", "nodes.json"), index=False)"""
     
    
 
@@ -367,10 +381,10 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
         [
             "javac",
             "-cp",
-            "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/lib/*",
+            os.path.join(MODEL_DIR, "lib", "*"),
             "-d",
-            "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/bin",
-            f"/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/src/main/{java_main_class}.java"
+            os.path.join(MODEL_DIR, "bin"),
+            os.path.join(MODEL_DIR, "src", "main", f"{java_main_class}.java")
         ],
         capture_output=True,
         text=True
@@ -382,7 +396,7 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
         [
             "java",
             "-cp",
-            "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/bin:/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/lib/*",
+            os.path.join(MODEL_DIR, "bin") + ":" + os.path.join(MODEL_DIR, "lib", "*"),
             f"main.{java_main_class}"
         ],
         capture_output=True,
@@ -399,7 +413,7 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     transfers = {}
     works = {}
 
-    model_output_path = "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/outputs"
+    model_output_path = os.path.join(MODEL_DIR, "outputs")
 
     #df_transfers = pd.read_csv(f"{model_output_path}/transfers.csv")
     #df_works = pd.read_csv(f"{model_output_path}/works.csv")
@@ -502,7 +516,7 @@ def startMinizincModel(master_node, jobs: list, replicas_locations: dict, nodes_
     }
 
         # ---- Convert to DZN ----
-    dzn_path = "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/minizincModel/inputs/params.dzn"
+    dzn_path = os.path.join(MINIZINC_DIR, "inputs", "params.dzn")
     with open(dzn_path, "w") as d:
         for key, value in params.items():
             if key == "transfers_time":
@@ -519,7 +533,7 @@ def startMinizincModel(master_node, jobs: list, replicas_locations: dict, nodes_
 
     command = [
         "minizinc",
-        "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/minizincModel/scheduler.mzn",
+        os.path.join(MINIZINC_DIR, "scheduler.mzn"),
         dzn_path,
         "--solver", "CP-SAT",
         "--output-mode", "json",
@@ -545,18 +559,18 @@ def startMinizincModel(master_node, jobs: list, replicas_locations: dict, nodes_
             last_json = json_blocks[-1]
 
             # écrire proprement dans le fichier
-            with open("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/minizincModel/outputs/sortie.json", "w") as f:
+            with open(os.path.join(MINIZINC_DIR, "outputs", "sortie.json"), "w") as f:
                 f.write(last_json)
 
     if result.returncode == 0:
         transfers, works = getResults(
             jobs, master_node, params["nb_data"],
             params["nb_nodes"], params["nb_works"],
-            "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/minizincModel/outputs/sortie.json"
+            os.path.join(MINIZINC_DIR, "outputs", "sortie.json")
         )
 
         # reset du fichier
-        with open("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/minizincModel/outputs/sortie.json", "w") as f:
+        with open(os.path.join(MINIZINC_DIR, "outputs", "sortie.json"), "w") as f:
             f.write('{}')
 
         transfers, works = sortSolution(transfers, works)

@@ -429,6 +429,13 @@ class SchedulingUsingCSPOnline:
         if job_id in self.replicas_locations.keys() and compute_node.node_id in self.replicas_locations[job_id]:
             # Data already present on this node (e.g. re-planned after the original transfer
             # already completed): nothing to transfer, just unblock whoever is waiting on it.
+            # Must still mark it present in compute_node.datasets like the real-transfer path
+            # below does unconditionally -- otherwise checkForJobs() in processTasks() keeps
+            # returning False forever for this (node, job) pair (nothing else will ever set it,
+            # since this is the only transfer this pair will ever get), and any task dispatched
+            # here loops in the 0.01-tick retry queue indefinitely instead of ever starting.
+            if job_id not in compute_node.datasets:
+                compute_node.datasets.append(job_id)
             dataset_ready_event.succeed()
             return
 
@@ -481,12 +488,52 @@ class SchedulingUsingCSPIncremental(SchedulingUsingCSPOnline):
                 nodes_free_time[node_id] += work[5]  # duration
         return nodes_free_time
 
+    def _idleNodeIds(self):
+        """Node ids with nothing ongoing right now (no active transfer, no active task) --
+        same "free right now" notion used by the restrict_to_free_nodes hard filter in
+        schedulingUsingJavaCSP. Already-queued-but-not-yet-started work doesn't disqualify a
+        node: nodes_free_time already accounts for that backlog's duration."""
+        idle = []
+        for node_id in range(len(self.compute_nodes)):
+            key = f'node_{node_id}'
+            if self.ongoing_transfers.get(key) is None and self.ongoing_works.get(key) is None:
+                idle.append(node_id)
+        return idle
+
     def schedulingNewJob(self):
+
+        # Remembers the (job_id, idle-node-set) pair that last came back with no solution when
+        # restricted to free nodes, so we don't burn a full solver call re-trying the exact same
+        # infeasible request every tick -- only retry once the set of idle nodes actually changes
+        # (a node frees up) or a different job reaches the front of the queue. Only meaningful
+        # for the restrict_to_free_nodes variant: plain Incremental sees every node's continuously
+        # decreasing free-time, so a repeat solve is never truly identical to the last one there.
+        last_failed_attempt = None
 
         while True:
             yield self.env.timeout(0.1)
 
             if len(self.waiting_jobs) >= 1:
+
+                job = self.waiting_jobs[0]
+
+                if getattr(self, 'restrict_to_free_nodes', False):
+                    idle_nodes = self._idleNodeIds()
+                    current_attempt = (job.job_id, frozenset(idle_nodes))
+                    # An empty idle set would have schedulingUsingJavaCSP write an empty
+                    # free_nodes.txt, which the Java side reads as "no restriction" (its
+                    # not-empty check for opting into the filter) -- i.e. exactly the case we
+                    # must not solve for would silently drop the restriction. Skip the solve
+                    # entirely rather than risk that, and wait for a node to free up.
+                    if not idle_nodes or current_attempt == last_failed_attempt:
+                        # Nothing free, or same job/same idle nodes as the attempt that just
+                        # failed: re-solving now would fail again (or silently misbehave) --
+                        # wait for a node to free up instead.
+                        if self._allJobsCompleted():
+                            break
+                        continue
+                else:
+                    current_attempt = None
 
                 nodes_free_time = self.nodesFreeTimeIncremental(self.ongoing_transfers, self.ongoing_works)
                 replicas_locations = self.replicas_locations
@@ -494,7 +541,6 @@ class SchedulingUsingCSPIncremental(SchedulingUsingCSPOnline):
                 # Incremental: place only the oldest waiting job, on its own. Jobs already
                 # placed -- even if still running with unstarted tasks -- are never
                 # reconsidered or re-planned.
-                job = self.waiting_jobs[0]
                 jobs_to_reschedule = [job]
 
                 logger.debug("[%s] Master: looking for a solution for job %s (incremental)", self.env.now, job.job_id)
@@ -519,8 +565,10 @@ class SchedulingUsingCSPIncremental(SchedulingUsingCSPOnline):
                                 self.deletions[key].append(deletion)
 
                     self.waiting_jobs.pop(0)
+                    last_failed_attempt = None
                 else:
                     logger.warning("[%s] Master: no CSP solution found for job %s, will retry", self.env.now, job.job_id)
+                    last_failed_attempt = current_attempt
 
             if self._allJobsCompleted():
                 break
@@ -529,10 +577,12 @@ class SchedulingUsingCSPIncremental(SchedulingUsingCSPOnline):
 class SchedulingUsingCSPIncrementalFreeNodesOnly(SchedulingUsingCSPIncremental):
     """
     Same as SchedulingUsingCSPIncremental (one job at a time, never reconsidered), but the CSP
-    is only allowed to pick among nodes that are completely idle RIGHT NOW (nothing ongoing,
-    nothing already queued) -- a hard filter, with no notion of when a busy node would become
-    free. A busy node is simply not a candidate for this solve, period (still also subject to
-    the existing storage-size filter).
+    is only allowed to pick among nodes with nothing ongoing RIGHT NOW (no active transfer, no
+    active task) -- a hard filter, with no notion of when a currently-active node would become
+    free. A node with only already-queued-but-not-yet-started future work is still a candidate
+    (nodes_free_time already accounts for that backlog's duration, so it won't be double-booked).
+    A node actively busy right now is simply not a candidate for this solve, period (still also
+    subject to the existing storage-size filter).
     """
     restrict_to_free_nodes = True
 
@@ -596,30 +646,30 @@ class SchedulingUsingCSPSemiOnline:
             self.works[f'node_{node_id}'] = []
 
         while True:
-            
+
             yield self.env.timeout(0.2)
-            
+
             if len(self.waiting_jobs) >= 1 and len(self.nodesFree(self.ongoing_transfers, self.ongoing_works, self.works, self.transfers, self.waiting_jobs[0] ) ) > 0: #0 and self.isNoJobRunning(self.waiting_jobs[0].job_id, transfers, works): #self.env.now - t_now > 600: # and len(self.waiting_jobs + self.jobsToReschedule()) > 0: #len(self.waiting_jobs) > 0 and not block:
-                    
-                    free_nodes_list = self.nodesFree(self.ongoing_transfers, self.ongoing_works, self.works, self.transfers, self.waiting_jobs[0] ) 
+
+                    free_nodes_list = self.nodesFree(self.ongoing_transfers, self.ongoing_works, self.works, self.transfers, self.waiting_jobs[0] )
                     replicas_locations = self.replicas_locations
                     jobs_to_reschedule = copy.deepcopy(self.waiting_jobs) # + self.jobsToReschedule()
                     print("waiting jobs:", [job.job_id for job in self.waiting_jobs])
                     print(len(jobs_to_reschedule), ' jobs to reschedule at time ', self.env.now)
-                    
+
                     if len(jobs_to_reschedule) > 0 and len(free_nodes_list.keys()) > 0:
                         logger.debug("[%s] Master: Start looking for a solution. at time %s", self.env.now,self.env.now)
-                        
+
                         jobs = [jobs_to_reschedule[0]]
                         print("jobs to reschedule:", [job.job_id for job in jobs])
                         free_nodes = [self.compute_nodes[node_c] for node_c in free_nodes_list.keys()]
                         nodes_free_time = [free_nodes_list[node_c] for node_c in free_nodes_list.keys()]
                         transfer_node_free_time = [0 for node_c in free_nodes_list.keys()]
-                        
+
                         replicas_locations = {0:[]}
                                                                  #   master_node, jobs: list, r        eplicas_locations: dict, nodes_free_time: list, scheduling_start_time=None):
                         transfers_, works_ = schedulingUsingJavaCSP(self,jobs,    replicas_locations, free_nodes,            nodes_free_time,        transfer_node_free_time)
-                        
+
                         node_to_use = []
                         for i, node_used in enumerate(transfers_.keys()):
                             if len(transfers_[node_used]) > 0:

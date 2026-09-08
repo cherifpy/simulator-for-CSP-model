@@ -75,6 +75,13 @@ import java.util.stream.IntStream;
 
 public class MainOnline {
 
+    // Portable base path: the Python caller (utils/modelCSP.py) always launches this JVM with
+    // its working directory set to the `simulator/` folder, so paths built from here stay valid
+    // wherever that folder is copied (a different machine, a different username/home -- e.g.
+    // Grid5000), instead of being hardcoded to one developer's machine.
+    private static final String SIMULATOR_DIR = System.getProperty("user.dir");
+    private static final String MODEL_INPUTS_DIR = SIMULATOR_DIR + "/utils/model/inputs";
+    private static final String MODEL_OUTPUTS_DIR = SIMULATOR_DIR + "/utils/model/outputs";
 
     public static class MyMoveLNS implements Move {
 
@@ -536,7 +543,7 @@ public class MainOnline {
             //boolean[] nodeFree = new boolean[nb_nodes];
             //java.util.Arrays.fill(nodeFree, true);
             //try {
-            //    String freeNodesText = readFile("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/free_nodes.txt").trim();
+            //    String freeNodesText = readFile(MODEL_INPUTS_DIR + "/free_nodes.txt").trim();
             //    if (!freeNodesText.isEmpty()) {
             //        java.util.Arrays.fill(nodeFree, false);
             //        for (String tok : freeNodesText.split(",")) {
@@ -562,7 +569,7 @@ public class MainOnline {
             //}
             //List<GhostStorage> ghostStorage = new ArrayList<>();
             //try {
-            //    String ghostText = readFile("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/ghost_storage.txt").trim();
+            //    String ghostText = readFile(MODEL_INPUTS_DIR + "/ghost_storage.txt").trim();
             //    if (!ghostText.isEmpty()) {
             //        for (String line : ghostText.split("\n")) {
             //            if (line.trim().isEmpty()) continue;
@@ -584,7 +591,7 @@ public class MainOnline {
             // values Python prints for the final solution (which are also now+local).
             double currentSimTime = 0.0;
             try {
-                currentSimTime = Double.parseDouble(readFile("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/current_sim_time.txt").trim());
+                currentSimTime = Double.parseDouble(readFile(MODEL_INPUTS_DIR + "/current_sim_time.txt").trim());
             } catch (Exception e) {
                 // File missing/unreadable: debug prints just show 0 for "now" instead of crashing.
             }
@@ -987,7 +994,7 @@ public class MainOnline {
 
             int timeLimitSeconds = 30;
             try {
-                String timeLimitText = readFile("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/solver_time_limit.txt").trim();
+                String timeLimitText = readFile(MODEL_INPUTS_DIR + "/solver_time_limit.txt").trim();
                 timeLimitSeconds = Integer.parseInt(timeLimitText);
             } catch (Exception e) {
                 // File missing/unreadable (e.g. an older Python caller that doesn't write it
@@ -1060,7 +1067,7 @@ public class MainOnline {
                         j, starting_times[j], nodeStartingTimes[j], currentSimTime + nodeStartingTimes[j]);
             }
 
-            solver.findOptimalSolution(objectives[0], false);
+            solver.findOptimalSolution(objectives[1], false);
             if (!found[0]) {
                 System.out.println("No solution found");
             }
@@ -1827,13 +1834,13 @@ public class MainOnline {
     public static void main(String[] args) throws Exception {
 
         // ---- Load jobs JSON manually ----
-        String jobsText = readFile("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/jobs.json");
+        String jobsText = readFile(MODEL_INPUTS_DIR + "/jobs.json");
 
         JSONArray jobsArray = new JSONArray(jobsText);
         List<Job> jobs = new ArrayList<>();
 
         // ---- Load nodes JSON manually --
-        String nodesText = readFile("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/nodes.json");
+        String nodesText = readFile(MODEL_INPUTS_DIR + "/nodes.json");
         
         JSONArray nodesArray = new JSONArray(nodesText);
         List<NodeConfig> nodes = new ArrayList<>();
@@ -1843,7 +1850,7 @@ public class MainOnline {
             throw new Exception("Error: missing informations");
         }
 
-        String text = readFile("/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/inputs/replicas_locations.json");
+        String text = readFile(MODEL_INPUTS_DIR + "/replicas_locations.json");
         
         JSONArray json = new JSONArray(text);
 
@@ -1926,7 +1933,7 @@ public class MainOnline {
         SchedulingWithDiffN.SchedulingResult result = SchedulingWithDiffN.runScheduler(
             jobs,nodes.size(), nbData, data_sizes, works, bandwidths, cpus, storage_capacity, nodes_free_time, replicas_location,null, 0, true,null);
 
-        String basePath = "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/utils/model/outputs/";
+        String basePath = MODEL_OUTPUTS_DIR + "/";
 
         // ---- Pure Java JSON saving ----
         String worksJson = toJsonArray(result.worksExec);
