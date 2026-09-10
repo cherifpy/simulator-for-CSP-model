@@ -387,10 +387,23 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
             os.path.join(MODEL_DIR, "src", "main", f"{java_main_class}.java")
         ],
         capture_output=True,
-        text=True
+        text=True,
+        # The Java side resolves its input/output file paths relative to its own working
+        # directory (System.getProperty("user.dir")), on the assumption that it's launched
+        # with SIMULATOR_DIR as cwd. That's only true by accident when a human runs `cd
+        # simulator && python3 ...` -- e.g. under `oarsub "python3 ~/.../launcher.py ..."` the
+        # process inherits oarsub's own cwd (the submitter's home dir) instead, and Java then
+        # looks for jobs.json etc. under the wrong directory entirely. Pin it explicitly so it
+        # doesn't depend on how/where the caller happened to be when this got invoked.
+        cwd=SIMULATOR_DIR,
     )
     print("Compilation Error")
     print(str(result.stderr))
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"javac failed to compile {java_main_class}.java (exit code {result.returncode}).\n"
+            f"--- stderr ---\n{result.stderr}"
+        )
     print('Start looking for a solution')
     result = subprocess.run(
         [
@@ -408,7 +421,8 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
             f"main.{java_main_class}"
         ],
         capture_output=True,
-        text=True
+        text=True,
+        cwd=SIMULATOR_DIR,  # see the javac call above -- Java resolves paths relative to this.
     )
 
     print("results")
@@ -416,6 +430,14 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     if result.returncode != 0:
         print("Java scheduler exited with code", result.returncode)
         print(str(result.stderr))
+        # Don't fall through to toDict(): it would silently read whatever works.csv/
+        # transfers.csv were left over from a PREVIOUS successful solve (or nothing at all),
+        # producing a confusing downstream IndexError/KeyError instead of surfacing the real
+        # cause. Fail loudly here, with the JVM's own stderr, right where it happened.
+        raise RuntimeError(
+            f"Java scheduler ({java_main_class}) exited with code {result.returncode}.\n"
+            f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+        )
 
 
     transfers = {}

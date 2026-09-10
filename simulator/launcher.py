@@ -133,7 +133,8 @@ def do_setup(args):
         print("### ERROR: java/javac not found on PATH. Either 'module load' a JDK, or "
               "re-run with --java25 to install one.", file=sys.stderr)
         sys.exit(1)
-    print(f"### {subprocess.run(['java', '--version'], capture_output=True, text=True).stderr.splitlines()[0]}")
+    version_lines = subprocess.run(["java", "-version"], capture_output=True, text=True).stderr.splitlines()
+    print(f"### {version_lines[0] if version_lines else '(could not read java -version output)'}")
 
     compile_java()
 

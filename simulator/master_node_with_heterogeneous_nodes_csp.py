@@ -465,6 +465,16 @@ class SchedulingUsingCSPOnline:
             self.tracker.log_transfer(job_id, compute_node.node_id, end_time - transfer_time, end_time, dataset_size, task_id=task_id)
 
 
+class SchedulingUsingCSPOnlineThreeStep(SchedulingUsingCSPOnline):
+    """
+    Same online full-replan machinery as SchedulingUsingCSPOnline, but delegates the
+    CSP solve to the three-step decomposition (Dataset Splitting -> per-node Transfer
+    scheduling -> per-node Task Allocation) adapted from flowtime-scheduler-main,
+    instead of the single-shot Choco model used by MainOnline.java.
+    """
+    java_main_class = 'MainOnlineThreeStep'
+
+
 class SchedulingUsingCSPIncremental(SchedulingUsingCSPOnline):
     """
     Comparison baseline for SchedulingUsingCSPOnline: same machinery (transfers, works,

@@ -867,11 +867,16 @@ public class MainIncremental {
                     model.max(end_time, jobEnds[i]).post();
 
                     IntVar elapsedTime =  model.intVar(jobs.get(i).timelasped);
-                    
-                    IntVar flow = model.intVar(0, makespan);
+
+                    // flow = end_time + elapsedTime can exceed makespan by however long this job
+                    // already waited across earlier replans, so its domain must be wider than
+                    // end_time's own -- capping it at plain makespan would make the model
+                    // spuriously infeasible for any already-long-waiting job (same class of bug
+                    // fixed for MainOnlineThreeStep.java's storage "release" bound).
+                    IntVar flow = model.intVar(0, 999_999);
                     model.arithm(end_time, "+", elapsedTime, "=", flow).post();
-                    
-                    all_flow_time[i] = end_time;
+
+                    all_flow_time[i] = flow;
                 }
                 IntVar maxFlowTime = model.intVar("max_flow_time", 0, 999_999);
                 model.max(maxFlowTime, all_flow_time).post();
@@ -1007,7 +1012,7 @@ public class MainIncremental {
                         objectives[0].getValue(), objectives[1].getValue(), solver.getTimeCount(), solver.getSolutionCount());*/
             });
 
-            solver.findOptimalSolution(objectives[0], false);
+            solver.findOptimalSolution(objectives[1], false);
             if (!found[0]) {
                 System.out.println("No solution found");
             }

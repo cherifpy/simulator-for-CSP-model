@@ -910,11 +910,16 @@ public class MainOnline {
                     model.max(end_time, jobEnds[i]).post();
 
                     IntVar elapsedTime =  model.intVar(jobs.get(i).timelasped);
-                    
-                    IntVar flow = model.intVar(0, makespan);
+
+                    // flow = end_time + elapsedTime can exceed makespan by however long this job
+                    // already waited across earlier replans, so its domain must be wider than
+                    // end_time's own -- capping it at plain makespan would make the model
+                    // spuriously infeasible for any already-long-waiting job (same class of bug
+                    // fixed for MainOnlineThreeStep.java's storage "release" bound).
+                    IntVar flow = model.intVar(0, 999_999);
                     model.arithm(end_time, "+", elapsedTime, "=", flow).post();
-                    
-                    all_flow_time[i] = end_time;
+
+                    all_flow_time[i] = flow;
                 }
                 IntVar maxFlowTime = model.intVar("max_flow_time", 0, 999_999);
                 model.max(maxFlowTime, all_flow_time).post();
@@ -1067,7 +1072,7 @@ public class MainOnline {
                         j, starting_times[j], nodeStartingTimes[j], currentSimTime + nodeStartingTimes[j]);
             }
 
-            solver.findOptimalSolution(objectives[1], false);
+            solver.findOptimalSolution(objectives[0], false);
             if (!found[0]) {
                 System.out.println("No solution found");
             }
@@ -1259,17 +1264,39 @@ public class MainOnline {
                         int ii = imaxs[i];
                         TIntArrayList values = mapping.get(ii);
                         if (i == data) {
-                            for (int k = 0; k < works[ii].length; k++) {
-                                if (jn[ii][k] == values.get(work)) {
-                                    jobNodes[ii][k].removeValue(jn[ii][k], this);
-                                } else {
-                                    jobNodes[ii][k].instantiateTo(jn[ii][k], this);
-                                    jobStarts[ii][k].instantiateTo(sn[ii][k], this);
+                            // Choco can backtrack past an earlier call to this method (a
+                            // contradiction found elsewhere undoes the variable instantiations
+                            // made here), but data/work/mapping/jn/sn are plain Java fields --
+                            // not part of Choco's trail -- so they are NOT rolled back with it.
+                            // On retry, `work` can end up pointing past the end of this job's
+                            // recorded distinct-node list (confirmed in practice: e.g. work=1
+                            // while values={34}, size 1). Rather than crash
+                            // (ArrayIndexOutOfBoundsException), treat that as "nothing left to
+                            // fix for this job" and move on -- this just skips re-imposing one
+                            // specific alternative-node exclusion for it this round, which the
+                            // search can still recover through other neighbors/decisions.
+                            boolean exhausted = (values == null || work >= values.size());
+                            if (exhausted) {
+                                if (values == null || work > values.size()) {
+                                    System.out.println("### getNeighbor2: skipping data index " + ii + " (i=" + i
+                                            + ", data=" + data + ", work=" + work + ", values="
+                                            + (values == null ? "null" : values.toString())
+                                            + ") -- stale LNS state after a Choco backtrack.");
                                 }
-                            }
-                            work++;
-                            if (work == values.size()) {
                                 move = true;
+                            } else {
+                                for (int k = 0; k < works[ii].length; k++) {
+                                    if (jn[ii][k] == values.get(work)) {
+                                        jobNodes[ii][k].removeValue(jn[ii][k], this);
+                                    } else {
+                                        jobNodes[ii][k].instantiateTo(jn[ii][k], this);
+                                        jobStarts[ii][k].instantiateTo(sn[ii][k], this);
+                                    }
+                                }
+                                work++;
+                                if (work == values.size()) {
+                                    move = true;
+                                }
                             }
                         } else {
                             for (int k = 0; k < works[ii].length; k++) {
