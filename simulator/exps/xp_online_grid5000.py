@@ -24,6 +24,7 @@ import logging
 import os
 import random
 import sys
+from datetime import date
 
 # Resolve the simulator/ root relative to this file, not to any hardcoded developer path --
 # this file lives at <simulator>/exps/xp_online_grid5000.py.
@@ -75,7 +76,7 @@ def parse_args():
                          help="Path to the base config.json to start from (default: <simulator>/config.json).")
     parser.add_argument("--results-dir", default=None,
                          help="Where to write results. Default: "
-                              "<simulator>/results-grid5000/<approach>_<nb_jobs>j-<nb_nodes>n_<solver_time_limit>s.")
+                              "<simulator>/results-grid5000/<approach>_<nb_jobs>j-<nb_nodes>n_<solver_time_limit>s_<date>.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42).")
     parser.add_argument("--skip-gantt", action="store_true", help="Skip generating the gantt chart PNG.")
     return parser.parse_args()
@@ -94,7 +95,7 @@ def run(args):
 
     results_dir = args.results_dir or os.path.join(
         SIMULATOR_DIR, "results-grid5000",
-        f"{args.approach}_{args.nb_jobs}j-{args.nb_nodes}n_{args.solver_time_limit}s",
+        f"{args.approach}_{args.nb_jobs}j-{args.nb_nodes}n_{args.solver_time_limit}s_{date.today().isoformat()}",
     )
     os.makedirs(results_dir, exist_ok=True)
 
