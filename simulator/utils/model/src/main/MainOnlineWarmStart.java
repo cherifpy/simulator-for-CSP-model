@@ -73,7 +73,7 @@ import java.util.List;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
-public class MainOnline {
+public class MainOnlineWarmStart {
 
     // Portable base path: the Python caller (utils/modelCSP.py) always launches this JVM with
     // its working directory set to the `simulator/` folder, so paths built from here stay valid
@@ -438,14 +438,14 @@ public class MainOnline {
             }
         }
 
-        public static void writeNodeConfigCSV(List<MainOnline.NodeConfig> nodes, String path) throws Exception {
+        public static void writeNodeConfigCSV(List<MainOnlineWarmStart.NodeConfig> nodes, String path) throws Exception {
             FileWriter writer = new FileWriter(path);
 
             // header
             writer.write("bandwidth,computation_nodes,energy_consumption,storage_capacity\n");
 
             // rows
-            for (MainOnline.NodeConfig n : nodes) {
+            for (MainOnlineWarmStart.NodeConfig n : nodes) {
                 writer.write(
                         n.bandwidth + "," +
                                 n.computationNodes + "," +
@@ -494,7 +494,7 @@ public class MainOnline {
             writer.close();
         }
 
-        public static SchedulingResult runScheduler(List<MainOnline.Job>  jobs,int nb_nodes, int nb_data, int[] data_sizes, int[][] works, int[] bandwidths, double[] cpus, int[] storage_capacity, double[] starting_times, int[][]  replicas_location, Model[] models, int pos, boolean solve, double[] job_arriving_times) {
+        public static SchedulingResult runScheduler(List<MainOnlineWarmStart.Job>  jobs,int nb_nodes, int nb_data, int[] data_sizes, int[][] works, int[] bandwidths, double[] cpus, int[] storage_capacity, double[] starting_times, int[][]  replicas_location, Model[] models, int pos, boolean solve, double[] job_arriving_times) {
             final int CPU_UNIT = 1; // to scale cpu speeds
 
             // starting_times[j] (how long node j stays busy) comes from the Python simulator as
@@ -932,13 +932,94 @@ public class MainOnline {
 
             //----- SOLVER -----
             Solver solver = model.getSolver();
+            IntVar[] decisionVars = decisionVariables(nb_nodes, nb_data, works, jobNodes, jobStarts, transferHeights, transferTasks);
+
+            //----- WARM START (optional) -----
+            // Seeds the search with a known-good solution -- Incremental's decision for the
+            // newly-arrived job(s) plus this scheduler's own last-known plan for jobs it already
+            // knew about -- so the LNS search starts from at least as good a point instead of
+            // from scratch, per the hybrid-scheduling experiment. IntDomainLast needs a Solution
+            // explicitly constructed over the exact variables we intend to set (Solver's own
+            // defaultSolution() does NOT implicitly cover every model variable -- e.g. transfer
+            // starts aren't in its default set -- attempting setIntVal on one throws). Falls back
+            // to plain (cold-start) search entirely if the file is missing/empty/invalid, or if an
+            // individual value turns out stale (out of the freshly-computed domain for this
+            // solve) -- warm start must never be required for correctness.
+            Solution warmStartSolution = new Solution(model, decisionVars);
+            // IntDomainLast unconditionally calls Solution.getIntVal() for every variable it is
+            // ever asked to decide -- it does NOT gracefully skip a variable that was simply never
+            // given a value, it throws. So every one of decisionVars needs SOME recorded value
+            // (its own lower bound, as an inert default) before the search runs; the warm-start
+            // values read from warm_start.json below then override this default for whichever
+            // subset of variables we actually have a real hint for.
+            for (IntVar v : decisionVars) {
+                warmStartSolution.setIntVal(v, v.getLB());
+            }
+            try {
+                String warmStartText = readFile(MODEL_INPUTS_DIR + "/warm_start.json").trim();
+                if (!warmStartText.isEmpty()) {
+                    JSONObject warmStart = new JSONObject(warmStartText);
+                    // (using warmStartSolution declared above, explicitly scoped to decisionVars)
+                    int applied = 0, skipped = 0;
+
+                    if (warmStart.has("job_placements")) {
+                        JSONArray placements = warmStart.getJSONArray("job_placements");
+                        for (int p = 0; p < placements.length(); p++) {
+                            JSONObject entry = placements.getJSONObject(p);
+                            int i = entry.getInt("job_index");
+                            int k = entry.getInt("task_index");
+                            int node = entry.getInt("node");
+                            int start = entry.getInt("start");
+                            if (i < 0 || i >= nb_data || k < 0 || k >= works[i].length) { skipped++; continue; }
+                            try {
+                                if (jobNodes[i][k].contains(node)) {
+                                    warmStartSolution.setIntVal(jobNodes[i][k], node);
+                                    applied++;
+                                } else skipped++;
+                                if (jobStarts[i][k].contains(start)) {
+                                    warmStartSolution.setIntVal(jobStarts[i][k], start);
+                                    applied++;
+                                } else skipped++;
+                            } catch (Exception e) {
+                                skipped++;
+                            }
+                        }
+                    }
+
+                    if (warmStart.has("transfers")) {
+                        JSONArray transfersWs = warmStart.getJSONArray("transfers");
+                        for (int t = 0; t < transfersWs.length(); t++) {
+                            JSONObject entry = transfersWs.getJSONObject(t);
+                            int i = entry.getInt("job_index");
+                            int node = entry.getInt("node");
+                            int start = entry.getInt("start");
+                            if (i < 0 || i >= nb_data || node < 0 || node >= nb_nodes) { skipped++; continue; }
+                            try {
+                                if (transferHeights[node][i].contains(1)) {
+                                    warmStartSolution.setIntVal(transferHeights[node][i], 1);
+                                    applied++;
+                                } else skipped++;
+                                IntVar tStart = transferTasks[node][i].getStart();
+                                if (tStart.contains(start)) {
+                                    warmStartSolution.setIntVal(tStart, start);
+                                    applied++;
+                                } else skipped++;
+                            } catch (Exception e) {
+                                skipped++;
+                            }
+                        }
+                    }
+                    System.out.println("### Warm start loaded: " + applied + " value(s) applied, " + skipped + " skipped (stale/out-of-domain).");
+                }
+            } catch (Exception e) {
+                // File missing/unreadable/malformed: proceed without a warm start.
+            }
             List<TransferConfig> transfersList = new ArrayList<>();
             List<WorkConfig> worksList = new ArrayList<>();
             List<DeletionConfig> deletionsList = new ArrayList<>();
             //model.displayVariableOccurrences();
             //model.displayPropagatorOccurrences();
 
-            IntVar[] decisionVars = decisionVariables(nb_nodes, nb_data, works, jobNodes, jobStarts, transferHeights, transferTasks);
             // TEMP: hints disabled to check whether they're locking in the job11-style idle gaps
             // hints(nb_nodes, nb_data, data_sizes, works, cpus, solver, jobNodes);
 
@@ -949,7 +1030,7 @@ public class MainOnline {
             solver.setSearch(
                     Search.lastConflict(
                             Search.intVarSearch(new InputOrder<>(model),
-                                    new IntDomainLast(model.getSolver().defaultSolution(),
+                                    new IntDomainLast(warmStartSolution,
                                             new IntValueSelector() {
                                                 @Override
                                                 public int selectValue(IntVar intVar) {
@@ -1010,9 +1091,7 @@ public class MainOnline {
             
             boolean[] found = {false};
             solver.onSolution(() -> {
-
-                    System.out.println("### DIAG solution found: sumFlowTime=" + objectives[0].getValue()
-                            + " maxFlowTime=" + objectives[1].getValue() + " nb_data=" + nb_data);
+                        
                     found[0] = true;
 
                     transfersList.clear();
@@ -1078,9 +1157,6 @@ public class MainOnline {
             if (!found[0]) {
                 System.out.println("No solution found");
             }
-            System.out.println("### DIAG search end: timeCount=" + solver.getTimeCount()
-                    + "s  timeLimitWas=" + timeLimitSeconds + "s  objectiveOptimal=" + solver.isObjectiveOptimal()
-                    + "  solutionCount=" + solver.getSolutionCount());
 
             SchedulingResult result = new SchedulingResult(transfersList, worksList, deletionsList);
 

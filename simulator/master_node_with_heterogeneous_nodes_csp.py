@@ -1,4 +1,6 @@
+import json
 import math
+import os
 import random
 import simpy
 import numpy as np
@@ -7,7 +9,7 @@ from classes.job import Task, Replica, Job
 import copy
 from compute_node import ComputeNode
 
-from utils.modelCSP import onLineSchedulingUsingCSP,schedulingUsingJavaCSP,startMinizincModel
+from utils.modelCSP import onLineSchedulingUsingCSP,schedulingUsingJavaCSP,startMinizincModel,MODEL_DIR
 
 
 logger = logging.getLogger(__name__)
@@ -463,6 +465,135 @@ class SchedulingUsingCSPOnline:
             self.compute_nodes[compute_node.node_id].datasets.append(job_id)
 
             self.tracker.log_transfer(job_id, compute_node.node_id, end_time - transfer_time, end_time, dataset_size, task_id=task_id)
+
+
+class SchedulingUsingCSPOnlineWarmStart(SchedulingUsingCSPOnline):
+    """
+    Hybrid experiment: same full-replan Online approach, but seeds the CSP's search with a
+    warm-start solution instead of letting it start cold every time. The warm start combines:
+      (a) this scheduler's OWN last-known plan for jobs it already knew about (read back from
+          self.works/self.transfers, exactly what's "currently running/queued" from Online's own
+          point of view -- no attempt to reconcile with a different scheduler's timeline), and
+      (b) Incremental's decision for the brand-new job(s), computed via a throwaway MainIncremental
+          solve using the EXACT SAME nodes_free_time/replicas_locations this replan itself sees
+          (so it's state-consistent with Online, not with Incremental's own separate history).
+    Tests whether Online's usual underperformance vs. Incremental comes mainly from its LNS
+    search not reliably reaching a good solution within budget (in which case warm-starting from
+    an at-least-as-good point should close most of the gap) rather than full replanning being
+    inherently worse.
+    """
+    java_main_class = 'MainOnlineWarmStart'
+
+    def schedulingNewJob(self):
+
+        while True:
+            yield self.env.timeout(0.1)
+
+            if len(self.waiting_jobs) >= 1:
+
+                nodes_free_time = self.nodesFreeTime(self.ongoing_transfers, self.ongoing_works)
+                replicas_locations = self.replicas_locations
+                jobs_to_reschedule = [job for job in self.waiting_jobs] + self.getRunningJobs()
+
+                if len(jobs_to_reschedule) > 0:
+                    self._writeWarmStart(jobs_to_reschedule, replicas_locations, nodes_free_time)
+                    logger.debug("[%s] Master: looking for a solution for %s job(s) (warm-started)", self.env.now, len(jobs_to_reschedule))
+                    transfers_, works_, deletions_ = schedulingUsingJavaCSP(self, jobs_to_reschedule, replicas_locations, nodes_free_time, self.env.now)
+                else:
+                    transfers_, works_, deletions_ = {}, {}, {}
+
+                if len(transfers_.keys()) > 0 and len(works_.keys()) > 0:
+                    for node in range(len(self.compute_nodes)):
+                        key = "node_" + str(node)
+                        self.transfers[key] = []
+                        self.works[key] = []
+                        self.deletions[key] = []
+                        if key in transfers_.keys() and len(transfers_[key]) > 0:
+                            ongoing = self.ongoing_transfers.get(key)
+                            for transfer in transfers_[key]:
+                                transfer_job_id = transfer[0]
+                                already_present = transfer_job_id in self.replicas_locations and node in self.replicas_locations[transfer_job_id]
+                                already_in_flight = ongoing is not None and ongoing[0] == transfer_job_id
+                                if already_present or already_in_flight:
+                                    continue
+                                self.transfers[key].append(transfer)
+
+                            if len(works_[key]) > 0:
+                                for work in works_[key]:
+                                    self.works[key].append(work)
+
+                        if key in deletions_.keys() and len(deletions_[key]) > 0:
+                            for deletion in deletions_[key]:
+                                self.deletions[key].append(deletion)
+
+                    self.waiting_jobs.clear()
+
+                else:
+                    logger.warning("[%s] Master: no CSP solution found for %s job(s)", self.env.now, len(jobs_to_reschedule))
+
+            if self._allJobsCompleted():
+                break
+
+    def _writeWarmStart(self, jobs_to_reschedule, replicas_locations, nodes_free_time):
+        """Builds warm_start.json for the upcoming solve: this scheduler's own last-decided plan
+        for jobs it already knew about, plus Incremental's decision for the brand-new job(s),
+        both converted from absolute simulation time to the local (relative-to-now) time frame
+        this solve's Java model expects (mirrors how toDict() adds `now` back on the way out)."""
+        sorted_jobs = sorted(jobs_to_reschedule, key=lambda j: j.job_id)
+        job_index = {job.job_id: idx for idx, job in enumerate(sorted_jobs)}
+        now = self.env.now
+
+        job_placements = []
+        transfers_ws = []
+
+        # (a) already-known jobs: reuse this scheduler's own last-decided plan as-is.
+        already_known_ids = {job.job_id for job in self.getRunningJobs()}
+        for node_id in range(len(self.compute_nodes)):
+            key = f'node_{node_id}'
+            for work in self.works.get(key, []):
+                w_job_id, w_node, w_task, w_start, w_end, w_dur = work
+                if w_job_id in job_index and w_job_id in already_known_ids:
+                    job_placements.append({
+                        "job_index": job_index[w_job_id], "task_index": int(w_task),
+                        "node": int(w_node), "start": int(round(w_start - now)),
+                    })
+            for transfer in self.transfers.get(key, []):
+                t_job_id, t_node, t_start, t_end, t_dur = transfer
+                if t_job_id in job_index and t_job_id in already_known_ids:
+                    transfers_ws.append({
+                        "job_index": job_index[t_job_id], "node": int(t_node),
+                        "start": int(round(t_start - now)),
+                    })
+
+        # (b) brand-new job(s): ask Incremental, using the exact state this replan itself sees.
+        orig_java_main_class = self.java_main_class
+        try:
+            for job in self.waiting_jobs:
+                self.java_main_class = 'MainIncremental'
+                inc_transfers, inc_works, _ = schedulingUsingJavaCSP(
+                    self, [job], replicas_locations, nodes_free_time, self.env.now)
+                for node_id in range(len(self.compute_nodes)):
+                    key = f'node_{node_id}'
+                    for work in inc_works.get(key, []):
+                        w_job_id, w_node, w_task, w_start, w_end, w_dur = work
+                        if w_job_id == job.job_id:
+                            job_placements.append({
+                                "job_index": job_index[w_job_id], "task_index": int(w_task),
+                                "node": int(w_node), "start": int(round(w_start - now)),
+                            })
+                    for transfer in inc_transfers.get(key, []):
+                        t_job_id, t_node, t_start, t_end, t_dur = transfer
+                        if t_job_id == job.job_id:
+                            transfers_ws.append({
+                                "job_index": job_index[t_job_id], "node": int(t_node),
+                                "start": int(round(t_start - now)),
+                            })
+        finally:
+            self.java_main_class = orig_java_main_class
+
+        warm_start = {"job_placements": job_placements, "transfers": transfers_ws}
+        with open(os.path.join(MODEL_DIR, "inputs", "warm_start.json"), "w") as f:
+            json.dump(warm_start, f)
 
 
 class SchedulingUsingCSPOnlineThreeStep(SchedulingUsingCSPOnline):

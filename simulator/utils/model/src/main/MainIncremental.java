@@ -968,7 +968,9 @@ public class MainIncremental {
             
             boolean[] found = {false};
             solver.onSolution(() -> {
-                        
+
+                    System.out.println("### DIAG solution found: sumFlowTime=" + objectives[0].getValue()
+                            + " maxFlowTime=" + objectives[1].getValue() + " nb_data=" + nb_data);
                     found[0] = true;
 
                     transfersList.clear();

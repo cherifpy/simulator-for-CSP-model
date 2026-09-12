@@ -2,16 +2,28 @@
 """
 All-in-one launcher for Grid5000 (or any fresh machine): sets up everything needed (Python
 venv, pinned dependencies, optionally a modern JDK, compiles the Java CSP model) and then runs
-the experiment -- a single command instead of setup_grid5000.sh + exps/xp_online_grid5000.py
-run separately.
+one of the experiment scripts under exps/ -- a single command instead of setup_grid5000.sh +
+the experiment script run separately.
 
 Can be launched with the system python3 (no venv needed yet): it bootstraps the venv itself,
 installs dependencies into it, then re-executes itself under that venv's interpreter to
 actually run the experiment.
 
+--experiment selects which script under exps/ actually runs (default: online). Every other
+flag is that script's OWN command-line interface, passed through unchanged -- see each script's
+own --help for its full flag set (they differ: xp_online_grid5000.py wants --nb-jobs/--skip-gantt,
+xp_single_decision_grid5000.py wants --n-existing/--new-job-index/--state-a-time-limit instead).
+
 Examples:
+    # Default experiment (xp_online_grid5000.py): full simulation run, one approach at a time.
     python3 launcher.py --approach online --instance-dir workloads/.../inst-10J-20N \\
         --nb-jobs 10 --nb-nodes 20 --solver-time-limit 10 --lambda-rate 60
+
+    # Controlled single-decision-point test (xp_single_decision_grid5000.py): e.g. a 2h Online
+    # solve for the one new job arriving on top of N=15 already-in-progress jobs.
+    python3 launcher.py --experiment single_decision --approach online \\
+        --instance-dir workloads/.../inst-20J-50N --nb-nodes 50 --n-existing 15 \\
+        --solver-time-limit 7200 --lambda-rate 100
 
     # Grid5000 node with an old default JDK (Choco fails with a low-level JVM startup error,
     # e.g. "graal_create_isolate error", on anything too old):
@@ -148,68 +160,48 @@ def reexec_under_venv():
     os.execv(py, [py, os.path.abspath(__file__)] + sys.argv[1:] + ["--skip-setup"])
 
 
-def run_experiment(args):
-    # Only import after the venv's interpreter (with simpy/pandas/etc.) is the one running --
-    # importing at module load time would fail under the bootstrap system python.
+EXPERIMENT_MODULES = {
+    "online": "exps.xp_online_grid5000",
+    "single_decision": "exps.xp_single_decision_grid5000",
+}
+
+
+def run_experiment(experiment, extra_argv):
+    """Delegates entirely to the chosen script's own argparse + main() -- each exps/xp_*.py is
+    a complete, independently-runnable CLI tool (see their own --help), so the launcher doesn't
+    re-declare or mirror their flags; it just forwards whatever wasn't consumed by the launcher's
+    own --experiment/--java25/--skip-setup."""
     exps_dir = os.path.join(SCRIPT_DIR, "exps")
     if exps_dir not in sys.path:
         sys.path.append(exps_dir)
-    import exps.xp_online_grid5000 as xp
+    import importlib
+    xp = importlib.import_module(EXPERIMENT_MODULES[experiment])
 
-    ns = argparse.Namespace(
-        approach=args.approach,
-        instance_dir=args.instance_dir,
-        nb_jobs=args.nb_jobs,
-        nb_nodes=args.nb_nodes,
-        solver_time_limit=args.solver_time_limit,
-        lambda_rate=args.lambda_rate,
-        config=args.config or os.path.join(SCRIPT_DIR, "config.json"),
-        results_dir=args.results_dir,
-        seed=args.seed,
-        skip_gantt=args.skip_gantt,
-    )
-
-    xp.configure_logging(xp.logging.WARNING)
-    results_dir = xp.run(ns)
-
-    violations = xp.verify_storage(results_dir, ns.instance_dir)
-    print()
-    print("=" * 70)
-    if not violations:
-        print("STORAGE CHECK: OK -- no violation at any instant, on any node.")
-    else:
-        print(f"STORAGE CHECK: {len(violations)} violation(s) found:")
-        for node, t, occupied, cap, label in violations:
-            print(f"  node_{node} at t={t:.2f}: occupied={occupied:.1f} > capacity={cap:.1f} ({label})")
-    print("=" * 70)
+    sys.argv = [sys.argv[0]] + extra_argv
+    xp.main()
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--approach", required=True, choices=["online", "incremental", "incremental_free_nodes_only"])
-    parser.add_argument("--instance-dir", required=True,
-                         help="Directory containing this instance's jobs.json and infrastructure.csv.")
-    parser.add_argument("--nb-jobs", required=True, type=int)
-    parser.add_argument("--nb-nodes", required=True, type=int)
-    parser.add_argument("--solver-time-limit", required=True, type=int, help="Seconds per CSP solve.")
-    parser.add_argument("--lambda-rate", type=int, default=60)
-    parser.add_argument("--config", default=None, help="Defaults to <simulator>/config.json.")
-    parser.add_argument("--results-dir", default=None)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--skip-gantt", action="store_true")
+def parse_launcher_args():
+    """Only the launcher's OWN flags are declared here (add_help=False so -h/--help falls
+    through, unconsumed, to the chosen experiment script's own parser instead of this one).
+    Everything else (--approach, --instance-dir, ...) is experiment-specific and is left in
+    `extra_argv` for that script's own parse_args() to handle."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--experiment", choices=sorted(EXPERIMENT_MODULES.keys()), default="online",
+                         help="Which exps/xp_*.py script to run (default: online).")
     parser.add_argument("--java25", action="store_true",
                          help="Install Oracle JDK 25 via sudo-g5k if not already present (Grid5000).")
     parser.add_argument("--skip-setup", action="store_true",
                          help="Skip venv/deps/Java setup entirely and go straight to running the "
                               "experiment (assumes it was already done in a previous invocation).")
-    return parser.parse_args()
+    return parser.parse_known_args()
 
 
 def main():
-    args = parse_args()
+    launcher_args, extra_argv = parse_launcher_args()
 
-    if not args.skip_setup:
-        do_setup(args)
+    if not launcher_args.skip_setup:
+        do_setup(launcher_args)
 
     # Whether or not setup just ran, the experiment itself needs the venv's interpreter (it's
     # the only one with simpy/pandas/etc. installed). --skip-setup only skips venv/deps/Java
@@ -226,7 +218,7 @@ def main():
         reexec_under_venv()  # process replaced -- nothing below runs in this invocation
         return
 
-    run_experiment(args)
+    run_experiment(launcher_args.experiment, extra_argv)
 
 
 if __name__ == "__main__":

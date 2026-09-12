@@ -246,11 +246,15 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     import json
 
     matrix = []
-    print(jobs)
-    print("replicas_locations:", replicas_locations)
-    print('jobs:', jobs)
-    print("replicas_locations keys:", replicas_locations)
     jobs = sorted(jobs, key=lambda x: x.job_id)
+    print(f"\n### schedulingUsingJavaCSP: {len(jobs)} job(s) to (re)schedule ###")
+    print(f"{'job_id':>8}{'nb_tasks':>10}{'task_duration':>15}{'dataset_size':>14}{'arriving_time':>15}")
+    for job in jobs:
+        task_duration = job.tasks[0].duration if job.tasks else None
+        print(f"{job.job_id:>8}{job.nb_tasks:>10}{task_duration!s:>15}{job.dataset_size:>14}{job.arriving_time:>15.2f}")
+    print("replicas_locations:")
+    for job_id, nodes in sorted(replicas_locations.items()):
+        print(f"  job {job_id}: nodes {nodes}")
     # A transfer that has started but not yet completed doesn't appear in replicas_locations
     # yet (that's only updated on completion), so without this a job's data mid-flight to a
     # node looks like a brand-new, freely re-plannable candidate to the CSP -- letting a later
