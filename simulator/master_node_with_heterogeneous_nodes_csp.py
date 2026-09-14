@@ -464,7 +464,12 @@ class SchedulingUsingCSPOnline:
 
             self.compute_nodes[compute_node.node_id].datasets.append(job_id)
 
-            self.tracker.log_transfer(job_id, compute_node.node_id, end_time - transfer_time, end_time, dataset_size, task_id=task_id)
+            self.tracker.log_transfer(
+                job_id, compute_node.node_id, end_time - transfer_time, end_time, dataset_size, task_id=task_id,
+                receiver_energy_consumption=compute_node.energy_consumption,
+                sender_energy_consumption=self._config.get('master_energy_consumption', 0.0),
+                network_energy=self._config.get('network_energy_per_transfer', 0.0),
+            )
 
 
 class SchedulingUsingCSPOnlineWarmStart(SchedulingUsingCSPOnline):
@@ -1123,7 +1128,12 @@ class SchedulingUsingCSPSemiOnline:
             
             dataset_ready_event.succeed()
 
-            self.tracker.log_transfer(job_id, compute_node.node_id, end_time - transfer_time, end_time, dataset_size, task_id=task_id)
+            self.tracker.log_transfer(
+                job_id, compute_node.node_id, end_time - transfer_time, end_time, dataset_size, task_id=task_id,
+                receiver_energy_consumption=compute_node.energy_consumption,
+                sender_energy_consumption=self._config.get('master_energy_consumption', 0.0),
+                network_energy=self._config.get('network_energy_per_transfer', 0.0),
+            )
 
             if compute_node.node_id in self.actual_transfers.keys(): del self.actual_transfers[self.compute_nodes[compute_node.node_id].node_id]
 

@@ -19,13 +19,23 @@ class Tracker:
         self.stats_on_replicas = []
         self.stats_on_tasks = []
         self.stats_on_jobs = []
+        self.stats_on_transfers_energy = []
         self.threshold_history = []
+
+        # Energy model: energy(transfer) = sender + receiver * transfer_time + network.
+        # sender/network are fixed per-transfer costs (sender = the master, modeled as a single
+        # node with its own energy_consumption regardless of which compute node receives; there's
+        # no peer-to-peer sender in this model -- every transfer conceptually originates from the
+        # master). receiver is the destination compute node's own energy_consumption, scaled by
+        # how long the transfer actually took (bigger/slower transfers cost the receiver more).
+        self.total_energy_consumed = 0.0
 
     def register_job(self, job_id, start_time):
         if job_id not in self.tasks_duration_per_job:
             self.tasks_duration_per_job[job_id] = {'start_time': start_time, 'end_time': 0}
 
-    def log_transfer(self, job_id, node_id, start_time, end_time, dataset_size, task_id=-1):
+    def log_transfer(self, job_id, node_id, start_time, end_time, dataset_size, task_id=-1,
+                      receiver_energy_consumption=0.0, sender_energy_consumption=0.0, network_energy=0.0):
         self.events_history.append({
             'job_id': job_id,
             'node_id': node_id,
@@ -33,6 +43,19 @@ class Tracker:
             'start': start_time,
             'end': end_time,
             'transferred_bytes': dataset_size
+        })
+
+        transfer_time = end_time - start_time
+        transfer_energy = sender_energy_consumption + receiver_energy_consumption * transfer_time + network_energy
+        self.total_energy_consumed += transfer_energy
+        self.stats_on_transfers_energy.append({
+            "job": job_id,
+            "node": node_id,
+            "transfer_time": transfer_time,
+            "sender_energy": sender_energy_consumption,
+            "receiver_energy": receiver_energy_consumption * transfer_time,
+            "network_energy": network_energy,
+            "total_energy": transfer_energy,
         })
 
         #logger.debug("[%s] Transfer for job %s to node %s took %s",
@@ -46,6 +69,7 @@ class Tracker:
             "execution_time":end_time-start_time,
             "id_dataset":job_id,
             "transfert_time":end_time-start_time,
+            "transfer_energy":transfer_energy,
         })
         self.total_nb_transfers += 1
         self.total_nb_transferred_bytes += dataset_size

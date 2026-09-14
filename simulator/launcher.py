@@ -163,6 +163,7 @@ def reexec_under_venv():
 EXPERIMENT_MODULES = {
     "online": "exps.xp_online_grid5000",
     "single_decision": "exps.xp_single_decision_grid5000",
+    "dataset_size_sweep": "exps.xp_dataset_size_sweep",
 }
 
 

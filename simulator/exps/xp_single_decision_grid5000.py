@@ -1,12 +1,14 @@
 """
-Standalone, portable Grid5000 launcher for the controlled single-decision-point test: build a
-real starting state A (N existing jobs already in progress, from a real simulator run), freeze
-it, inject exactly ONE new job, then solve that one job's placement with a given approach
-(online-style joint replan, or incremental-style: the new job alone) and a given solver time
-budget. Reports the new job's wait/flow time plus the mean/max flow time over the ISOLATED set
-of jobs that could actually differ between approaches (the new job + every existing job not yet
-finished at the freeze point -- already-finished jobs are identical under any approach and are
-excluded so they don't dilute the comparison).
+Standalone, portable Grid5000 launcher for the controlled single-decision-point test: build
+state A as a single, direct JOINT CSP solve over the --n-existing jobs (their real
+dataset_size/nb_tasks/task_duration/arriving_time from the instance), with node free times at 0
+and no pre-existing replicas -- a genuine one-shot "offline" placement decision for those N jobs
+(NOT a replay of N sequential live-simulation arrivals). Then inject exactly ONE new job and
+solve ITS placement with a given approach (online-style joint replan, or incremental-style: the
+new job alone) and a given solver time budget. Reports the new job's wait/flow time plus the
+mean/max flow time over ALL jobs (state A + new job) -- since nothing has actually "finished" in
+this offline framing (state A's own solve just decided a placement, none of it physically
+executed), every existing job is legitimately part of the comparison scope, not just a subset.
 
 Every path is resolved relative to this file's own location, so the whole `simulator/` folder
 can be copied to Grid5000 (or anywhere) and this script keeps working unmodified.
@@ -40,20 +42,15 @@ import simpy
 from classes.tracker import Tracker
 from classes.job import Job
 from compute_node import ComputeNode
-from master_node_with_heterogeneous_nodes_csp import SchedulingUsingCSPIncremental, SchedulingUsingCSPOnline
+from master_node_with_heterogeneous_nodes_csp import SchedulingUsingCSPOnline, SchedulingUsingCSPIncremental
 from utils.modelCSP import schedulingUsingJavaCSP
-from simulator import generateHeterogeneousInfrastructureEquilibre, jobs_injector, configure_logging
+from simulator import generateHeterogeneousInfrastructureEquilibre, configure_logging
 
 logger = logging.getLogger(__name__)
 
 JAVA_MAIN_CLASS_BY_APPROACH = {
     "online": "MainOnline",
     "incremental": "MainIncremental",
-}
-
-STATE_A_MASTER_CLASSES = {
-    "online": SchedulingUsingCSPOnline,
-    "incremental": SchedulingUsingCSPIncremental,
 }
 
 
@@ -75,19 +72,14 @@ def parse_args():
     parser.add_argument("--solver-time-limit", required=True, type=int,
                          help="CSP solver time budget for the new job's placement solve, in seconds "
                               "(e.g. 7200 for a 2h Grid5000 run). Only applies to that final solve -- "
-                              "the state-A-building solves always use --state-a-time-limit.")
+                              "the state-A-building solve always uses --state-a-time-limit.")
     parser.add_argument("--state-a-time-limit", type=int, default=30,
-                         help="CSP solver time budget for each of the N solves used to build state A "
-                              "(default: 30s, fast and unaffected by --solver-time-limit).")
-    parser.add_argument("--state-a-approach", choices=sorted(STATE_A_MASTER_CLASSES.keys()), default="incremental",
-                         help="How the N existing jobs get placed while building state A: "
-                              "'incremental' (default) places each one alone as it arrives, never "
-                              "revisiting earlier jobs -- the realistic 'committed one at a time' "
-                              "history. 'online' jointly re-plans every still-unstarted job on each "
-                              "new arrival, so state A itself reflects Online's own joint-replanning "
-                              "logic rather than Incremental's, before the final new job is tested.")
+                         help="CSP solver time budget for the ONE joint solve that builds state A "
+                              "over all --n-existing jobs at once (default: 30s).")
     parser.add_argument("--lambda-rate", type=int, default=100,
-                         help="Mean inter-arrival time for the Poisson job injector (default: 100).")
+                         help="Present for config compatibility; unused now that state A is a single "
+                              "direct joint solve rather than a live-simulation replay with injected "
+                              "arrivals (default: 100).")
     parser.add_argument("--config", default=os.path.join(SIMULATOR_DIR, "config.json"),
                          help="Path to the base config.json to start from (default: <simulator>/config.json).")
     parser.add_argument("--results-dir", default=None,
@@ -99,24 +91,27 @@ def parse_args():
 
 
 def build_state_a(config, args, results_dir):
-    """Runs the real simulator for the first --n-existing jobs of the instance, freezing the clock
-    the instant the single new job would arrive. Which scheduler drives this construction is
-    controlled by --state-a-approach, independently of --approach (which only governs how the
-    final new job's own placement is solved)."""
+    """Builds state A as ONE direct joint CSP solve over all --n-existing jobs at once (their real
+    dataset_size/nb_tasks/task_duration/arriving_time), with node free times at 0 and no
+    pre-existing replicas -- a genuine one-shot "offline" placement, not a replay of N sequential
+    live-simulation arrivals. env.now is fast-forwarded directly to the moment the new job would
+    arrive via env.run(until=...) with NO processes registered (SimPy just advances the clock;
+    nothing else happens), since schedulingUsingJavaCSP reads master.env.now directly everywhere
+    (its scheduling_start_time parameter is unused) and the rest of this script uses that same
+    value as its "now" reference throughout."""
     with open(os.path.join(args.instance_dir, "jobs.json")) as f:
         all_jobs_raw = json.load(f)
     existing_jobs_raw = all_jobs_raw[:args.n_existing]
     new_job_index = args.new_job_index if args.new_job_index is not None else args.n_existing
     new_job_raw = all_jobs_raw[new_job_index]
+    freeze_at = new_job_raw["arriving_time"]
 
-    state_a_jobs_file = os.path.join(results_dir, "state_a_jobs.json")
-    with open(state_a_jobs_file, "w") as f:
+    with open(os.path.join(results_dir, "state_a_jobs.json"), "w") as f:
         json.dump(existing_jobs_raw, f)
 
     config = dict(config)
     config["total_nb_jobs"] = args.n_existing
     config["total_nb_compute_nodes"] = args.nb_nodes
-    config["jobs_file_path"] = state_a_jobs_file
     config["solver_time_limit_s"] = args.state_a_time_limit
     config["lambda_rate"] = args.lambda_rate
 
@@ -124,11 +119,10 @@ def build_state_a(config, args, results_dir):
     nodes_config = generateHeterogeneousInfrastructureEquilibre(
         config, path=os.path.join(args.instance_dir, "infrastructure.csv"))
 
-    random.seed(args.seed)
     env = simpy.Environment()
+    env.run(until=freeze_at)
     tracker = Tracker(env)
-    state_a_master_class = STATE_A_MASTER_CLASSES[args.state_a_approach]
-    master = state_a_master_class(env, [], tracker, config, overlap=True)
+    master = SchedulingUsingCSPOnline(env, [], tracker, config, overlap=True)
     compute_nodes = [
         ComputeNode(env, i, master, bandwidth=nodes_config[i]['bandwidth'],
                     compute_capacity=nodes_config[i]['computation_nodes'],
@@ -138,52 +132,82 @@ def build_state_a(config, args, results_dir):
     ]
     master.compute_nodes = compute_nodes
     master.nb_nodes = len(compute_nodes)
+    # Constructed with compute_nodes=[] above (ComputeNode needs an already-existing master to
+    # reference), so __init__ never got a chance to size these per-node dicts -- do it now, same
+    # as __init__ would have. Without this, nodesFreeTimeIncremental's direct `self.transfers[key]`
+    # indexing (no .get()) raises KeyError.
+    for i in range(len(compute_nodes)):
+        key = f'node_{i}'
+        master.ongoing_transfers.setdefault(key, None)
+        master.ongoing_works.setdefault(key, None)
+        master.transfers.setdefault(key, [])
+        master.works.setdefault(key, [])
+        master.deletions.setdefault(key, [])
 
-    env.process(master.receiveJobs())
-    env.process(master.schedulingNewJob())
-    env.process(master.scheduling())
-    env.process(master.checkOnJobs())
-    for node in compute_nodes:
-        env.process(node.processTasks())
-    env.process(jobs_injector(env, master, jobs=[], job_file_path=config['jobs_file_path'], config=config))
+    existing_jobs = []
+    for raw in existing_jobs_raw:
+        j = Job(raw["job_id"], raw["task_duration"], raw["nb_tasks"], raw["dataset_size"])
+        j.arriving_time = raw["arriving_time"]
+        existing_jobs.append(j)
+        tracker.register_job(j.job_id, raw["arriving_time"])
+    master.jobs = existing_jobs
 
-    freeze_at = new_job_raw["arriving_time"]
-    print(f"### Building state A: running {args.state_a_approach} for jobs 0..{args.n_existing - 1} "
-          f"(solver_time_limit={args.state_a_time_limit}s each), freezing clock at t={freeze_at:.2f} ###",
+    nodes_free_time = master.nodesFreeTime(master.ongoing_transfers, master.ongoing_works)
+    master.java_main_class = 'MainOnline'
+    print(f"### Building state A: ONE joint solve over jobs 0..{args.n_existing - 1} "
+          f"(solver_time_limit={args.state_a_time_limit}s, node free times=0, no pre-existing "
+          f"replicas) ###", flush=True)
+    transfers_, works_, deletions_ = schedulingUsingJavaCSP(master, existing_jobs, {}, nodes_free_time, freeze_at)
+
+    state_a_finish = {}
+    if works_:
+        for entries in works_.values():
+            for job_id, node_index, task_index, start_abs, end_abs, duration in entries:
+                state_a_finish[job_id] = end_abs if job_id not in state_a_finish else max(state_a_finish[job_id], end_abs)
+    master._state_a_finish = state_a_finish
+    if len(state_a_finish) < args.n_existing:
+        print(f"### WARNING: state A solve only placed {len(state_a_finish)}/{args.n_existing} jobs "
+              f"-- possibly infeasible or cut short within the time budget ###", flush=True)
+    print(f"### State A built. env.now={env.now:.2f}, jobs placed={len(state_a_finish)}/{args.n_existing} ###",
           flush=True)
-    env.run(until=freeze_at)
-    print(f"### State A frozen. env.now={env.now:.2f}, waiting_jobs={len(master.waiting_jobs)}, "
-          f"jobs known={len(master.jobs)}, finished_jobs={master.finished_jobs} ###", flush=True)
 
     new_job = Job(new_job_raw["job_id"], new_job_raw["task_duration"], new_job_raw["nb_tasks"], new_job_raw["dataset_size"])
     new_job.arriving_time = env.now
     master.tracker.register_job(new_job.job_id, env.now)
 
-    not_finished_ids = {j.job_id for j in master.jobs if j.status != "Finished"}
-    isolated_ids = not_finished_ids | {new_job.job_id}
-    print(f"### Isolated comparison scope: {len(isolated_ids)} jobs not yet finished at freeze "
-          f"(job_ids={sorted(isolated_ids)}) -- excludes {len(master.jobs) - len(not_finished_ids)} "
-          f"already-finished jobs (identical under any approach, would dilute the comparison) ###",
-          flush=True)
+    # Nothing has actually "finished" in this offline framing -- state A's solve just DECIDED a
+    # placement for these jobs, none of them physically executed. So every existing job (plus the
+    # new one) is legitimately part of the comparison scope, unlike the live-replay version where
+    # some jobs could already be done by the freeze point.
+    isolated_ids = {j.job_id for j in existing_jobs} | {new_job.job_id}
+    print(f"### Isolated comparison scope: all {len(isolated_ids)} jobs (state A + new job) ###", flush=True)
     return master, new_job, isolated_ids
 
 
 def committed_finish_time(master, nb_nodes, job_id):
-    """Already-decided completion time for a job that this solve does NOT re-plan. A job fully
-    finished before the freeze point has no trace left in works/ongoing_works (cleared on
-    completion) -- its real finishing_time lives in the tracker's historical log instead."""
-    for rec in master.tracker.stats_on_jobs:
-        if rec["job_id"] == job_id:
-            return rec["finishing_time"]
-    latest = None
-    for key in [f'node_{i}' for i in range(nb_nodes)]:
-        ow = master.ongoing_works.get(key)
-        if ow is not None and ow[0] == job_id:
-            latest = ow[4] if latest is None else max(latest, ow[4])
-        for w in master.works.get(key, []):
-            if w[0] == job_id:
-                latest = w[4] if latest is None else max(latest, w[4])
-    return latest
+    """Already-decided completion time for an existing job that this solve does NOT re-plan --
+    read directly from state A's own solve result (there's no live execution history to fall back
+    on in this offline-style construction)."""
+    return master._state_a_finish.get(job_id)
+
+
+def compute_transfer_energy(transfers_, master):
+    """Same formula as Tracker.log_transfer (energy = sender + receiver * transfer_time +
+    network), applied here to a solve's PROPOSED transfers -- this test bypasses the live
+    simulation loop entirely (it calls schedulingUsingJavaCSP directly and never actually
+    executes the resulting plan), so those transfers never flow through the tracker's own
+    accounting and would otherwise be invisible to any energy comparison."""
+    sender = master._config.get('master_energy_consumption', 0.0)
+    network = master._config.get('network_energy_per_transfer', 0.0)
+    total = 0.0
+    detail = []
+    for entries in transfers_.values():
+        for job_id, node_index, start_abs, end_abs, duration in entries:
+            receiver = master.compute_nodes[node_index].energy_consumption
+            energy = sender + receiver * duration + network
+            total += energy
+            detail.append({"job_id": job_id, "node": node_index, "duration": duration, "energy": energy})
+    return total, detail
 
 
 def run_online_style(master, new_job, isolated_ids, nb_nodes, now, replicas_locations):
@@ -229,6 +253,7 @@ def run_online_style(master, new_job, isolated_ids, nb_nodes, now, replicas_loca
             if job_id == new_job.job_id:
                 new_job_start = start_abs if new_job_start is None else min(new_job_start, start_abs)
     wait_time = (new_job_start - new_job.arriving_time) if new_job_start is not None else None
+    transfer_energy_total, transfer_energy_detail = compute_transfer_energy(transfers_, master)
 
     return {
         "wait_time_new_job": wait_time,
@@ -246,6 +271,8 @@ def run_online_style(master, new_job, isolated_ids, nb_nodes, now, replicas_loca
         "max_flow_time_isolated": max(isolated_flow_times) if isolated_flow_times else None,
         "n_jobs_isolated": len(isolated_flow_times),
         "jobs_to_reschedule": [j.job_id for j in jobs_to_reschedule],
+        "transfer_energy_total": transfer_energy_total,
+        "transfer_energy_detail": transfer_energy_detail,
         "transfers": transfers_,
         "works": works_,
         "deletions": deletions_,
@@ -257,7 +284,11 @@ def run_incremental_style(master, new_job, isolated_ids, nb_nodes, now, replicas
     """Mirrors SchedulingUsingCSPIncremental.schedulingNewJob(): place the new job alone; every
     existing job keeps whatever it was already committed to in state A, untouched."""
     jobs_to_reschedule = [new_job]
-    nodes_free_time = master.nodesFreeTimeIncremental(master.ongoing_transfers, master.ongoing_works)
+    # master is a SchedulingUsingCSPOnline instance (state A is always built via Online now);
+    # nodesFreeTimeIncremental is only DEFINED on the Incremental subclass, but only ever
+    # touches attributes (transfers/works/compute_nodes/env) that any instance already has,
+    # so calling it unbound on our Online instance is safe and avoids needing a second master.
+    nodes_free_time = SchedulingUsingCSPIncremental.nodesFreeTimeIncremental(master, master.ongoing_transfers, master.ongoing_works)
 
     master.java_main_class = 'MainIncremental'
     transfers_, works_, deletions_ = schedulingUsingJavaCSP(master, jobs_to_reschedule, replicas_locations, nodes_free_time, now)
@@ -293,6 +324,7 @@ def run_incremental_style(master, new_job, isolated_ids, nb_nodes, now, replicas
     isolated_flow_times = [ft for jid, ft in flow_by_job.items() if jid in isolated_ids]
 
     wait_time = (new_job_start - new_job.arriving_time) if new_job_start is not None else None
+    transfer_energy_total, transfer_energy_detail = compute_transfer_energy(transfers_, master)
     return {
         "wait_time_new_job": wait_time,
         "flow_time_new_job": (new_job_finish - new_job.arriving_time) if new_job_finish is not None else None,
@@ -309,6 +341,8 @@ def run_incremental_style(master, new_job, isolated_ids, nb_nodes, now, replicas
         "n_jobs_isolated": len(isolated_flow_times),
         "flow_time_by_job": flow_by_job,
         "jobs_to_reschedule": [j.job_id for j in jobs_to_reschedule],
+        "transfer_energy_total": transfer_energy_total,
+        "transfer_energy_detail": transfer_energy_detail,
         "transfers": transfers_,
         "works": works_,
         "deletions": deletions_,
@@ -361,7 +395,7 @@ def main():
 
     results_dir = args.results_dir or os.path.join(
         SIMULATOR_DIR, "results-grid5000",
-        f"single_decision_{args.approach}_stateA-{args.state_a_approach}_{args.n_existing}j-{args.nb_nodes}n_"
+        f"single_decision_{args.approach}_{args.n_existing}j-{args.nb_nodes}n_"
         f"{args.solver_time_limit}s_{date.today().isoformat()}",
     )
     os.makedirs(results_dir, exist_ok=True)
@@ -379,7 +413,7 @@ def main():
     solve_fn = run_online_style if args.approach == "online" else run_incremental_style
     result = solve_fn(master, new_job, isolated_ids, args.nb_nodes, now, replicas_locations)
     result_summary = {k: v for k, v in result.items()
-                       if k not in ("transfers", "works", "deletions", "replicas_locations")} if result else None
+                       if k not in ("transfers", "works", "deletions", "replicas_locations", "transfer_energy_detail")} if result else None
     print(f"{args.approach} result ({args.solver_time_limit}s):", result_summary, flush=True)
 
     print_jobs_replicas_and_schedule(master, new_job, isolated_ids, result)
@@ -393,7 +427,8 @@ def main():
                             ("Mean flow time (all jobs)", "mean_flow_time_all"),
                             ("Max flow time (all jobs)", "max_flow_time_all"),
                             ("Mean flow time (ISOLATED)", "mean_flow_time_isolated"),
-                            ("Max flow time (ISOLATED)", "max_flow_time_isolated")]:
+                            ("Max flow time (ISOLATED)", "max_flow_time_isolated"),
+                            ("Transfer energy (this solve)", "transfer_energy_total")]:
         v = result.get(key) if result else None
         print(f"{row_label:<30}{('%.2f' % v) if v is not None else 'N/A':>25}")
     print("=" * 70)
@@ -414,7 +449,6 @@ def main():
     with open(results_path, "w") as f:
         json.dump({
             "approach": args.approach,
-            "state_a_approach": args.state_a_approach,
             "solver_time_limit_s": args.solver_time_limit,
             "state_a_time_limit_s": args.state_a_time_limit,
             "n_existing": args.n_existing,

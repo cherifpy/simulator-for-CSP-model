@@ -1074,7 +1074,7 @@ public class MainOnline {
                         j, starting_times[j], nodeStartingTimes[j], currentSimTime + nodeStartingTimes[j]);
             }
 
-            solver.findOptimalSolution(objectives[0], false);
+            solver.findOptimalSolution(objectives[1], false);
             if (!found[0]) {
                 System.out.println("No solution found");
             }
