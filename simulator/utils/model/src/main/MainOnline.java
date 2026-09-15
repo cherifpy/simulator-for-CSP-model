@@ -1035,6 +1035,15 @@ public class MainOnline {
 
                                 TransferConfig tmp_transfer = new TransferConfig(i, transferTasks[j][i].getStart().getValue(), transferTasks[j][i].getEnd().getValue(), j);
                                 transfersList.add(tmp_transfer);
+
+                                // Freshly-transferred data's own release time (computed by the
+                                // storage cumulative constraint above, storageTasks[j][i]'s end)
+                                // was never exported before -- only abandon decisions for
+                                // already-resident replicas were. Without this, nothing downstream
+                                // (the simulator's own bookkeeping, any storage-occupancy
+                                // reconstruction) can tell when this node frees back up, making
+                                // freshly-placed data look permanently resident.
+                                deletionsList.add(new DeletionConfig(i, j, storageTasks[j][i].getEnd().getValue()));
                             }
 
                             final int jFinal = j;
