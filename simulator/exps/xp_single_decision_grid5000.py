@@ -95,11 +95,21 @@ def build_state_a(config, args, results_dir):
     """Builds state A as ONE direct joint CSP solve over all --n-existing jobs at once (their real
     dataset_size/nb_tasks/task_duration/arriving_time), with node free times at 0 and no
     pre-existing replicas -- a genuine one-shot "offline" placement, not a replay of N sequential
-    live-simulation arrivals. env.now is fast-forwarded directly to the moment the new job would
-    arrive via env.run(until=...) with NO processes registered (SimPy just advances the clock;
-    nothing else happens), since schedulingUsingJavaCSP reads master.env.now directly everywhere
-    (its scheduling_start_time parameter is unused) and the rest of this script uses that same
-    value as its "now" reference throughout."""
+    live-simulation arrivals.
+
+    Critically, this solve runs with env.now=0 (each job's OWN real arriving_time as its actual
+    lower bound, absolute times coming out exactly as if state A had really executed from t=0) --
+    NOT with env.now already at the freeze point. schedulingUsingJavaCSP reads master.env.now
+    directly everywhere to turn Java's local times into absolute ones, so solving at env.now=T
+    would wrongly anchor every job's schedule to start at-or-after T, making nothing ever appear
+    "already finished" by the time the new job arrives (jobs that arrived long ago would still be
+    scheduled to start in the future). Solving at env.now=0 first lets each job's real committed
+    finish time fall wherever the solver decides -- some existing jobs will genuinely have
+    finished before the freeze point T, some will still be mid-execution -- exactly like the
+    original live-simulation version, just computed with one direct solve instead of a replay.
+    Only AFTER solving is env.now advanced to T (via env.run(until=T) with no processes
+    registered, so SimPy just advances the clock) for the new job's own arrival and the final
+    solve."""
     with open(os.path.join(args.instance_dir, "jobs.json")) as f:
         all_jobs_raw = json.load(f)
     existing_jobs_raw = all_jobs_raw[:args.n_existing]
@@ -120,8 +130,7 @@ def build_state_a(config, args, results_dir):
     nodes_config = generateHeterogeneousInfrastructureEquilibre(
         config, path=os.path.join(args.instance_dir, "infrastructure.csv"))
 
-    env = simpy.Environment()
-    env.run(until=freeze_at)
+    env = simpy.Environment()  # starts at now=0 -- do NOT advance it before the state-A solve
     tracker = Tracker(env)
     master = SchedulingUsingCSPOnline(env, [], tracker, config, overlap=True)
     compute_nodes = [
@@ -157,8 +166,9 @@ def build_state_a(config, args, results_dir):
     master.java_main_class = 'MainOnline'
     print(f"### Building state A: ONE joint solve over jobs 0..{args.n_existing - 1} "
           f"(solver_time_limit={args.state_a_time_limit}s, node free times=0, no pre-existing "
-          f"replicas) ###", flush=True)
-    transfers_, works_, deletions_ = schedulingUsingJavaCSP(master, existing_jobs, {}, nodes_free_time, freeze_at)
+          f"replicas, solved at env.now=0 so each job's real timeline comes out as if it had "
+          f"actually executed) ###", flush=True)
+    transfers_, works_, deletions_ = schedulingUsingJavaCSP(master, existing_jobs, {}, nodes_free_time, 0)
 
     state_a_finish = {}
     if works_:
@@ -171,6 +181,40 @@ def build_state_a(config, args, results_dir):
     if len(state_a_finish) < args.n_existing:
         print(f"### WARNING: state A solve only placed {len(state_a_finish)}/{args.n_existing} jobs "
               f"-- possibly infeasible or cut short within the time budget ###", flush=True)
+
+    # A job is "finished by T" iff its own committed schedule has it fully done (last task's end)
+    # at or before the freeze point -- computed from state A's OWN decided timeline, not from any
+    # live status flag (nothing here ever actually executes via SimPy's event loop).
+    not_finished_ids = {j.job_id for j in existing_jobs
+                         if state_a_finish.get(j.job_id) is None or state_a_finish[j.job_id] > freeze_at}
+    not_finished_jobs = [j for j in existing_jobs if j.job_id in not_finished_ids]
+    print(f"### At freeze point T={freeze_at:.2f}: {args.n_existing - len(not_finished_ids)} of "
+          f"{args.n_existing} existing jobs already finished per state A's own schedule; "
+          f"{len(not_finished_ids)} still running (job_ids={sorted(not_finished_ids)}) ###",
+          flush=True)
+
+    # Reflect state A's own decisions for the not-yet-finished jobs as REAL node occupancy at the
+    # freeze point, so nodesFreeTime()/nodesFreeTimeIncremental() correctly see which nodes are
+    # busy (and until when) instead of treating every node as free -- exactly what a live replay
+    # would have given for free via ongoing_transfers/ongoing_works/transfers/works.
+    for key, entries in (works_ or {}).items():
+        for job_id, node_index, task_index, start_abs, end_abs, duration in entries:
+            if job_id not in not_finished_ids or end_abs <= freeze_at:
+                continue
+            if start_abs <= freeze_at < end_abs:
+                master.ongoing_works[f'node_{node_index}'] = (job_id, node_index, task_index, start_abs, end_abs, duration)
+            else:
+                master.works[f'node_{node_index}'].append((job_id, node_index, task_index, start_abs, end_abs, duration))
+    for key, entries in (transfers_ or {}).items():
+        for job_id, node_index, start_abs, end_abs, duration in entries:
+            if job_id not in not_finished_ids or end_abs <= freeze_at:
+                continue
+            if start_abs <= freeze_at < end_abs:
+                master.ongoing_transfers[f'node_{node_index}'] = (job_id, node_index, start_abs, end_abs, duration)
+            else:
+                master.transfers[f'node_{node_index}'].append((job_id, node_index, start_abs, end_abs, duration))
+
+    env.run(until=freeze_at)
     print(f"### State A built. env.now={env.now:.2f}, jobs placed={len(state_a_finish)}/{args.n_existing} ###",
           flush=True)
 
@@ -178,13 +222,13 @@ def build_state_a(config, args, results_dir):
     new_job.arriving_time = env.now
     master.tracker.register_job(new_job.job_id, env.now)
 
-    # Nothing has actually "finished" in this offline framing -- state A's solve just DECIDED a
-    # placement for these jobs, none of them physically executed. So every existing job (plus the
-    # new one) is legitimately part of the comparison scope, unlike the live-replay version where
-    # some jobs could already be done by the freeze point.
-    isolated_ids = {j.job_id for j in existing_jobs} | {new_job.job_id}
-    print(f"### Isolated comparison scope: all {len(isolated_ids)} jobs (state A + new job) ###", flush=True)
-    return master, new_job, isolated_ids
+    # Only the new job plus existing jobs still running at T could actually differ between
+    # approaches -- an already-finished job's outcome is fixed no matter what, so including it
+    # would only dilute the comparison.
+    isolated_ids = not_finished_ids | {new_job.job_id}
+    print(f"### Isolated comparison scope: {len(isolated_ids)} jobs (new job + still-running "
+          f"existing jobs) ###", flush=True)
+    return master, new_job, isolated_ids, not_finished_jobs
 
 
 def committed_finish_time(master, nb_nodes, job_id):
@@ -213,10 +257,15 @@ def compute_transfer_energy(transfers_, master):
     return total, detail
 
 
-def run_online_style(master, new_job, isolated_ids, nb_nodes, now, replicas_locations):
+def run_online_style(master, new_job, isolated_ids, nb_nodes, now, replicas_locations, not_finished_jobs):
     """Mirrors SchedulingUsingCSPOnline.schedulingNewJob(): jointly replan the new job + every
-    existing job that still has unstarted tasks."""
-    jobs_to_reschedule = [new_job] + master.getRunningJobs()
+    existing job that still has unstarted tasks. Which existing jobs count as "still running" is
+    passed in directly (not_finished_jobs, from state A's own committed schedule vs the freeze
+    point) rather than via master.getRunningJobs() -- that method reads live job.status/task.status
+    flags that are never updated here (nothing actually executes through SimPy's event loop in
+    this offline-style construction), so it would incorrectly treat every existing job as still
+    running regardless of whether state A's own schedule already finished it."""
+    jobs_to_reschedule = [new_job] + not_finished_jobs
     nodes_free_time = master.nodesFreeTime(master.ongoing_transfers, master.ongoing_works)
 
     master.java_main_class = 'MainOnline'
@@ -283,9 +332,10 @@ def run_online_style(master, new_job, isolated_ids, nb_nodes, now, replicas_loca
     }
 
 
-def run_incremental_style(master, new_job, isolated_ids, nb_nodes, now, replicas_locations):
+def run_incremental_style(master, new_job, isolated_ids, nb_nodes, now, replicas_locations, not_finished_jobs=None):
     """Mirrors SchedulingUsingCSPIncremental.schedulingNewJob(): place the new job alone; every
-    existing job keeps whatever it was already committed to in state A, untouched."""
+    existing job keeps whatever it was already committed to in state A, untouched. not_finished_jobs
+    is accepted (and ignored) purely so this shares a call signature with run_online_style."""
     jobs_to_reschedule = [new_job]
     # master is a SchedulingUsingCSPOnline instance (state A is always built via Online now);
     # nodesFreeTimeIncremental is only DEFINED on the Incremental subclass, but only ever
@@ -435,7 +485,7 @@ def main():
     with open(args.config, "r", encoding="utf-8") as f:
         config = json.load(f)
 
-    master, new_job, isolated_ids = build_state_a(config, args, results_dir)
+    master, new_job, isolated_ids, not_finished_jobs = build_state_a(config, args, results_dir)
     now = master.env.now
     replicas_locations = master.replicas_locations
 
@@ -443,7 +493,7 @@ def main():
     print(f"\n### Solving new job's (id={new_job.job_id}) placement -- {args.approach.upper()} style, "
           f"{args.solver_time_limit}s budget ###", flush=True)
     solve_fn = run_online_style if args.approach == "online" else run_incremental_style
-    result = solve_fn(master, new_job, isolated_ids, args.nb_nodes, now, replicas_locations)
+    result = solve_fn(master, new_job, isolated_ids, args.nb_nodes, now, replicas_locations, not_finished_jobs)
     result_summary = {k: v for k, v in result.items()
                        if k not in ("transfers", "works", "deletions", "replicas_locations", "transfer_energy_detail")} if result else None
     print(f"{args.approach} result ({args.solver_time_limit}s):", result_summary, flush=True)
