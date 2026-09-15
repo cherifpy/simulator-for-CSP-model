@@ -44,6 +44,7 @@ from classes.job import Job
 from compute_node import ComputeNode
 from master_node_with_heterogeneous_nodes_csp import SchedulingUsingCSPOnline, SchedulingUsingCSPIncremental
 from utils.modelCSP import schedulingUsingJavaCSP
+from utils.plots import plot_gantt_chart
 from simulator import generateHeterogeneousInfrastructureEquilibre, configure_logging
 
 logger = logging.getLogger(__name__)
@@ -165,6 +166,8 @@ def build_state_a(config, args, results_dir):
             for job_id, node_index, task_index, start_abs, end_abs, duration in entries:
                 state_a_finish[job_id] = end_abs if job_id not in state_a_finish else max(state_a_finish[job_id], end_abs)
     master._state_a_finish = state_a_finish
+    master._state_a_works = works_ or {}
+    master._state_a_transfers = transfers_ or {}
     if len(state_a_finish) < args.n_existing:
         print(f"### WARNING: state A solve only placed {len(state_a_finish)}/{args.n_existing} jobs "
               f"-- possibly infeasible or cut short within the time budget ###", flush=True)
@@ -389,6 +392,35 @@ def print_jobs_replicas_and_schedule(master, new_job, isolated_ids, result):
               f"{'  [isolated]' if job_id in isolated_ids else ''}")
 
 
+def build_gantt_events(master, result):
+    """Full final schedule as plot_gantt_chart's flat event list: state A's own placement for
+    every job it decided, with any job actually touched by THIS solve (jobs_to_reschedule)
+    overridden by its result instead -- for Online that's the new job + every still-open
+    existing job it re-planned; for Incremental it's just the new job, so every other job's
+    state-A placement is untouched here too."""
+    if result is None:
+        return []
+    reschedule_ids = set(result["jobs_to_reschedule"])
+    events = []
+    for source_works, source_transfers, skip_ids in (
+        (master._state_a_works, master._state_a_transfers, reschedule_ids),
+        (result["works"], result["transfers"], set()),
+    ):
+        for entries in source_works.values():
+            for job_id, node_index, task_index, start_abs, end_abs, duration in entries:
+                if job_id in skip_ids:
+                    continue
+                events.append({"type": "processing", "node_id": node_index, "start": start_abs,
+                                "end": end_abs, "job_id": job_id, "task_id": task_index})
+        for entries in source_transfers.values():
+            for job_id, node_index, start_abs, end_abs, duration in entries:
+                if job_id in skip_ids:
+                    continue
+                events.append({"type": "transfer", "node_id": node_index, "start": start_abs,
+                                "end": end_abs, "job_id": job_id})
+    return events
+
+
 def main():
     args = parse_args()
     configure_logging(logging.WARNING)
@@ -462,6 +494,16 @@ def main():
             "result": result,
         }, f, indent=2)
     print(f"\n### Results written to {results_path} ###", flush=True)
+
+    gantt_events = build_gantt_events(master, result)
+    if gantt_events:
+        gantt_path = os.path.join(results_dir, "gantt.png")
+        plot_gantt_chart(gantt_events, args.nb_nodes,
+                          title=f"{args.approach} -- state A ({args.n_existing}j) + new job {new_job.job_id}",
+                          save_path=gantt_path)
+        print(f"### Gantt chart written to {gantt_path} ###", flush=True)
+    else:
+        print("### No gantt chart: no schedule to plot (solve returned no solution) ###", flush=True)
 
 
 if __name__ == "__main__":
