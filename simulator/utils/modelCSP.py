@@ -315,7 +315,15 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
                 "nb_tasks": len([task.duration for task in job.tasks if task.status == "NotStarted"]),
                 "task_duration": job.tasks[0].duration ,
                 "timelasped": int(master_node.env.now - job.arriving_time)+1,
-                "job_arriving_time": job.arriving_time,
+                # LOCAL-frame lower bound on this job's first transfer start (0 = "now" for this
+                # solve, same frame as every "start"/"end" the solver outputs). Always 0 for any
+                # job that's genuinely already arrived (job.arriving_time <= env.now, the normal
+                # live-replanning case) -- only nonzero when a batch jointly solves jobs with
+                # staggered real arrival times relative to this solve's own env.now (e.g. state
+                # A's one-shot joint solve at env.now=0 over jobs that "arrive" at different real
+                # times), where it's exactly job.arriving_time itself. Without this, nothing in
+                # the CSP stops a job's data transfer from starting before the job has arrived.
+                "job_arriving_time": max(0, job.arriving_time - master_node.env.now),
             })
     jobs_data = sorted(jobs_data, key=lambda x: x['job_id'])
     

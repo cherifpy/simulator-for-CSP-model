@@ -5,7 +5,8 @@ import matplotlib.patches as mpatches
 plt.set_loglevel (level = 'warning')
 logging.getLogger('PIL').setLevel(logging.WARNING)
 
-def plot_gantt_chart(task_data, num_nodes, title="Task Execution and Data Transfers", save_path=None):
+def plot_gantt_chart(task_data, num_nodes, title="Task Execution and Data Transfers", save_path=None,
+                      freeze_at=None, freeze_label="Arrival of new job"):
     """Visualize the Gantt chart."""
     _, ax = plt.subplots(figsize=(12, 8))
     colors = {'processing': 'blue', 'transfer': 'red'}
@@ -66,6 +67,12 @@ def plot_gantt_chart(task_data, num_nodes, title="Task Execution and Data Transf
         mpatches.Patch(color=colors['processing'], label='Processing'),
         mpatches.Patch(color=colors['transfer'], label='Dataset Transfer'),
     ]
+    if freeze_at is not None:
+        ax.axvline(x=freeze_at, color='black', linestyle='--', linewidth=1.5)
+        ax.text(freeze_at, ax.get_ylim()[1], f"  {freeze_label}\n  (T={freeze_at:.1f})",
+                color='black', ha='left', va='top', fontsize=9, fontweight='bold')
+        handles.append(mpatches.Patch(facecolor='none', edgecolor='black', linestyle='--', label=freeze_label))
+
     ax.legend(handles=handles)
 
     ax.set_xlabel("Time")

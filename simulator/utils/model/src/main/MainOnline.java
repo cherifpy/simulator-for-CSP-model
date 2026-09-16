@@ -644,9 +644,19 @@ public class MainOnline {
                         d = 1;
                         end = model.intVar("end_transfer_d" + i + "_n" + j, nodeStartingTimes[j] + d, nodeStartingTimes[j] + d, true);
                     } else {
-                        s = model.intVar("start_transfer_d" + i + "_n" + j, nodeStartingTimes[j], makespan, true);
+                        // A data item can't start transferring before its own job has actually
+                        // arrived -- nodeStartingTimes[j] alone only bounds this by when the NODE
+                        // is free, which says nothing about the JOB itself. job_arriving_times[i]
+                        // is 0 for the ordinary case (job already arrived relative to this solve's
+                        // own "now"), so this is a no-op there; it only bites for a joint solve
+                        // over jobs with staggered real arrival times (e.g. state A's one-shot
+                        // build), where it stops the solver from silently scheduling a job's
+                        // transfer before local time 0 = its real arrival.
+                        int arrivalLb = job_arriving_times == null ? 0 : (int) Math.ceil(job_arriving_times[i]);
+                        int lb = Math.max(nodeStartingTimes[j], arrivalLb);
+                        s = model.intVar("start_transfer_d" + i + "_n" + j, lb, makespan, true);
                         d = (int) Math.ceil(transferTime(i, j, data_sizes[i], bandwidths[j], replicas_location));
-                        end = model.intVar("end_transfer_d" + i + "_n" + j, nodeStartingTimes[j] + d, makespan, true);
+                        end = model.intVar("end_transfer_d" + i + "_n" + j, lb + d, makespan, true);
                     }
                     IntVar durationVar = model.intVar(d);
                     
@@ -1972,7 +1982,7 @@ public class MainOnline {
 
         // Call scheduler
         SchedulingWithDiffN.SchedulingResult result = SchedulingWithDiffN.runScheduler(
-            jobs,nodes.size(), nbData, data_sizes, works, bandwidths, cpus, storage_capacity, nodes_free_time, replicas_location,null, 0, true,null);
+            jobs,nodes.size(), nbData, data_sizes, works, bandwidths, cpus, storage_capacity, nodes_free_time, replicas_location,null, 0, true,jobs_arrival_time);
 
         String basePath = MODEL_OUTPUTS_DIR + "/";
 

@@ -77,6 +77,16 @@ def parse_args():
     parser.add_argument("--state-a-time-limit", type=int, default=30,
                          help="CSP solver time budget for the ONE joint solve that builds state A "
                               "over all --n-existing jobs at once (default: 30s).")
+    parser.add_argument("--occupied-nodes-fraction", type=float, default=1.0,
+                         help="Fraction of --nb-nodes eligible for state A's own solve (default: "
+                              "1.0, i.e. all of them). Use this to directly control infra occupancy "
+                              "instead of --n-existing/--state-a-time-limit alone -- e.g. 5 existing "
+                              "jobs restricted to the first 50%% of nodes (--occupied-nodes-fraction "
+                              "0.5) genuinely fills that half, rather than hoping a joint solve over "
+                              "all N nodes happens to leave some jobs still running by the freeze "
+                              "point. The new job's own solve still sees every node -- only state A's "
+                              "construction is restricted to the first "
+                              "round(nb_nodes * occupied_nodes_fraction) nodes.")
     parser.add_argument("--lambda-rate", type=int, default=100,
                          help="Present for config compatibility; unused now that state A is a single "
                               "direct joint solve rather than a live-simulation replay with injected "
@@ -162,13 +172,25 @@ def build_state_a(config, args, results_dir):
         tracker.register_job(j.job_id, raw["arriving_time"])
     master.jobs = existing_jobs
 
+    # Restrict state A's OWN solve to a PREFIX of the node list (nb_occupied nodes), so the
+    # --n-existing jobs are forced to genuinely fill that fraction of the infra, rather than
+    # spreading across all --nb-nodes and leaving occupancy up to how the solver happens to
+    # behave. Node indices returned by this restricted solve equal the real global node index
+    # exactly (it's a prefix, not an arbitrary subset), so no remapping is needed. Restored to the
+    # full node list right after, since the final new-job solve should see every node -- the
+    # un-occupied ones are genuinely free.
+    nb_occupied = max(1, min(args.nb_nodes, round(args.nb_nodes * args.occupied_nodes_fraction)))
+    master.compute_nodes = compute_nodes[:nb_occupied]
+
     nodes_free_time = master.nodesFreeTime(master.ongoing_transfers, master.ongoing_works)
     master.java_main_class = 'MainOnline'
-    print(f"### Building state A: ONE joint solve over jobs 0..{args.n_existing - 1} "
-          f"(solver_time_limit={args.state_a_time_limit}s, node free times=0, no pre-existing "
-          f"replicas, solved at env.now=0 so each job's real timeline comes out as if it had "
-          f"actually executed) ###", flush=True)
+    print(f"### Building state A: ONE joint solve over jobs 0..{args.n_existing - 1}, restricted to "
+          f"the first {nb_occupied}/{args.nb_nodes} nodes ({args.occupied_nodes_fraction * 100:.0f}% "
+          f"of the infra) (solver_time_limit={args.state_a_time_limit}s, node free times=0, no "
+          f"pre-existing replicas, solved at env.now=0 so each job's real timeline comes out as if "
+          f"it had actually executed) ###", flush=True)
     transfers_, works_, deletions_ = schedulingUsingJavaCSP(master, existing_jobs, {}, nodes_free_time, 0)
+    master.compute_nodes = compute_nodes  # restore full node list for the final new-job solve
 
     state_a_finish = {}
     if works_:
@@ -192,6 +214,27 @@ def build_state_a(config, args, results_dir):
           f"{args.n_existing} existing jobs already finished per state A's own schedule; "
           f"{len(not_finished_ids)} still running (job_ids={sorted(not_finished_ids)}) ###",
           flush=True)
+
+    # Reflect state A's own per-TASK schedule onto each not-yet-finished job's actual Task
+    # objects: anything already committed by T becomes "Finished" (task fully done before T) or
+    # "Started" (in progress right at T), leaving only genuinely not-yet-started tasks as
+    # "NotStarted". schedulingUsingJavaCSP (utils/modelCSP.py) only ever batches a job's
+    # "NotStarted" tasks into the CSP, so this is what makes an online replan reconsider just the
+    # REMAINING work -- without it, every task.status here is still the Task class's default
+    # ("NotStarted", since these Job/Task objects never run through SimPy's live event loop in
+    # this offline-style construction), so a replan would silently re-decide the job's ENTIRE
+    # placement from scratch at T, discarding whatever state A had already committed before T.
+    job_by_id = {j.job_id: j for j in existing_jobs}
+    for key, entries in (works_ or {}).items():
+        for job_id, node_index, task_index, start_abs, end_abs, duration in entries:
+            if job_id not in not_finished_ids:
+                continue
+            task_obj = job_by_id[job_id].tasks[task_index]
+            if end_abs <= freeze_at:
+                task_obj.status = "Finished"
+            elif start_abs <= freeze_at < end_abs:
+                task_obj.status = "Started"
+            # else: stays "NotStarted" (default) -- genuinely still reschedulable
 
     # Reflect state A's own decisions for the not-yet-finished jobs as REAL node occupancy at the
     # freeze point, so nodesFreeTime()/nodesFreeTimeIncremental() correctly see which nodes are
@@ -442,32 +485,44 @@ def print_jobs_replicas_and_schedule(master, new_job, isolated_ids, result):
               f"{'  [isolated]' if job_id in isolated_ids else ''}")
 
 
-def build_gantt_events(master, result):
+def build_gantt_events(master, result, freeze_at):
     """Full final schedule as plot_gantt_chart's flat event list: state A's own placement for
-    every job it decided, with any job actually touched by THIS solve (jobs_to_reschedule)
-    overridden by its result instead -- for Online that's the new job + every still-open
-    existing job it re-planned; for Incremental it's just the new job, so every other job's
-    state-A placement is untouched here too."""
+    every job it decided, EXCEPT the portion of a rescheduled job (jobs_to_reschedule) that was
+    still genuinely open at T (start_abs > freeze_at, i.e. not yet started -- the only part the
+    CSP was actually free to re-decide) -- that portion comes from this solve's own result
+    instead. Anything already committed by T (finished, or in progress right at T) keeps its
+    state-A placement even for a rescheduled job, since that work physically already happened
+    and this solve never touched it (see the task.status pre-marking in build_state_a). For
+    Incremental, jobs_to_reschedule is just the new job, so every existing job's state-A
+    placement is untouched here regardless of freeze_at."""
     if result is None:
         return []
     reschedule_ids = set(result["jobs_to_reschedule"])
     events = []
-    for source_works, source_transfers, skip_ids in (
-        (master._state_a_works, master._state_a_transfers, reschedule_ids),
-        (result["works"], result["transfers"], set()),
+    for job_id, node_index, task_index, start_abs, end_abs, duration in (
+        e for entries in master._state_a_works.values() for e in entries
     ):
-        for entries in source_works.values():
-            for job_id, node_index, task_index, start_abs, end_abs, duration in entries:
-                if job_id in skip_ids:
-                    continue
-                events.append({"type": "processing", "node_id": node_index, "start": start_abs,
-                                "end": end_abs, "job_id": job_id, "task_id": task_index})
-        for entries in source_transfers.values():
-            for job_id, node_index, start_abs, end_abs, duration in entries:
-                if job_id in skip_ids:
-                    continue
-                events.append({"type": "transfer", "node_id": node_index, "start": start_abs,
-                                "end": end_abs, "job_id": job_id})
+        if job_id in reschedule_ids and start_abs > freeze_at:
+            continue  # this task was still open at T -- superseded by result's own placement
+        events.append({"type": "processing", "node_id": node_index, "start": start_abs,
+                        "end": end_abs, "job_id": job_id, "task_id": task_index})
+    for job_id, node_index, start_abs, end_abs, duration in (
+        e for entries in master._state_a_transfers.values() for e in entries
+    ):
+        if job_id in reschedule_ids and start_abs > freeze_at:
+            continue
+        events.append({"type": "transfer", "node_id": node_index, "start": start_abs,
+                        "end": end_abs, "job_id": job_id})
+    for job_id, node_index, task_index, start_abs, end_abs, duration in (
+        e for entries in result["works"].values() for e in entries
+    ):
+        events.append({"type": "processing", "node_id": node_index, "start": start_abs,
+                        "end": end_abs, "job_id": job_id, "task_id": task_index})
+    for job_id, node_index, start_abs, end_abs, duration in (
+        e for entries in result["transfers"].values() for e in entries
+    ):
+        events.append({"type": "transfer", "node_id": node_index, "start": start_abs,
+                        "end": end_abs, "job_id": job_id})
     return events
 
 
@@ -545,12 +600,12 @@ def main():
         }, f, indent=2)
     print(f"\n### Results written to {results_path} ###", flush=True)
 
-    gantt_events = build_gantt_events(master, result)
+    gantt_events = build_gantt_events(master, result, new_job.arriving_time)
     if gantt_events:
         gantt_path = os.path.join(results_dir, "gantt.png")
         plot_gantt_chart(gantt_events, args.nb_nodes,
                           title=f"{args.approach} -- state A ({args.n_existing}j) + new job {new_job.job_id}",
-                          save_path=gantt_path)
+                          save_path=gantt_path, freeze_at=new_job.arriving_time)
         print(f"### Gantt chart written to {gantt_path} ###", flush=True)
     else:
         print("### No gantt chart: no schedule to plot (solve returned no solution) ###", flush=True)
