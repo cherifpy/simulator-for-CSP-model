@@ -57,10 +57,16 @@ JAVA_MAIN_CLASS_BY_APPROACH = {
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--approach", required=True, choices=sorted(JAVA_MAIN_CLASS_BY_APPROACH.keys()),
+    parser.add_argument("--approach", required=True,
+                         choices=sorted(JAVA_MAIN_CLASS_BY_APPROACH.keys()) + ["both"],
                          help="How to solve the single new job's placement: 'online' jointly "
                               "replans it with every existing job that still has unstarted tasks; "
-                              "'incremental' places it alone, leaving existing jobs untouched.")
+                              "'incremental' places it alone, leaving existing jobs untouched; "
+                              "'both' builds state A ONCE (per --state-a-time-limit) and solves "
+                              "the new job's placement with BOTH approaches from that SAME frozen "
+                              "state (see --online-time-limit/--incremental-time-limit for their "
+                              "individual budgets), so the comparison isn't muddied by two "
+                              "separate, independently-(re)built state A's.")
     parser.add_argument("--instance-dir", required=True,
                          help="Directory containing this instance's jobs.json and infrastructure.csv.")
     parser.add_argument("--nb-nodes", required=True, type=int, help="Number of compute nodes in the instance.")
@@ -70,10 +76,18 @@ def parse_args():
     parser.add_argument("--new-job-index", type=int, default=None,
                          help="Index into jobs.json of the single new job injected after state A is "
                               "frozen (default: --n-existing, i.e. the job right after state A).")
-    parser.add_argument("--solver-time-limit", required=True, type=int,
+    parser.add_argument("--solver-time-limit", type=int, default=None,
                          help="CSP solver time budget for the new job's placement solve, in seconds "
-                              "(e.g. 7200 for a 2h Grid5000 run). Only applies to that final solve -- "
-                              "the state-A-building solve always uses --state-a-time-limit.")
+                              "(e.g. 7200 for a 2h Grid5000 run). Required unless --approach both "
+                              "(which uses --online-time-limit/--incremental-time-limit instead). "
+                              "Only applies to that final solve -- the state-A-building solve "
+                              "always uses --state-a-time-limit.")
+    parser.add_argument("--online-time-limit", type=int, default=None,
+                         help="Online's own solver time budget in seconds, used only with "
+                              "--approach both (e.g. 3600 for a 1h online replan).")
+    parser.add_argument("--incremental-time-limit", type=int, default=None,
+                         help="Incremental's own solver time budget in seconds, used only with "
+                              "--approach both (e.g. 30 for a 30s incremental placement).")
     parser.add_argument("--state-a-time-limit", type=int, default=30,
                          help="CSP solver time budget for the ONE joint solve that builds state A "
                               "over all --n-existing jobs at once (default: 30s).")
@@ -98,7 +112,13 @@ def parse_args():
                               "<simulator>/results-grid5000/single_decision_<approach>_<n_existing>j-"
                               "<nb_nodes>n_<solver_time_limit>s_<date>.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42).")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.approach == "both":
+        if args.online_time_limit is None or args.incremental_time_limit is None:
+            parser.error("--approach both requires both --online-time-limit and --incremental-time-limit")
+    elif args.solver_time_limit is None:
+        parser.error(f"--approach {args.approach} requires --solver-time-limit")
+    return args
 
 
 def build_state_a(config, args, results_dir):
@@ -526,46 +546,40 @@ def build_gantt_events(master, result, freeze_at):
     return events
 
 
-def main():
-    args = parse_args()
-    configure_logging(logging.WARNING)
+METRIC_ROWS = [("New job's wait time", "wait_time_new_job"),
+               ("New job's flow time", "flow_time_new_job"),
+               ("Mean flow time (all jobs)", "mean_flow_time_all"),
+               ("Max flow time (all jobs)", "max_flow_time_all"),
+               ("Mean flow time (ISOLATED)", "mean_flow_time_isolated"),
+               ("Max flow time (ISOLATED)", "max_flow_time_isolated"),
+               ("Transfer energy (this solve)", "transfer_energy_total")]
 
-    results_dir = args.results_dir or os.path.join(
-        SIMULATOR_DIR, "results-grid5000",
-        f"single_decision_{args.approach}_{args.n_existing}j-{args.nb_nodes}n_"
-        f"{args.solver_time_limit}s_{date.today().isoformat()}",
-    )
-    os.makedirs(results_dir, exist_ok=True)
 
-    with open(args.config, "r", encoding="utf-8") as f:
-        config = json.load(f)
-
-    master, new_job, isolated_ids, not_finished_jobs = build_state_a(config, args, results_dir)
-    now = master.env.now
-    replicas_locations = master.replicas_locations
-
-    master._config["solver_time_limit_s"] = args.solver_time_limit
-    print(f"\n### Solving new job's (id={new_job.job_id}) placement -- {args.approach.upper()} style, "
-          f"{args.solver_time_limit}s budget ###", flush=True)
-    solve_fn = run_online_style if args.approach == "online" else run_incremental_style
+def solve_and_save(approach, time_limit, out_dir, args, master, new_job, isolated_ids,
+                    not_finished_jobs, now, replicas_locations):
+    """Runs ONE approach's placement solve against the given (already-built) state A, prints its
+    schedule/metrics, and saves results.json + gantt.png under out_dir. Safe to call more than
+    once against the SAME master for a --approach both run: neither run_online_style nor
+    run_incremental_style mutates master's own accumulated state (works/transfers/ongoing_*/
+    replicas_locations) or the Job/Task objects' status beyond what build_state_a already fixed
+    once -- each call only reads them and returns a fresh, independent result dict."""
+    os.makedirs(out_dir, exist_ok=True)
+    master._config["solver_time_limit_s"] = time_limit
+    print(f"\n### Solving new job's (id={new_job.job_id}) placement -- {approach.upper()} style, "
+          f"{time_limit}s budget ###", flush=True)
+    solve_fn = run_online_style if approach == "online" else run_incremental_style
     result = solve_fn(master, new_job, isolated_ids, args.nb_nodes, now, replicas_locations, not_finished_jobs)
     result_summary = {k: v for k, v in result.items()
                        if k not in ("transfers", "works", "deletions", "replicas_locations", "transfer_energy_detail")} if result else None
-    print(f"{args.approach} result ({args.solver_time_limit}s):", result_summary, flush=True)
+    print(f"{approach} result ({time_limit}s):", result_summary, flush=True)
 
     print_jobs_replicas_and_schedule(master, new_job, isolated_ids, result)
 
     print("\n" + "=" * 70)
-    label = f"{args.approach} ({args.solver_time_limit}s)"
+    label = f"{approach} ({time_limit}s)"
     print(f"{'Metric':<30}{label:>25}")
     print("=" * 70)
-    for row_label, key in [("New job's wait time", "wait_time_new_job"),
-                            ("New job's flow time", "flow_time_new_job"),
-                            ("Mean flow time (all jobs)", "mean_flow_time_all"),
-                            ("Max flow time (all jobs)", "max_flow_time_all"),
-                            ("Mean flow time (ISOLATED)", "mean_flow_time_isolated"),
-                            ("Max flow time (ISOLATED)", "max_flow_time_isolated"),
-                            ("Transfer energy (this solve)", "transfer_energy_total")]:
+    for row_label, key in METRIC_ROWS:
         v = result.get(key) if result else None
         print(f"{row_label:<30}{('%.2f' % v) if v is not None else 'N/A':>25}")
     print("=" * 70)
@@ -582,11 +596,11 @@ def main():
         for j in sorted(master.jobs + [new_job], key=lambda j: j.job_id)
     ]
 
-    results_path = os.path.join(results_dir, "results.json")
+    results_path = os.path.join(out_dir, "results.json")
     with open(results_path, "w") as f:
         json.dump({
-            "approach": args.approach,
-            "solver_time_limit_s": args.solver_time_limit,
+            "approach": approach,
+            "solver_time_limit_s": time_limit,
             "state_a_time_limit_s": args.state_a_time_limit,
             "n_existing": args.n_existing,
             "new_job_index": args.new_job_index if args.new_job_index is not None else args.n_existing,
@@ -602,13 +616,63 @@ def main():
 
     gantt_events = build_gantt_events(master, result, new_job.arriving_time)
     if gantt_events:
-        gantt_path = os.path.join(results_dir, "gantt.png")
+        gantt_path = os.path.join(out_dir, "gantt.png")
         plot_gantt_chart(gantt_events, args.nb_nodes,
-                          title=f"{args.approach} -- state A ({args.n_existing}j) + new job {new_job.job_id}",
+                          title=f"{approach} -- state A ({args.n_existing}j) + new job {new_job.job_id}",
                           save_path=gantt_path, freeze_at=new_job.arriving_time)
         print(f"### Gantt chart written to {gantt_path} ###", flush=True)
     else:
         print("### No gantt chart: no schedule to plot (solve returned no solution) ###", flush=True)
+    return result
+
+
+def main():
+    args = parse_args()
+    configure_logging(logging.WARNING)
+
+    if args.approach == "both":
+        approach_plan = [("online", args.online_time_limit), ("incremental", args.incremental_time_limit)]
+        time_limit_tag = f"online{args.online_time_limit}s-incremental{args.incremental_time_limit}s"
+    else:
+        approach_plan = [(args.approach, args.solver_time_limit)]
+        time_limit_tag = f"{args.solver_time_limit}s"
+
+    results_dir = args.results_dir or os.path.join(
+        SIMULATOR_DIR, "results-grid5000",
+        f"single_decision_{args.approach}_{args.n_existing}j-{args.nb_nodes}n_"
+        f"{time_limit_tag}_{date.today().isoformat()}",
+    )
+    os.makedirs(results_dir, exist_ok=True)
+
+    with open(args.config, "r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    master, new_job, isolated_ids, not_finished_jobs = build_state_a(config, args, results_dir)
+    now = master.env.now
+    replicas_locations = master.replicas_locations
+
+    results_by_approach = {}
+    for approach, time_limit in approach_plan:
+        out_dir = results_dir if len(approach_plan) == 1 else os.path.join(results_dir, approach)
+        results_by_approach[approach] = (
+            solve_and_save(approach, time_limit, out_dir, args, master, new_job, isolated_ids,
+                            not_finished_jobs, now, replicas_locations),
+            time_limit,
+        )
+
+    if len(approach_plan) > 1:
+        print("\n" + "=" * 70)
+        print("### COMPARISON -- same state A, different approach/budget for the new job ###")
+        col_labels = [f"{approach} ({tl}s)" for approach, (_, tl) in results_by_approach.items()]
+        print(f"{'Metric':<30}" + "".join(f"{lbl:>25}" for lbl in col_labels))
+        print("=" * 70)
+        for row_label, key in METRIC_ROWS:
+            cells = []
+            for result, _ in results_by_approach.values():
+                v = result.get(key) if result else None
+                cells.append(('%.2f' % v) if v is not None else 'N/A')
+            print(f"{row_label:<30}" + "".join(f"{c:>25}" for c in cells))
+        print("=" * 70)
 
 
 if __name__ == "__main__":

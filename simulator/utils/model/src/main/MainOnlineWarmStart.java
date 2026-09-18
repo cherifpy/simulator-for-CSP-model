@@ -896,7 +896,7 @@ public class MainOnlineWarmStart {
             // ----- OBJECTIVE Make span-----
             //makespan var and ensure it's >= all end
             boolean makespan_obj = false;
-            final IntVar[] objectives = new IntVar[2];
+            final IntVar[] objectives = new IntVar[3];
             if (makespan_obj) {
                 /*IntVar makespanVar = model.intVar("makespan", 0, makespan);
 
@@ -928,6 +928,15 @@ public class MainOnlineWarmStart {
                 //model.setObjective(false, maxFlowTime);
                 objectives[1] = maxFlowTime;
                 objectives[0] = sumFlowTime;
+
+                // Objective 2: the flow time of ONE specific job -- whichever job in this batch
+                // has the HIGHEST job_id, by convention the brand-new job (see MainOnline.java's
+                // matching comment / xp_online_warmstart_test.py's NEW_JOB_ID_BASE).
+                int newJobIdx = 0;
+                for (int i = 1; i < nb_data; i++) {
+                    if (jobs.get(i).job_id > jobs.get(newJobIdx).job_id) newJobIdx = i;
+                }
+                objectives[2] = all_flow_time[newJobIdx];
             }
 
             //----- SOLVER -----
@@ -1088,7 +1097,21 @@ public class MainOnlineWarmStart {
             }
             System.out.println("Solver time limit: " + timeLimitSeconds + "s");
             solver.limitTime(timeLimitSeconds + "s");
-            
+
+            // Which objectives[] entry to actually optimize: 0=sum flow time (all jobs, this
+            // file's long-standing default), 1=max flow time (all jobs), 2=the new job's own
+            // flow time alone (see objectives[2] above). Runtime-selectable so any OTHER caller
+            // that never writes this file keeps today's exact behavior (default: 0).
+            int objectiveChoice = 0;
+            try {
+                String objectiveChoiceText = readFile(MODEL_INPUTS_DIR + "/objective_choice.txt").trim();
+                if (!objectiveChoiceText.isEmpty()) objectiveChoice = Integer.parseInt(objectiveChoiceText);
+            } catch (Exception e) {
+                // File missing/unreadable: keep the default (0 = sum flow time, all jobs).
+            }
+            System.out.println("Objective choice: " + objectiveChoice
+                    + " (0=sum all, 1=max all, 2=new job's own flow time)");
+
             boolean[] found = {false};
             solver.onSolution(() -> {
                         
@@ -1114,6 +1137,14 @@ public class MainOnlineWarmStart {
 
                                 TransferConfig tmp_transfer = new TransferConfig(i, transferTasks[j][i].getStart().getValue(), transferTasks[j][i].getEnd().getValue(), j);
                                 transfersList.add(tmp_transfer);
+
+                                // Freshly-transferred data's own release time (storageTasks[j][i]'s
+                                // end, the same value the storage cumulative constraint already
+                                // respects) was never exported here -- only the height==0 (abandon)
+                                // branch below was. Ported from MainOnline.java's fix: without this,
+                                // this data looked "never freed" downstream (verification scripts,
+                                // anything reading deletions_), inflating occupancy / false violations.
+                                deletionsList.add(new DeletionConfig(i, j, storageTasks[j][i].getEnd().getValue()));
                             }
 
                             final int jFinal = j;
@@ -1153,7 +1184,7 @@ public class MainOnlineWarmStart {
                         j, starting_times[j], nodeStartingTimes[j], currentSimTime + nodeStartingTimes[j]);
             }
 
-            solver.findOptimalSolution(objectives[0], false);
+            solver.findOptimalSolution(objectives[objectiveChoice], false);
             if (!found[0]) {
                 System.out.println("No solution found");
             }

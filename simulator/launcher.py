@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 Test
 """
 All-in-one launcher for Grid5000 (or any fresh machine): sets up everything needed (Python
 venv, pinned dependencies, optionally a modern JDK, compiles the Java CSP model) and then runs
@@ -34,6 +34,8 @@ Examples:
     # re-checking/re-installing everything:
     python3 launcher.py --approach incremental --instance-dir ... --nb-jobs 50 --nb-nodes 50 \\
         --solver-time-limit 20 --lambda-rate 100 --skip-setup
+
+    oarsub -l host=1,walltime=03:30:00 "python3 ~/simulator-for-CSP-model/simulator/launcher.py --experiment single_decision --approach online --instance-dir ~/simulator-for-CSP-model/simulator/workloads/workloads-100-for_storage_constraintes/inst-20J-50N --nb-nodes 50 --n-existing 15 --solver-time-limit 7200 --lambda-rate 100"
 """
 
 import argparse
@@ -164,6 +166,8 @@ EXPERIMENT_MODULES = {
     "online": "exps.xp_online_grid5000",
     "single_decision": "exps.xp_single_decision_grid5000",
     "dataset_size_sweep": "exps.xp_dataset_size_sweep",
+    "occupancy_sweep": "exps.xp_occupancy_sweep",
+    "online_warmstart_test": "exps.xp_online_warmstart_test",
 }
 
 

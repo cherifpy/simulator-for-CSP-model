@@ -4,15 +4,17 @@ large), to show how the cost of Online's "reconsideration" -- jointly re-plannin
 job that still has unstarted tasks, instead of just placing the new job alone like Incremental
 does -- scales with the size of the data being introduced.
 
-For each size tier: build state A (the same --n-existing jobs, unaffected by the tier) as ONE
-direct joint CSP solve -- node free times at 0, no pre-existing replicas, a genuine one-shot
-"offline" placement, not a replay of N sequential live-simulation arrivals -- ONCE, then solve
-the SAME new job's placement (with that tier's dataset_size) BOTH Online-style and
-Incremental-style from that one state. This is safe to do from a single build (not one build per
-approach, and not one per repeat either): schedulingUsingJavaCSP never mutates the master's
-persistent state (works/ongoing_works/replicas_locations) -- it only reads it and returns a
-proposed solution -- so calling it many times in a row for the same snapshot doesn't let one
-solve contaminate another's starting point.
+For each size tier: build state A as ONE direct joint CSP solve over --n-existing jobs -- node
+free times at 0, no pre-existing replicas, a genuine one-shot "offline" placement, not a replay
+of N sequential live-simulation arrivals -- ONCE per tier, with EVERY one of those jobs' own
+dataset_size ALSO redrawn from that tier's size_range (not just the new job's -- the whole
+infrastructure's data volumes shift with the tier, existing jobs included), then solve the SAME
+new job's placement (with a freshly-drawn dataset_size from that same range) BOTH Online-style
+and Incremental-style from that one state. Reusing one state-A build across all repeats and both
+approaches is safe: schedulingUsingJavaCSP never mutates the master's persistent state
+(works/ongoing_works/replicas_locations) -- it only reads it and returns a proposed solution --
+so calling it many times in a row for the same snapshot doesn't let one solve contaminate
+another's starting point.
 
 Reports, per tier and per approach: the new job's wait/flow time, mean/max flow time (all jobs
 and the ISOLATED subset that can actually differ between approaches), plus a derived
@@ -86,8 +88,14 @@ def parse_args():
                               "reused across its repeats (safe: solving never mutates it), so this "
                               "only adds solves, not state-A rebuilds.")
     parser.add_argument("--solver-time-limit", type=int, default=30,
-                         help="CSP solver time budget for the new job's placement solve, in seconds -- "
-                              "applies to both Online and Incremental at every tier (default: 30).")
+                         help="CSP solver time budget (seconds) for Online's placement solve, per "
+                              "tier (default: 30). Also Incremental's, unless --incremental-time-limit "
+                              "is given separately.")
+    parser.add_argument("--incremental-time-limit", type=int, default=None,
+                         help="CSP solver time budget (seconds) for Incremental's placement solve, "
+                              "per tier. Defaults to --solver-time-limit if not given -- set this "
+                              "separately when Online needs a much larger budget than Incremental "
+                              "(e.g. --solver-time-limit 7200 --incremental-time-limit 60).")
     parser.add_argument("--state-a-time-limit", type=int, default=30,
                          help="CSP solver time budget for the ONE joint solve that builds state A over "
                               "all --n-existing jobs at once, per tier (default: 30s).")
@@ -101,10 +109,13 @@ def parse_args():
                               "<simulator>/results-grid5000/dataset_size_sweep_<n_existing>j-"
                               "<nb_nodes>n_<solver_time_limit>s_<date>.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42).")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.incremental_time_limit is None:
+        args.incremental_time_limit = args.solver_time_limit
+    return args
 
 
-def build_state_a(config, args, results_dir, tier_name):
+def build_state_a(config, args, results_dir, tier_name, size_range, tier_index):
     """Builds state A as ONE direct joint CSP solve over all --n-existing jobs at once (their
     real dataset_size/nb_tasks/task_duration/arriving_time), with node free times at 0 and no
     pre-existing replicas -- a genuine one-shot "offline" placement, not a replay of N sequential
@@ -124,8 +135,6 @@ def build_state_a(config, args, results_dir, tier_name):
     new_job_raw = all_jobs_raw[new_job_index]
     freeze_at = new_job_raw["arriving_time"]
 
-    with open(os.path.join(results_dir, f"state_a_jobs_{tier_name}.json"), "w") as f:
-        json.dump(existing_jobs_raw, f)
 
     config = dict(config)
     config["total_nb_jobs"] = args.n_existing
@@ -161,16 +170,32 @@ def build_state_a(config, args, results_dir, tier_name):
         master.works.setdefault(key, [])
         master.deletions.setdefault(key, [])
 
+    # Every existing job's dataset_size is ALSO redrawn from this tier's size_range (not just the
+    # new job's) -- own random.Random instance (not the global `random` module, which
+    # generateHeterogeneousInfrastructureEquilibre's own random.uniform calls above already
+    # consumed from) so this draw is deterministic and independent of infra generation, seeded
+    # distinctly per tier so different tiers don't share a draw sequence.
+    job_size_rng = random.Random(args.seed * 2000 + tier_index)
     existing_jobs = []
     for raw in existing_jobs_raw:
-        j = Job(raw["job_id"], raw["task_duration"], raw["nb_tasks"], raw["dataset_size"])
+        dataset_size = job_size_rng.randint(*size_range)
+        j = Job(raw["job_id"], raw["task_duration"], raw["nb_tasks"], dataset_size)
         j.arriving_time = raw["arriving_time"]
         existing_jobs.append(j)
         tracker.register_job(j.job_id, raw["arriving_time"])
     master.jobs = existing_jobs
 
+    with open(os.path.join(results_dir, f"state_a_jobs_{tier_name}.json"), "w") as f:
+        json.dump([{"job_id": j.job_id, "dataset_size": j.dataset_size, "nb_tasks": j.nb_tasks,
+                    "task_duration": j.tasks[0].duration if j.tasks else None,
+                    "arriving_time": j.arriving_time} for j in existing_jobs], f)
+
     nodes_free_time = master.nodesFreeTime(master.ongoing_transfers, master.ongoing_works)
     master.java_main_class = 'MainOnline'
+    # Explicit rather than relying on MainOnline.java's own default (1 = max flow time) -- state
+    # A's own construction is also an Online-style joint solve, so it gets the same objective as
+    # the final new-job solve below for consistency.
+    master.objective_choice = 1
     print(f"### [{tier_name}] Building state A: ONE joint solve over jobs 0..{args.n_existing - 1} "
           f"(solver_time_limit={args.state_a_time_limit}s, node free times=0, no pre-existing "
           f"replicas, solved at env.now=0) ###", flush=True)
@@ -196,6 +221,27 @@ def build_state_a(config, args, results_dir, tier_name):
     print(f"### [{tier_name}] At freeze point T={freeze_at:.2f}: {args.n_existing - len(not_finished_ids)} "
           f"of {args.n_existing} existing jobs already finished; {len(not_finished_ids)} still running "
           f"(job_ids={sorted(not_finished_ids)}) ###", flush=True)
+
+    # Reflect state A's own per-TASK schedule onto each not-yet-finished job's actual Task
+    # objects: anything already committed by T becomes "Finished" or "Started", leaving only
+    # genuinely not-yet-started tasks as "NotStarted". schedulingUsingJavaCSP only ever batches a
+    # job's "NotStarted" tasks into the CSP, so this is what makes an online replan reconsider
+    # just the REMAINING work -- without it, every task here is still "NotStarted" (the Task
+    # class default, since these Job/Task objects never run through SimPy's live event loop), so
+    # a replan would silently re-decide the ENTIRE job's placement from scratch at T, discarding
+    # whatever state A had already committed before T. See xp_single_decision_grid5000.py's
+    # matching fix/comment.
+    job_by_id = {j.job_id: j for j in existing_jobs}
+    for key, entries in (works_ or {}).items():
+        for job_id, node_index, task_index, start_abs, end_abs, duration in entries:
+            if job_id not in not_finished_ids:
+                continue
+            task_obj = job_by_id[job_id].tasks[task_index]
+            if end_abs <= freeze_at:
+                task_obj.status = "Finished"
+            elif start_abs <= freeze_at < end_abs:
+                task_obj.status = "Started"
+            # else: stays "NotStarted" (default) -- genuinely still reschedulable
 
     # Reflect state A's own decisions for the not-yet-finished jobs as REAL node occupancy at the
     # freeze point, so nodesFreeTime()/nodesFreeTimeIncremental() correctly see which nodes are
@@ -264,6 +310,7 @@ def run_online_style(master, new_job, isolated_ids, nb_nodes, now, replicas_loca
     nodes_free_time = master.nodesFreeTime(master.ongoing_transfers, master.ongoing_works)
 
     master.java_main_class = 'MainOnline'
+    master.objective_choice = 1  # max flow time (all jobs in this batch) -- explicit, not relied on as a default
     transfers_, works_, deletions_ = schedulingUsingJavaCSP(master, jobs_to_reschedule, replicas_locations, nodes_free_time, now)
 
     if not transfers_ or not works_:
@@ -366,14 +413,13 @@ def run_tier(config, args, results_dir, tier_name, size_range, tier_index):
     within the tier instead of a single fixed value. Safe to reuse the one state-A build across
     all repeats and both approaches: schedulingUsingJavaCSP only reads master's state and returns
     a proposed solution, it never mutates works/ongoing_works/replicas_locations."""
-    master, new_job_raw, not_finished_jobs = build_state_a(config, args, results_dir, tier_name)
+    master, new_job_raw, not_finished_jobs = build_state_a(config, args, results_dir, tier_name, size_range, tier_index)
     now = master.env.now
     replicas_locations = master.replicas_locations
     not_finished_ids = {j.job_id for j in not_finished_jobs}
 
     rng = random.Random(args.seed * 1000 + tier_index)
     low, high = size_range
-    master._config["solver_time_limit_s"] = args.solver_time_limit
 
     trials = []
     for r in range(args.repeats):
@@ -382,6 +428,7 @@ def run_tier(config, args, results_dir, tier_name, size_range, tier_index):
 
         new_job_online = make_new_job(new_job_raw, dataset_size, now)
         master.tracker.register_job(new_job_online.job_id, now)
+        master._config["solver_time_limit_s"] = args.solver_time_limit
         print(f"\n### [{tier_name} #{r}] Solving new job's (dataset_size={dataset_size}) placement -- "
               f"ONLINE style, {args.solver_time_limit}s budget ###", flush=True)
         online_result = run_online_style(master, new_job_online, isolated_ids, args.nb_nodes, now, replicas_locations, not_finished_jobs)
@@ -391,8 +438,9 @@ def run_tier(config, args, results_dir, tier_name, size_range, tier_index):
         # schedulingUsingJavaCSP doesn't mutate new_job_online, so reusing it would also be
         # correct, but building a fresh one keeps the two solves fully decoupled.
         new_job_incremental = make_new_job(new_job_raw, dataset_size, now)
+        master._config["solver_time_limit_s"] = args.incremental_time_limit
         print(f"\n### [{tier_name} #{r}] Solving new job's (dataset_size={dataset_size}) placement -- "
-              f"INCREMENTAL style, {args.solver_time_limit}s budget ###", flush=True)
+              f"INCREMENTAL style, {args.incremental_time_limit}s budget ###", flush=True)
         incremental_result = run_incremental_style(master, new_job_incremental, isolated_ids, args.nb_nodes, now, replicas_locations)
         print(f"[{tier_name} #{r}] Incremental result:", incremental_result, flush=True)
 
@@ -498,6 +546,7 @@ def main():
             "nb_nodes": args.nb_nodes,
             "instance_dir": args.instance_dir,
             "solver_time_limit_s": args.solver_time_limit,
+            "incremental_time_limit_s": args.incremental_time_limit,
             "state_a_time_limit_s": args.state_a_time_limit,
             "repeats": args.repeats,
             "tiers": all_results,

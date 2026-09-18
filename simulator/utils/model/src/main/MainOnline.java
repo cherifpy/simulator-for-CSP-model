@@ -906,7 +906,7 @@ public class MainOnline {
             // ----- OBJECTIVE Make span-----
             //makespan var and ensure it's >= all end
             boolean makespan_obj = false;
-            final IntVar[] objectives = new IntVar[2];
+            final IntVar[] objectives = new IntVar[3];
             if (makespan_obj) {
                 /*IntVar makespanVar = model.intVar("makespan", 0, makespan);
 
@@ -938,6 +938,19 @@ public class MainOnline {
                 //model.setObjective(false, maxFlowTime);
                 objectives[1] = maxFlowTime;
                 objectives[0] = sumFlowTime;
+
+                // Objective 2: the flow time of ONE specific job -- by convention, whichever job
+                // in this batch has the HIGHEST job_id. Every experiment driving this from Python
+                // gives the brand-new job an id far above any existing job's (see
+                // xp_online_warmstart_test.py's NEW_JOB_ID_BASE), so after modelCSP.py's own
+                // sort-by-job_id this is always that new job -- letting Online be told to
+                // optimize purely for the new arrival's own flow time, instead of the whole
+                // batch's sum/max.
+                int newJobIdx = 0;
+                for (int i = 1; i < nb_data; i++) {
+                    if (jobs.get(i).job_id > jobs.get(newJobIdx).job_id) newJobIdx = i;
+                }
+                objectives[2] = all_flow_time[newJobIdx];
             }
 
             //----- SOLVER -----
@@ -1017,12 +1030,27 @@ public class MainOnline {
             }
             System.out.println("Solver time limit: " + timeLimitSeconds + "s");
             solver.limitTime(timeLimitSeconds + "s");
-            
+
+            // Which objectives[] entry to actually optimize: 0=sum flow time (all jobs), 1=max
+            // flow time (all jobs, the long-standing default), 2=the new job's own flow time
+            // alone (see objectives[2] above). Runtime-selectable so every OTHER experiment that
+            // never writes this file keeps today's exact behavior (default: 1).
+            int objectiveChoice = 1;
+            try {
+                String objectiveChoiceText = readFile(MODEL_INPUTS_DIR + "/objective_choice.txt").trim();
+                if (!objectiveChoiceText.isEmpty()) objectiveChoice = Integer.parseInt(objectiveChoiceText);
+            } catch (Exception e) {
+                // File missing/unreadable: keep the default (1 = max flow time, all jobs).
+            }
+            System.out.println("Objective choice: " + objectiveChoice
+                    + " (0=sum all, 1=max all, 2=new job's own flow time)");
+
             boolean[] found = {false};
             solver.onSolution(() -> {
 
                     System.out.println("### DIAG solution found: sumFlowTime=" + objectives[0].getValue()
-                            + " maxFlowTime=" + objectives[1].getValue() + " nb_data=" + nb_data);
+                            + " maxFlowTime=" + objectives[1].getValue()
+                            + " newJobFlowTime=" + objectives[2].getValue() + " nb_data=" + nb_data);
                     found[0] = true;
 
                     transfersList.clear();
@@ -1093,7 +1121,7 @@ public class MainOnline {
                         j, starting_times[j], nodeStartingTimes[j], currentSimTime + nodeStartingTimes[j]);
             }
 
-            solver.findOptimalSolution(objectives[1], false);
+            solver.findOptimalSolution(objectives[objectiveChoice], false);
             if (!found[0]) {
                 System.out.println("No solution found");
             }

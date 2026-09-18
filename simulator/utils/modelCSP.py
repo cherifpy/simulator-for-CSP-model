@@ -336,6 +336,20 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     with open(os.path.join(MODEL_DIR, "inputs", "solver_time_limit.txt"), "w") as f:
         f.write(str(int(solver_time_limit_s)))
 
+    # Optional: which objectives[] entry MainOnline/MainOnlineWarmStart should actually optimize
+    # (0=sum flow time, 1=max flow time, 2=one specific job's own flow time -- see those files'
+    # own comments). Only written when a caller explicitly opts in via master_node.objective_choice
+    # (e.g. xp_online_warmstart_test.py); absent otherwise, so every existing caller keeps its
+    # current default untouched (MainOnline.java: 1: MainOnlineWarmStart.java: 0).
+    objective_choice = getattr(master_node, 'objective_choice', None)
+    objective_choice_path = os.path.join(MODEL_DIR, "inputs", "objective_choice.txt")
+    if objective_choice is not None:
+        with open(objective_choice_path, "w") as f:
+            f.write(str(int(objective_choice)))
+    else:
+        with open(objective_choice_path, "w") as f:
+            f.write("")
+
     # Java only ever works in a LOCAL frame (0 = "now" for this solve) -- it has no idea what
     # the simulator's absolute clock reads. Pass it along purely so debug prints can show
     # absolute times directly comparable to the final solution's "start:"/"end:" values.
