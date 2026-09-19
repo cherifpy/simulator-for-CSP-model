@@ -81,6 +81,11 @@ def parse_args():
     parser.add_argument("--large-range", type=int, nargs=2, metavar=("LOW", "HIGH"), default=(51200, 102400),
                          help="Large tier dataset_size range in MB, inclusive (default: 51200 102400, i.e. "
                               "50-100GB -- see the infeasibility note above).")
+    parser.add_argument("--tiers", nargs="+", choices=["small", "medium", "large"],
+                         default=["small", "medium", "large"],
+                         help="Which tier(s) to actually run (default: all three). E.g. "
+                              "--tiers medium to test only the medium size range, skipping the "
+                              "small/large solves entirely.")
     parser.add_argument("--repeats", type=int, default=5,
                          help="Number of trials per tier, each drawing a fresh dataset_size uniformly "
                               "from that tier's range -- for heterogeneity within a tier instead of a "
@@ -472,11 +477,12 @@ def main():
     with open(args.config, "r", encoding="utf-8") as f:
         config = json.load(f)
 
-    tiers = [
+    all_tiers = [
         ("small", tuple(args.small_range)),
         ("medium", tuple(args.medium_range)),
         ("large", tuple(args.large_range)),
     ]
+    tiers = [(name, rng) for name, rng in all_tiers if name in args.tiers]
 
     all_results = [run_tier(config, args, results_dir, tier_name, size_range, i)
                    for i, (tier_name, size_range) in enumerate(tiers)]

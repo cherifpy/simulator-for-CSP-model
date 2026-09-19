@@ -528,12 +528,22 @@ public class MainOnlineWarmStart {
             double maxStartingTime = 0;
             for (double s : starting_times) if (s > maxStartingTime) maxStartingTime = s;
 
-            makespanLong += 0;
+            // maxStartingTime was computed above but never folded in here (silently added as 0) --
+            // with enough existing/queued work, a node's own starting_times[j] can already exceed
+            // whatever this bound would otherwise be, so every "start_transfer_d..._n..." IntVar
+            // built as [starting_times[j], makespan] below ends up with lower > upper -- a Choco
+            // SolverException, not a graceful infeasible-result return. Folding it in first
+            // guarantees makespan is always at least as large as the latest node/job starting
+            // point before the data/compute-volume margin is added on top.
+            makespanLong += (long) Math.ceil(maxStartingTime) + 1;
             makespanLong += totalWork * CPU_UNIT * Math.max(1, maxCpu);
             makespanLong *= 2;
 
-
-            int makespan = 10_000; //(int) Math.min(makespanLong, Integer.MAX_VALUE);
+            // Was hardcoded to a fixed 10_000s horizon -- fine for light workloads, but silently
+            // wrong (not just suboptimal: an outright SolverException, since node/job starting
+            // times can then exceed this fixed ceiling) once enough existing jobs/data volume
+            // push the real horizon past it. Use the dynamically-computed bound instead.
+            int makespan = (int) Math.min(makespanLong, Integer.MAX_VALUE);
 
             // Optional hard node filter: when present, a node NOT listed is completely excluded
             // from this solve's candidates -- no notion of "will be free in X time units", just

@@ -245,6 +245,19 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     """
     import json
 
+    # All exchange files (utils/model/inputs/*, outputs/*) and the compiled .class output
+    # (utils/model/bin) live at fixed paths under SIMULATOR_DIR by default -- fine for one
+    # solve at a time, but TWO solves running concurrently on the SAME machine (e.g. two
+    # separate n_existing scenarios launched in parallel) clobber each other's inputs mid-solve
+    # and read back garbage or crash outright. Setting SIMULATOR_RUN_CWD in the environment
+    # (e.g. from a launcher script that gave each concurrent run its own private copy of
+    # utils/model/{inputs,outputs,bin}, with lib/src symlinked back to the canonical copy since
+    # those are read-only) redirects both Python's own reads/writes AND Java's (which resolves
+    # its paths from its own cwd, i.e. this same directory) to that private location instead.
+    # Unset (the default): behavior is byte-identical to before this existed.
+    run_cwd = os.environ.get("SIMULATOR_RUN_CWD", SIMULATOR_DIR)
+    model_dir = os.path.join(run_cwd, "utils", "model") if run_cwd != SIMULATOR_DIR else MODEL_DIR
+
     matrix = []
     jobs = sorted(jobs, key=lambda x: x.job_id)
     print(f"\n### schedulingUsingJavaCSP: {len(jobs)} job(s) to (re)schedule ###")
@@ -274,7 +287,7 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
                 resident_nodes.append(node_id)
         matrix.append(resident_nodes)
     print("matrix:", matrix)
-    with open(os.path.join(MODEL_DIR, "inputs", "replicas_locations.json"), "w") as f:
+    with open(os.path.join(model_dir, "inputs", "replicas_locations.json"), "w") as f:
         json.dump(matrix, f)
 
     # Optional hard node filter: only written when the caller opts in (restrict_to_free_nodes),
@@ -288,7 +301,7 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     # on one node can occupy it, as far as this filter is concerned, for the job's entire
     # remaining lifetime, so the pool of "free" nodes could shrink toward zero and never recover
     # under sustained load, starving whichever job is waiting.
-    free_nodes_path = os.path.join(MODEL_DIR, "inputs", "free_nodes.txt")
+    free_nodes_path = os.path.join(model_dir, "inputs", "free_nodes.txt")
     if getattr(master_node, 'restrict_to_free_nodes', False):
         free_node_ids = []
         for node_id in range(len(master_node.compute_nodes)):
@@ -328,12 +341,12 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     jobs_data = sorted(jobs_data, key=lambda x: x['job_id'])
     
 
-    pd.DataFrame(jobs_data).to_json(os.path.join(MODEL_DIR, "inputs", "jobs.json"), orient="records", indent=4)
+    pd.DataFrame(jobs_data).to_json(os.path.join(model_dir, "inputs", "jobs.json"), orient="records", indent=4)
 
     # Per-scheduler-class solver time budget (e.g. Online vs Incremental can be compared at
     # different budgets); Main.java falls back to 120s if this file is missing/unreadable.
     solver_time_limit_s = master_node._config.get('solver_time_limit_s', 120)
-    with open(os.path.join(MODEL_DIR, "inputs", "solver_time_limit.txt"), "w") as f:
+    with open(os.path.join(model_dir, "inputs", "solver_time_limit.txt"), "w") as f:
         f.write(str(int(solver_time_limit_s)))
 
     # Optional: which objectives[] entry MainOnline/MainOnlineWarmStart should actually optimize
@@ -342,7 +355,7 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     # (e.g. xp_online_warmstart_test.py); absent otherwise, so every existing caller keeps its
     # current default untouched (MainOnline.java: 1: MainOnlineWarmStart.java: 0).
     objective_choice = getattr(master_node, 'objective_choice', None)
-    objective_choice_path = os.path.join(MODEL_DIR, "inputs", "objective_choice.txt")
+    objective_choice_path = os.path.join(model_dir, "inputs", "objective_choice.txt")
     if objective_choice is not None:
         with open(objective_choice_path, "w") as f:
             f.write(str(int(objective_choice)))
@@ -353,7 +366,7 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     # Java only ever works in a LOCAL frame (0 = "now" for this solve) -- it has no idea what
     # the simulator's absolute clock reads. Pass it along purely so debug prints can show
     # absolute times directly comparable to the final solution's "start:"/"end:" values.
-    with open(os.path.join(MODEL_DIR, "inputs", "current_sim_time.txt"), "w") as f:
+    with open(os.path.join(model_dir, "inputs", "current_sim_time.txt"), "w") as f:
         f.write(str(master_node.env.now))
 
     # Ghost storage: jobs NOT part of this solve's batch (e.g. a job that already had every
@@ -375,7 +388,7 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
                     deletion_time = max(0, int(pending_time - master_node.env.now))
                     break
             ghost_lines.append(f"{node_id},{int(size)},{deletion_time}")
-    with open(os.path.join(MODEL_DIR, "inputs", "ghost_storage.txt"), "w") as f:
+    with open(os.path.join(model_dir, "inputs", "ghost_storage.txt"), "w") as f:
         f.write("\n".join(ghost_lines))
 
     nodes_list = []
@@ -389,7 +402,7 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
             # JSON/Java have no "infinity": cap at a value the CSP treats as effectively unlimited.
             "storage_capacity": int(storage_capacity) if storage_capacity != float('inf') else 2**30
         })
-    pd.DataFrame(nodes_list).to_json(os.path.join(MODEL_DIR, "inputs", "nodes.json"), orient="records", indent=4)
+    pd.DataFrame(nodes_list).to_json(os.path.join(model_dir, "inputs", "nodes.json"), orient="records", indent=4)
 
     import subprocess
 
@@ -407,21 +420,22 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
         [
             "javac",
             "-cp",
-            os.path.join(MODEL_DIR, "lib", "*"),
+            os.path.join(model_dir, "lib", "*"),
             "-d",
-            os.path.join(MODEL_DIR, "bin"),
-            os.path.join(MODEL_DIR, "src", "main", f"{java_main_class}.java")
+            os.path.join(model_dir, "bin"),
+            os.path.join(model_dir, "src", "main", f"{java_main_class}.java")
         ],
         capture_output=True,
         text=True,
         # The Java side resolves its input/output file paths relative to its own working
         # directory (System.getProperty("user.dir")), on the assumption that it's launched
-        # with SIMULATOR_DIR as cwd. That's only true by accident when a human runs `cd
-        # simulator && python3 ...` -- e.g. under `oarsub "python3 ~/.../launcher.py ..."` the
-        # process inherits oarsub's own cwd (the submitter's home dir) instead, and Java then
-        # looks for jobs.json etc. under the wrong directory entirely. Pin it explicitly so it
-        # doesn't depend on how/where the caller happened to be when this got invoked.
-        cwd=SIMULATOR_DIR,
+        # with run_cwd (SIMULATOR_DIR unless SIMULATOR_RUN_CWD overrides it) as cwd. That's
+        # only true by accident when a human runs `cd simulator && python3 ...` -- e.g. under
+        # `oarsub "python3 ~/.../launcher.py ..."` the process inherits oarsub's own cwd (the
+        # submitter's home dir) instead, and Java then looks for jobs.json etc. under the wrong
+        # directory entirely. Pin it explicitly so it doesn't depend on how/where the caller
+        # happened to be when this got invoked.
+        cwd=run_cwd,
     )
     print("Compilation Error")
     print(str(result.stderr))
@@ -443,12 +457,12 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
             "-XX:+UnlockExperimentalVMOptions",
             "-XX:-UseJVMCICompiler",
             "-cp",
-            os.path.join(MODEL_DIR, "bin") + ":" + os.path.join(MODEL_DIR, "lib", "*"),
+            os.path.join(model_dir, "bin") + ":" + os.path.join(model_dir, "lib", "*"),
             f"main.{java_main_class}"
         ],
         capture_output=True,
         text=True,
-        cwd=SIMULATOR_DIR,  # see the javac call above -- Java resolves paths relative to this.
+        cwd=run_cwd,  # see the javac call above -- Java resolves paths relative to this.
     )
 
     print("results")
@@ -469,7 +483,7 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     transfers = {}
     works = {}
 
-    model_output_path = os.path.join(MODEL_DIR, "outputs")
+    model_output_path = os.path.join(model_dir, "outputs")
 
     #df_transfers = pd.read_csv(f"{model_output_path}/transfers.csv")
     #df_works = pd.read_csv(f"{model_output_path}/works.csv")

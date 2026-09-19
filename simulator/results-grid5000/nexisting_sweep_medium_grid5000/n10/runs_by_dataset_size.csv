@@ -1,0 +1,3 @@
+tier,repeat,dataset_size,approach,n_jobs_isolated,wait_time_new_job,flow_time_new_job,mean_flow_time_all,max_flow_time_all,mean_flow_time_isolated,max_flow_time_isolated,transfer_energy_total
+medium,0,29565,online,11,1681.0,2826.0,2479.319417492982,2833.2426545520216,2479.319417492982,2833.2426545520216,7988.580326258808
+medium,0,29565,incremental,11,42.0,321.0000000000001,3081.8597143155434,6144.298680960749,3081.8597143155434,6144.298680960749,201.95708890859694

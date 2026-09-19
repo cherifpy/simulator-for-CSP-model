@@ -2,5 +2,8 @@ env/*
 simulator/utils/CSPModel/lib/*
 simulator/workloads/*
 simulator/results*
+simulator/.run_cwd/*
 simulator-for-CSP-model/*
-sim.zup
+./sim.zip
+OAR*
+./env.zip
