@@ -400,9 +400,30 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
             "compute_capacity": node.compute_capacity,
             "free_time": nodes_free_time[node_id],
             # JSON/Java have no "infinity": cap at a value the CSP treats as effectively unlimited.
-            "storage_capacity": int(storage_capacity) if storage_capacity != float('inf') else 2**30
+            "storage_capacity": int(storage_capacity) if storage_capacity != float('inf') else 2**30,
+            # Only consumed by MainOnlineMultiObj.java (energy as a genuine second objective,
+            # not just a post-hoc Python-side computation) -- harmless additive field for every
+            # other Java entry point, which never reads it.
+            "energy_consumption": getattr(node, 'energy_consumption', 0.0),
         })
     pd.DataFrame(nodes_list).to_json(os.path.join(model_dir, "inputs", "nodes.json"), orient="records", indent=4)
+
+    # Only consumed by MainOnlineMultiObj.java, to price each candidate transfer's energy
+    # exactly the way Tracker.log_transfer / compute_transfer_energy already do on the Python
+    # side. Written unconditionally (cheap) so it's always in sync with config.json; every other
+    # Java entry point never reads this file.
+    with open(os.path.join(model_dir, "inputs", "energy_config.txt"), "w") as f:
+        f.write(f"{master_node._config.get('master_energy_consumption', 0.0)}\n")
+        f.write(f"{master_node._config.get('network_energy_per_transfer', 0.0)}\n")
+
+    # Optional: opt into MainOnlineMultiObj.java's Pareto-front search over {max flow time,
+    # energy} instead of a single-objective findOptimalSolution. Only written when a caller
+    # explicitly opts in via master_node.multi_objective (mirrors objective_choice's pattern);
+    # absent otherwise, so every existing caller is unaffected.
+    multi_objective = getattr(master_node, 'multi_objective', None)
+    multi_objective_path = os.path.join(model_dir, "inputs", "multi_objective.txt")
+    with open(multi_objective_path, "w") as f:
+        f.write("1" if multi_objective else "")
 
     import subprocess
 
