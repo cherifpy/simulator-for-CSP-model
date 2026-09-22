@@ -24,6 +24,7 @@ from utils.parser import ArgumentParser
 
 
 from utils.plots import plot_line, plot_gantt_chart
+from utils.run_export import start_recording
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,7 @@ def main():
         logger.info("Simulation begins with config: %s" ,str(config))
 
         nodes_config = generateHeterogeneousInfrastructureEquilibre(config, path=f"{instance_dir}/infrastructure.csv")
+        start_recording(results_destination, params={"nb_jobs": nb_jobs, "nb_nodes": nb_nodes, "instance_dir": instance_dir}, config=config, nodes_config=nodes_config)
 
         random.seed(42)
         results, nodes_config_ = simulatorForOptimalPerfsUsingCSPOnline(config=config, jobs=[], overlap=True, poisson=True, varying_load=False,nodes_config=nodes_config)

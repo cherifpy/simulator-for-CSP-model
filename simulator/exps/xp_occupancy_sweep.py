@@ -51,6 +51,7 @@ from classes.job import Job
 from compute_node import ComputeNode
 from master_node_with_heterogeneous_nodes_csp import SchedulingUsingCSPOnline, SchedulingUsingCSPIncremental
 from utils.modelCSP import schedulingUsingJavaCSP
+from utils.run_export import start_recording
 from utils.plots import plot_gantt_chart
 from simulator import generateHeterogeneousInfrastructureEquilibre, configure_logging
 
@@ -438,6 +439,8 @@ def main():
     results_dir = args.results_dir or os.path.join(
         SIMULATOR_DIR, "results-grid5000", f"occupancy_sweep_{args.nb_nodes}n_{date.today().isoformat()}")
     os.makedirs(results_dir, exist_ok=True)
+
+    start_recording(results_dir, params=args, config=config)
 
     all_results = {}
     for fraction in args.occupancy_fractions:

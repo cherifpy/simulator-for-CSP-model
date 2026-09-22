@@ -41,15 +41,22 @@ from simulator import (
 )
 from master_node_with_heterogeneous_nodes_csp import (
     SchedulingUsingCSPOnline,
+    SchedulingUsingCSPOnlineMultiObj,
     SchedulingUsingCSPIncremental,
     SchedulingUsingCSPIncrementalFreeNodesOnly,
 )
 from utils.plots import plot_gantt_chart
+from utils.run_export import start_recording
 
 logger = logging.getLogger(__name__)
 
 APPROACHES = {
     "online": SchedulingUsingCSPOnline,
+    # Bi-objective Online: same full-replan approach, but each replan solves the epsilon-
+    # constraint problem (phase 1: max flow time, phase 2: minimize transfer energy within
+    # epsilon_fraction of phase 1's result) via MainOnlineMultiObj.java. See
+    # SchedulingUsingCSPOnlineMultiObj in master_node_with_heterogeneous_nodes_csp.py.
+    "online_biobj": SchedulingUsingCSPOnlineMultiObj,
     "incremental": SchedulingUsingCSPIncremental,
     # Hard filter: a node is only a candidate if nothing is ongoing on it right now (queued
     # backlog doesn't disqualify it -- nodes_free_time already accounts for that). Known to be
@@ -79,11 +86,24 @@ def parse_args():
                               "<simulator>/results-grid5000/<approach>_<nb_jobs>j-<nb_nodes>n_<solver_time_limit>s_<date>.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42).")
     parser.add_argument("--skip-gantt", action="store_true", help="Skip generating the gantt chart PNG.")
+    parser.add_argument("--epsilon-fraction", type=float, default=0.1,
+                         help="online_biobj only: max flow time slack allowed in phase 2, as a "
+                              "fraction of phase 1's result (default: 0.1 = 10%%).")
+    parser.add_argument("--epsilon-phase1-fraction", type=float, default=0.5,
+                         help="online_biobj only: fraction of --solver-time-limit given to phase "
+                              "1 (max flow time); the rest goes to phase 2 (energy) (default: 0.5).")
+    parser.add_argument("--epsilon-max-cap", type=float, default=None,
+                         help="online_biobj only: absolute ceiling on the max-flow-time cap phase "
+                              "2 is allowed to accept, regardless of epsilon_fraction (default: none).")
     return parser.parse_args()
 
 
 def run(args):
     master_class = APPROACHES[args.approach]
+    if args.approach == "online_biobj":
+        master_class.epsilon_fraction = args.epsilon_fraction
+        master_class.epsilon_phase1_fraction = args.epsilon_phase1_fraction
+        master_class.epsilon_max_cap = args.epsilon_max_cap
 
     with open(args.config, "r", encoding="utf-8") as f:
         config = json.load(f)
@@ -107,6 +127,20 @@ def run(args):
     random.seed(args.seed)
     nodes_config = generateHeterogeneousInfrastructureEquilibre(
         config, path=os.path.join(args.instance_dir, "infrastructure.csv"))
+
+    # Everything a later analysis could need is saved with the run itself (see utils/run_export.py):
+    # parameters, infrastructure, the solver's complete console output, and -- for EVERY replan -- its
+    # decisions, log and raw Java input/output files under solver_archive/, next to the usual
+    # infos_on_* csv files and events_history.json below.
+    start_recording(
+        results_dir,
+        params={**vars(args), "master_class": master_class.__name__,
+                "java_main_class": getattr(master_class, "java_main_class", None),
+                "multi_objective": getattr(master_class, "multi_objective", None),
+                "epsilon_fraction": getattr(master_class, "epsilon_fraction", None),
+                "epsilon_phase1_fraction": getattr(master_class, "epsilon_phase1_fraction", None),
+                "epsilon_max_cap": getattr(master_class, "epsilon_max_cap", None)},
+        config=config, nodes_config=nodes_config)
 
     random.seed(args.seed)
     results, _ = simulatorForOptimalPerfsUsingCSPOnline(

@@ -1100,13 +1100,44 @@ public class MainOnlineMultiObj {
                     + " (0=sum all, 1=max all, 2=new job's own flow time)");
 
             boolean[] found = {false};
+            // Captured INSIDE onSolution (where every variable is guaranteed instantiated, since
+            // a solution was just accepted) rather than read from objectives[1] AFTER
+            // findOptimalSolution returns -- when the time limit cuts the search off mid-branch
+            // (not via exhaustive proof of optimality), the model's live variable state reflects
+            // wherever the search currently is, NOT necessarily the last accepted solution, and
+            // can be a not-yet-fully-instantiated intermediate node. Reading objectives[1]
+            // .getValue() directly in that case throws IllegalStateException (seen in practice
+            // on some -- not all -- runs, since it depends on the exact search state when the
+            // clock runs out). epsilon-constraint mode (below) needs phase 1's best value to set
+            // up phase 2's cap, so it must use this holder, not objectives[1] directly.
+            int[] lastMaxFlow = {-1};
+            int[] lastEnergy = {-1};
+            // Set right before phase 2 starts (epsilon-constraint mode only) so onSolution can
+            // report, on phase 2's very FIRST accepted solution, whether the warm start actually
+            // took (i.e. that first solution's maxFlowTime should equal phase 1's own, since the
+            // search is expected to re-derive phase 1's exact assignment before improving energy
+            // any further -- see the warm-start comment where phase 2 is set up below).
+            boolean[] inPhase2 = {false};
+            boolean[] phase2FirstSolutionSeen = {false};
+            int[] phase1FinalMaxFlow = {-1};
             solver.onSolution(() -> {
 
                     System.out.println("### DIAG solution found: sumFlowTime=" + objectives[0].getValue()
                             + " maxFlowTime=" + objectives[1].getValue()
                             + " newJobFlowTime=" + objectives[2].getValue()
-                            + " energy=" + objectives[3].getValue() + " nb_data=" + nb_data);
+                            + " energy=" + objectives[3].getValue() + " nb_data=" + nb_data + " t=" + solver.getTimeCount());
                     found[0] = true;
+                    lastMaxFlow[0] = objectives[1].getValue();
+                    if (inPhase2[0] && !phase2FirstSolutionSeen[0]) {
+                        phase2FirstSolutionSeen[0] = true;
+                        boolean warmStartHeld = lastMaxFlow[0] == phase1FinalMaxFlow[0];
+                        System.out.println("### EPSILON-CONSTRAINT: phase2's FIRST solution has "
+                                + "maxFlowTime=" + lastMaxFlow[0] + " (phase1's was " + phase1FinalMaxFlow[0]
+                                + ") -- warm start " + (warmStartHeld ? "HELD (search re-derived phase 1's "
+                                + "exact solution before improving energy)" : "DID NOT hold exactly (search "
+                                + "found a different, still cap-respecting point first instead)") + " ###");
+                    }
+                    lastEnergy[0] = objectives[3].getValue();
 
                     transfersList.clear();
                     worksList.clear();
@@ -1176,23 +1207,32 @@ public class MainOnlineMultiObj {
                         j, starting_times[j], nodeStartingTimes[j], currentSimTime + nodeStartingTimes[j]);
             }
 
-            // Multi-objective mode: search for the Pareto front over {max flow time, energy}
-            // instead of optimizing a single scalar objective. Opt-in via multi_objective.txt
-            // (absent/not "1" -> ordinary single-objective findOptimalSolution, unchanged).
-            // ParetoMaximizer only MAXIMIZES -- model.neg(...) views let it maximize the negated
-            // vars, which is equivalent to minimizing the originals, without adding real
-            // constraints or duplicating the actual objective IntVars.
-            boolean multiObjective = false;
+            // Multi-objective mode, read from multi_objective.txt: 0/absent = ordinary
+            // single-objective findOptimalSolution (unchanged); 1 = raw Pareto-front search over
+            // {max flow time, energy} via ParetoMaximizer -- empirically found to perform far
+            // WORSE than single-objective search within the same budget on real scenarios (the
+            // existing LNS/restart search strategy is tuned to aggressively descend ONE scalar
+            // objective, and doesn't explore a 2D dominance frontier well: on a 5-job real
+            // scenario it got stuck oscillating between 2 points, both much worse than
+            // single-objective's result, despite exploring 200k+ solutions in 600s); 2 =
+            // epsilon-constraint, a two-phase approach that reuses the SAME well-tuned
+            // single-objective search machinery for both phases instead: phase 1 minimizes max
+            // flow time as usual, phase 2 then minimizes energy subject to max flow time staying
+            // within an epsilon slack of phase 1's result -- see the mode==2 branch below.
+            int multiObjectiveMode = 0;
             try {
                 String multiObjectiveText = readFile(MODEL_INPUTS_DIR + "/multi_objective.txt").trim();
-                multiObjective = multiObjectiveText.equals("1");
+                if (!multiObjectiveText.isEmpty()) multiObjectiveMode = Integer.parseInt(multiObjectiveText);
             } catch (Exception e) {
-                // File missing/unreadable: keep the default (single-objective search).
+                // File missing/unreadable: keep the default (0 = single-objective search).
             }
 
-            if (multiObjective) {
+            if (multiObjectiveMode == 1) {
                 System.out.println("### Multi-objective mode: searching for the Pareto front over "
                         + "{max flow time, energy} ###");
+                // ParetoMaximizer only MAXIMIZES -- model.neg(...) views let it maximize the
+                // negated vars, equivalent to minimizing the originals, without adding real
+                // constraints or duplicating the actual objective IntVars.
                 ParetoMaximizer pareto = new ParetoMaximizer(new IntVar[]{model.neg(objectives[1]), model.neg(objectives[3])});
                 model.post(new Constraint("PARETO_MAXFLOW_ENERGY", pareto));
                 // Posting it as a constraint only wires its PROPAGATION (pruning dominated
@@ -1209,6 +1249,116 @@ public class MainOnlineMultiObj {
                 for (Solution sol : paretoFront) {
                     System.out.println("  maxFlowTime=" + sol.getIntVal(objectives[1])
                             + "  energy=" + sol.getIntVal(objectives[3]));
+                }
+            } else if (multiObjectiveMode == 2) {
+                // epsilon_fraction: how much worse than phase 1's own best max-flow-time result
+                // phase 2 is allowed to make it, as a FRACTION of that result (not an absolute
+                // value -- flow times vary wildly in magnitude across scenarios). Default 10%.
+                double epsilonFraction = 0.1;
+                try {
+                    String t = readFile(MODEL_INPUTS_DIR + "/epsilon_fraction.txt").trim();
+                    if (!t.isEmpty()) epsilonFraction = Double.parseDouble(t);
+                } catch (Exception e) { /* default 0.1 */ }
+                // How the total solver_time_limit.txt budget splits between the two phases.
+                // Default even split; phase 1 usually doesn't need as long as phase 2 in
+                // practice (it's a strictly easier, already well-tuned single-objective search),
+                // but an even split is a safe, simple default.
+                double phase1Fraction = 0.5;
+                try {
+                    String t = readFile(MODEL_INPUTS_DIR + "/epsilon_phase1_fraction.txt").trim();
+                    if (!t.isEmpty()) phase1Fraction = Double.parseDouble(t);
+                } catch (Exception e) { /* default 0.5 */ }
+                // Optional absolute ceiling on phase 2's cap -- e.g. a baseline (Incremental's)
+                // own max flow time result from a prior run, so this approach never needs to
+                // accept worse flow time than that trivial baseline already gets for free just
+                // because epsilonFraction's relative slack happened to push past it (which
+                // otherwise silently gets more likely the less phase 1's own budget lets it
+                // converge -- see the large-tier run where a 1h/1h split let the relative cap
+                // drift to +18.5% over Online's own 2h result). Absent -> no ceiling, unchanged
+                // behavior.
+                Double epsilonMaxCap = null;
+                try {
+                    String t = readFile(MODEL_INPUTS_DIR + "/epsilon_max_cap.txt").trim();
+                    if (!t.isEmpty()) epsilonMaxCap = Double.parseDouble(t);
+                } catch (Exception e) { /* default: no ceiling */ }
+
+                int phase1Seconds = Math.max(1, (int) Math.round(timeLimitSeconds * phase1Fraction));
+                int phase2Seconds = Math.max(1, timeLimitSeconds - phase1Seconds);
+                System.out.println("### EPSILON-CONSTRAINT mode: phase1 (minimize max flow time) budget="
+                        + phase1Seconds + "s, phase2 (minimize energy under flow-time cap) budget="
+                        + phase2Seconds + "s, epsilon fraction=" + epsilonFraction + " ###");
+
+                solver.limitTime(phase1Seconds + "s");
+                solver.findOptimalSolution(objectives[1], false);
+                if (!found[0]) {
+                    System.out.println("No solution found (phase 1)");
+                } else {
+                    // From the holder (captured inside onSolution, always fully instantiated
+                    // there), NOT objectives[1].getValue() directly -- if the time limit cut the
+                    // search off mid-branch rather than via an exhaustive optimality proof, the
+                    // model's LIVE variable state reflects wherever the search currently sits,
+                    // which is not necessarily the last accepted solution and can throw
+                    // IllegalStateException ("not instantiated") depending on the exact search
+                    // state when the clock ran out.
+                    int bestMaxFlow = lastMaxFlow[0];
+                    int epsilonAbs = Math.max(1, (int) Math.round(bestMaxFlow * epsilonFraction));
+                    int cap = bestMaxFlow + epsilonAbs;
+                    if (epsilonMaxCap != null) {
+                        // Never below bestMaxFlow itself: phase 1 already PROVED that value is
+                        // achievable, so a ceiling under it would make phase 2's own constraint
+                        // infeasible from the start. If the ceiling is that tight, phase 2 simply
+                        // gets zero slack (cap == bestMaxFlow) instead of crashing.
+                        int ceilingInt = (int) Math.round(epsilonMaxCap);
+                        int cappedCap = Math.max(bestMaxFlow, Math.min(cap, ceilingInt));
+                        if (cappedCap != cap) {
+                            System.out.println("### EPSILON-CONSTRAINT: relative cap " + cap
+                                    + " exceeds the absolute ceiling " + ceilingInt
+                                    + " -- clamping phase2's cap to " + cappedCap + " ###");
+                        }
+                        cap = cappedCap;
+                    }
+                    System.out.println("### EPSILON-CONSTRAINT: phase1 best maxFlowTime=" + bestMaxFlow
+                            + "  phase2 cap=maxFlowTime<=" + cap + " (epsilon=" + epsilonAbs + ") ###");
+
+                    // reset() clears the search tree, measures (getTimeCount() back to 0), and
+                    // every previously-set stop criterion (including phase 1's limitTime) --
+                    // WITHOUT undoing already-posted constraints or the model's own propagated
+                    // domains, so the newly-added cap constraint below stacks cleanly on top of
+                    // everything phase 1 already established, and phase 2's own limitTime call
+                    // counts fresh from this point rather than cumulatively from phase 1's.
+                    //
+                    // WARM START: phase 2 must not re-explore from scratch -- it should start
+                    // from phase 1's own solution, which trivially still satisfies the new cap
+                    // (cap = phase1's maxFlowTime + epsilon >= phase1's maxFlowTime). The search
+                    // strategy set up earlier in this method already branches via
+                    // IntDomainLast(solver.defaultSolution(), ...) -- Solver.defaultSolution()
+                    // is a Solution object Choco auto-attaches on first use and keeps updated on
+                    // EVERY accepted solution (safe to read even after a time-limit cutoff,
+                    // unlike a live IntVar's .getValue()), and reset() does NOT clear or detach
+                    // it (confirmed against Choco 5's own Solver.reset() source: it resets the
+                    // search tree/measures/stop criteria, never the attached solution recorder).
+                    // So by the time phase 2 starts branching, defaultSolution() already holds
+                    // phase 1's final assignment for every decision variable, and the SAME value
+                    // selector (unchanged -- setSearch() is only ever called once, before phase
+                    // 1) will try to reconstruct exactly that assignment first, before searching
+                    // for anything better. The onSolution callback above verifies this actually
+                    // happens (phase 2's first accepted solution's maxFlowTime is checked against
+                    // phase1FinalMaxFlow) rather than just assuming it from Choco's internals.
+                    phase1FinalMaxFlow[0] = bestMaxFlow;
+                    inPhase2[0] = true;
+                    solver.reset();
+                    model.arithm(objectives[1], "<=", cap).post();
+                    solver.limitTime(phase2Seconds + "s");
+                    found[0] = false; // phase 2's own outcome, tracked separately from phase 1's
+                    solver.findOptimalSolution(objectives[3], false);
+                    if (!found[0]) {
+                        System.out.println("### EPSILON-CONSTRAINT: no solution found in phase 2 -- "
+                                + "the exported schedule is whatever phase 1 last left in "
+                                + "transfersList/worksList (maxFlowTime=" + bestMaxFlow + ") ###");
+                    } else {
+                        System.out.println("### EPSILON-CONSTRAINT: phase2 best energy=" + lastEnergy[0]
+                                + "  (maxFlowTime=" + lastMaxFlow[0] + ") ###");
+                    }
                 }
             } else {
                 solver.findOptimalSolution(objectives[objectiveChoice], false);
@@ -1694,15 +1844,25 @@ public class MainOnlineMultiObj {
                         int ii = imaxs[i];
                         TIntArrayList values = mapping.get(ii);
                         if (i == data) {
-                            for (int k = 0; k < works[ii].length; k++) {
-                                if (jn[ii][k] != values.get(work)) {
-                                    jobNodes[ii][k].instantiateTo(jn[ii][k], this);
-                                    //jobStarts[ii][k].instantiateTo(sn[ii][k], this);
-                                }
-                            }
-                            work++;
-                            if (work == values.size()) {
+                            // Stale cursor guard (same failure getNeighbor2 already guards against):
+                            // if a ContradictionException was thrown by a later data's instantiateTo
+                            // in a previous call, the trailing `if (move)` never ran, leaving
+                            // work == values.size() -- values.get(work) then throws
+                            // ArrayIndexOutOfBoundsException. Treat it as "nothing left to fix for
+                            // this data" and move on. Never fires on a non-stale cursor.
+                            if (values == null || work >= values.size()) {
                                 move = true;
+                            } else {
+                                for (int k = 0; k < works[ii].length; k++) {
+                                    if (jn[ii][k] != values.get(work)) {
+                                        jobNodes[ii][k].instantiateTo(jn[ii][k], this);
+                                        //jobStarts[ii][k].instantiateTo(sn[ii][k], this);
+                                    }
+                                }
+                                work++;
+                                if (work == values.size()) {
+                                    move = true;
+                                }
                             }
                         } else {
                             for (int k = 0; k < works[ii].length; k++) {

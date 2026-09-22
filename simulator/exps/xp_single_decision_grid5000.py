@@ -44,6 +44,7 @@ from classes.job import Job
 from compute_node import ComputeNode
 from master_node_with_heterogeneous_nodes_csp import SchedulingUsingCSPOnline, SchedulingUsingCSPIncremental
 from utils.modelCSP import schedulingUsingJavaCSP
+from utils.run_export import start_recording
 from utils.plots import plot_gantt_chart
 from simulator import generateHeterogeneousInfrastructureEquilibre, configure_logging
 
@@ -646,6 +647,8 @@ def main():
 
     with open(args.config, "r", encoding="utf-8") as f:
         config = json.load(f)
+
+    start_recording(results_dir, params=args, config=config)
 
     master, new_job, isolated_ids, not_finished_jobs = build_state_a(config, args, results_dir)
     now = master.env.now

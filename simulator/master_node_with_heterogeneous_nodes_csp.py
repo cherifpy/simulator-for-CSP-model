@@ -472,6 +472,23 @@ class SchedulingUsingCSPOnline:
             )
 
 
+class SchedulingUsingCSPOnlineMultiObj(SchedulingUsingCSPOnline):
+    """
+    Same full-replan Online approach as SchedulingUsingCSPOnline, but each replan solves the
+    bi-objective epsilon-constraint problem via MainOnlineMultiObj.java instead of MainOnline.java:
+    phase 1 minimizes max flow time (identical objective to plain Online), phase 2 then minimizes
+    total transfer energy subject to max flow time staying within epsilon_fraction of phase 1's
+    result (optionally clamped by epsilon_max_cap). See utils/modelCSP.py's schedulingUsingJavaCSP
+    for how the class attributes below get forwarded to the Java model, and
+    utils/model/src/main/MainOnlineMultiObj.java for the 2-phase solve itself.
+    """
+    java_main_class = 'MainOnlineMultiObj'
+    multi_objective = 2  # epsilon-constraint (2-phase): phase 1 = max flow time, phase 2 = energy
+    epsilon_fraction = 0.1
+    epsilon_phase1_fraction = 0.5
+    epsilon_max_cap = None
+
+
 class SchedulingUsingCSPOnlineWarmStart(SchedulingUsingCSPOnline):
     """
     Hybrid experiment: same full-replan Online approach, but seeds the CSP's search with a

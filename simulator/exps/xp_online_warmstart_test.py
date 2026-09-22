@@ -48,6 +48,7 @@ from classes.job import Job
 from compute_node import ComputeNode
 from master_node_with_heterogeneous_nodes_csp import SchedulingUsingCSPOnline, SchedulingUsingCSPIncremental
 from utils.modelCSP import schedulingUsingJavaCSP, MODEL_DIR
+from utils.run_export import start_recording
 from utils.plots import plot_gantt_chart
 from simulator import generateHeterogeneousInfrastructureEquilibre, configure_logging
 # --state-a-mode solved reuses xp_single_decision_grid5000.py's own build_state_a() (ONE direct
@@ -626,6 +627,8 @@ def main():
     results_dir = args.results_dir or os.path.join(
         SIMULATOR_DIR, "results-grid5000", f"online_warmstart_test_{args.nb_nodes}n_{date.today().isoformat()}")
     os.makedirs(results_dir, exist_ok=True)
+
+    start_recording(results_dir, params=args, config=config)
 
     if args.state_a_mode == "solved":
         main_solved(args, config, results_dir)

@@ -1673,15 +1673,25 @@ public class MainOnlineWarmStart {
                         int ii = imaxs[i];
                         TIntArrayList values = mapping.get(ii);
                         if (i == data) {
-                            for (int k = 0; k < works[ii].length; k++) {
-                                if (jn[ii][k] != values.get(work)) {
-                                    jobNodes[ii][k].instantiateTo(jn[ii][k], this);
-                                    //jobStarts[ii][k].instantiateTo(sn[ii][k], this);
-                                }
-                            }
-                            work++;
-                            if (work == values.size()) {
+                            // Stale cursor guard (same failure getNeighbor2 already guards against):
+                            // if a ContradictionException was thrown by a later data's instantiateTo
+                            // in a previous call, the trailing `if (move)` never ran, leaving
+                            // work == values.size() -- values.get(work) then throws
+                            // ArrayIndexOutOfBoundsException. Treat it as "nothing left to fix for
+                            // this data" and move on. Never fires on a non-stale cursor.
+                            if (values == null || work >= values.size()) {
                                 move = true;
+                            } else {
+                                for (int k = 0; k < works[ii].length; k++) {
+                                    if (jn[ii][k] != values.get(work)) {
+                                        jobNodes[ii][k].instantiateTo(jn[ii][k], this);
+                                        //jobStarts[ii][k].instantiateTo(sn[ii][k], this);
+                                    }
+                                }
+                                work++;
+                                if (work == values.size()) {
+                                    move = true;
+                                }
                             }
                         } else {
                             for (int k = 0; k < works[ii].length; k++) {

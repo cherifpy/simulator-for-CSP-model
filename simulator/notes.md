@@ -55,3 +55,95 @@ ici jai change le nombre de job du stat A
 | 10 | incremental | 42.00    | 321.00   | 3081.86 | 6144.30  | 201.96   |
 | 20 | online      | 11338.00 | 12346.00 | 6714.21 | 12845.89 | (~13-14k)|
 | 20 | incremental | 41.00    | 537.00   | 8231.31 | 18436.19 | 303.46   |
+
+
+en variyant l'occupation de l'ijfra 
+| n_existing | Approche    | Wait    | Flow (new) | Mean (tous) | Max (tous) | Énergie |
+|---|---|---|---|---|---|---|
+| 5  | online      | 1357.00 | 1521.00 | 1436.44 | 1603.28  | 3946.50 |
+| 5  | incremental | 493.00  | 1593.00 | 1466.91 | 1649.04  | 667.00  |
+| 10 | online      | 1681.00 | 2826.00 | 2479.32 | 2833.24  | 7988.58 |
+| 10 | incremental | 42.00   | 321.00  | 3081.86 | 6144.30  | 201.96  |
+| 20 | online      | 4597.00 | 5815.00 | 5242.31 | 8834.46  | 9895.93 |
+| 20 | incremental | 41.00   | 537.00  | 8231.31 | 18436.19 | 303.46  |
+
+
+| Métrique | mono (max flow time seul) | multi (Pareto) |
+|---|---|---|
+| Max flow time | 390.00 | 3202.00 – 3436.00 |
+| Énergie | 525.77 | 444.00 – 530.04 |
+
+J'ai ensuite essaie de faire un multi objectif avec fention
+
+| Métrique | mono (max-flow seul) | epsilon-contrainte (10% marge) |
+|---|---|---|
+| Max flow time | 390.00 | 429.00 |
+| Énergie | 525.77 | 132.34 |
+
+## Exps 3
+En testant une nouvelle approach 
+| Palier | Taille | Métrique | online (2h) | incremental (1min) | epsilon (1h/1h) |
+|---|---|---|---|---|---|
+| small | 8126 | Flow time (new) | 1015.00 | 287.00 | 1010.00 |
+| small | 8126 | Mean flow time | 984.55 | 2091.04 | 981.46 |
+| small | 8126 | Max flow time | 1041.33 | 3479.76 | 1144.50 |
+| small | 8126 | Énergie | 2785.66 | 62.05 | 1388.46 |
+| medium | 36647 | Flow time (new) | 2309.00 | 1019.00 | 2087.00 |
+| medium | 36647 | Mean flow time | 2113.73 | 2505.50 | 2079.28 |
+| medium | 36647 | Max flow time | 2316.50 | 3284.30 | 2561.60 |
+| medium | 36647 | Énergie | 6262.04 | 173.79 | 3902.97 |
+| large | 94536 | Flow time (new) | 5247.00 | 4226.00 | 6353.00 |
+| large | 94536 | Mean flow time | 4345.46 | 4091.95 | 4692.92 |
+| large | 94536 | Max flow time | 5396.02 | 6053.76 | 6396.33 |
+| large | 94536 | Énergie | 8234.62 | 1998.56 | 4286.51 |
+
+j'ai refait pour large dataset 
+| Métrique | online (2h) | incremental (1min) | epsilon (2h/2h, capé) |
+|---|---|---|---|
+| Flow time (new job) | 5247.00 | 4226.00 | 5892.00 |
+| Mean flow time | 4345.46 | 4091.95 | 4112.28 |
+| Max flow time | 5396.02 | 6053.76 | 5941.67 |
+| Énergie | 8234.62 | 1998.56 | 6261.55 |
+
+
+J'ai besoinde variance donc j'ai re relance les exps
+Voici les deux commandes, une pour chaque script préparé :
+
+1. Sweep taille de dataset (pour la variance par job) — 3 jobs en parallèle (small/medium/large) :
+
+./simulator/submit_dataset_size_sweep_grid5000.sh
+2. Workload complet online vs online bi-objectif — 2 jobs en parallèle :
+
+./simulator/submit_online_vs_biobj_workload_grid5000.sh
+
+
+## Exps sur workload complet
+
+### le workload online 
+J4ai lancé sur grid 5000 nancy une exp pour verifier sur un workload complet 
+configu 
+- appoach: online
+- solving time: 30min /job
+- nb job & node: 20 / 50
+
+deja lancer sur 10 min ca a donner ca 
+┌───────────────────────────────────┬────────────┬────────────┬──────────┐
+│                run                │ flow moyen │ écart-type │ flow max │
+├───────────────────────────────────┼────────────┼────────────┼──────────┤
+│ Nancy online 10 min (nouveau)     │ 678        │ 266        │ 928      │
+├───────────────────────────────────┼────────────┼────────────┼──────────┤
+│ online_lambda100                  │ 693        │ 455        │ 1392     │
+├───────────────────────────────────┼────────────┼────────────┼──────────┤
+│ online_lambda100_warmstart_60s    │ 636        │ 460        │ 1517     │
+├───────────────────────────────────┼────────────┼────────────┼──────────┤
+│ incremental_lambda100             │ 490        │ 283        │ 993      │
+├───────────────────────────────────┼────────────┼────────────┼──────────┤
+│ online_lambda100_maxobj_fixed_30s │ 2171       │ 1997       │ 6107     │
+└───────────────────────────────────┴────────────┴────────────┴──────────┘
+
+
+### wokload online biobj 
+lancer sur grenoble 
+
+### Relance
+1- sur lille j'ai relancé sur la taille des données pour avoir des stats plus detaillé

@@ -240,6 +240,19 @@ def evaluateUtility(master_node, jobs,transfers:dict, works:dict):
 
 
 def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, nodes_free_time: list, scheduling_start_time=None):
+    """Single entry point to the Java CSP model. Behaves exactly like _schedulingUsingJavaCSP_impl
+    (below) unless a run recording is active (utils.run_export.start_recording sets
+    SOLVER_ARCHIVE_DIR), in which case every solve is also archived -- decisions, solver log, raw
+    Java input/output files -- so any statistic can be computed later without re-running."""
+    archive_dir = os.environ.get("SOLVER_ARCHIVE_DIR")
+    if not archive_dir:
+        return _schedulingUsingJavaCSP_impl(master_node, jobs, replicas_locations, nodes_free_time, scheduling_start_time)
+    from utils.run_export import archive_solve
+    return archive_solve(_schedulingUsingJavaCSP_impl, master_node, jobs, replicas_locations, nodes_free_time,
+                         scheduling_start_time, archive_dir)
+
+
+def _schedulingUsingJavaCSP_impl(master_node, jobs: list, replicas_locations: dict, nodes_free_time: list, scheduling_start_time=None):
     """
     Wrapper to call the Java CSP solver via command line.
     """
@@ -416,14 +429,33 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
         f.write(f"{master_node._config.get('master_energy_consumption', 0.0)}\n")
         f.write(f"{master_node._config.get('network_energy_per_transfer', 0.0)}\n")
 
-    # Optional: opt into MainOnlineMultiObj.java's Pareto-front search over {max flow time,
-    # energy} instead of a single-objective findOptimalSolution. Only written when a caller
-    # explicitly opts in via master_node.multi_objective (mirrors objective_choice's pattern);
-    # absent otherwise, so every existing caller is unaffected.
+    # Optional: opt into MainOnlineMultiObj.java's multi-objective modes instead of a plain
+    # single-objective findOptimalSolution. master_node.multi_objective: 1 (or True) = raw
+    # Pareto-front search over {max flow time, energy} (found to perform far worse than
+    # single-objective within the same budget on real scenarios -- kept for reference/further
+    # investigation, not recommended); 2 = epsilon-constraint (recommended): phase 1 minimizes
+    # max flow time via the SAME well-tuned single-objective search, phase 2 then minimizes
+    # energy subject to max flow time staying within master_node.epsilon_fraction (default 10%,
+    # see MainOnlineMultiObj.java) of phase 1's result. Absent/falsy -> ordinary single-objective
+    # search, every existing caller unaffected.
     multi_objective = getattr(master_node, 'multi_objective', None)
-    multi_objective_path = os.path.join(model_dir, "inputs", "multi_objective.txt")
-    with open(multi_objective_path, "w") as f:
-        f.write("1" if multi_objective else "")
+    with open(os.path.join(model_dir, "inputs", "multi_objective.txt"), "w") as f:
+        f.write(str(int(multi_objective)) if multi_objective else "")
+
+    epsilon_fraction = getattr(master_node, 'epsilon_fraction', None)
+    with open(os.path.join(model_dir, "inputs", "epsilon_fraction.txt"), "w") as f:
+        f.write(str(epsilon_fraction) if epsilon_fraction is not None else "")
+
+    epsilon_phase1_fraction = getattr(master_node, 'epsilon_phase1_fraction', None)
+    with open(os.path.join(model_dir, "inputs", "epsilon_phase1_fraction.txt"), "w") as f:
+        f.write(str(epsilon_phase1_fraction) if epsilon_phase1_fraction is not None else "")
+
+    # Optional absolute ceiling on phase 2's cap (e.g. a baseline approach's own max flow time
+    # from a prior run) -- never let epsilon_fraction's relative slack push phase 2 to accept
+    # worse flow time than that baseline already achieves for free. Absent -> no ceiling.
+    epsilon_max_cap = getattr(master_node, 'epsilon_max_cap', None)
+    with open(os.path.join(model_dir, "inputs", "epsilon_max_cap.txt"), "w") as f:
+        f.write(str(epsilon_max_cap) if epsilon_max_cap is not None else "")
 
     import subprocess
 

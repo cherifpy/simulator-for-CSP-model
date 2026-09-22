@@ -21,6 +21,7 @@ from utils.parser import ArgumentParser
 
 
 from utils.plots import plot_line, plot_gantt_chart
+from utils.run_export import start_recording
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,7 @@ def main():
     nodes_config_save.to_csv(f"{results_destination}/nodes_config.csv", index=False)
     
     random.seed(42)
+    start_recording(results_destination, params={"exp_name": exp_name, "total_nb_jobs": config["total_nb_jobs"]}, config=config, nodes_config=nodes_config)
     
     results, nodes_config_ = simulatorForOptimalPerfsUsingCSPOnline(config=config, jobs=[], overlap=True, poisson=True, varying_load=False,nodes_config=nodes_config)
     
