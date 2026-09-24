@@ -53,6 +53,7 @@ from utils.modelCSP import schedulingUsingJavaCSP
 from utils.run_export import (
     TASKS_FIELDS, TRANSFERS_FIELDS, DELETIONS_FIELDS, TRAJECTORY_FIELDS,
     run_captured, snapshot_solver_io, write_rows, plan_rows, parse_solver_log, start_recording,
+    solver_model_dir,
 )
 from simulator import generateHeterogeneousInfrastructureEquilibre, configure_logging
 
@@ -109,7 +110,7 @@ def parse_args():
                               "per tier. Defaults to --solver-time-limit if not given -- set this "
                               "separately when Online needs a much larger budget than Incremental "
                               "(e.g. --solver-time-limit 7200 --incremental-time-limit 60).")
-    parser.add_argument("--approaches", nargs="+", choices=["online", "incremental", "epsilon"],
+    parser.add_argument("--approaches", nargs="+", choices=["online", "online_warmstart", "incremental", "epsilon"],
                          default=["online", "incremental"],
                          help="Which approach(es) to actually run per tier (default: online + "
                               "incremental). Use --approaches epsilon alone to run ONLY the "
@@ -597,6 +598,146 @@ def run_online_style(master, new_job, isolated_ids, nb_nodes, now, replicas_loca
     }
 
 
+def build_warm_start_for_reconsideration(master, new_job, not_finished_jobs, nb_nodes, now, replicas_locations):
+    """Writes warm_start.json to seed Online's search with a solution AT LEAST heuristically as
+    good as "leave every not-finished job exactly where state A already had it, and place the new
+    job however Incremental would" -- see MainOnlineWarmStart.java's own warm-start reader for the
+    exact mechanism (IntDomainLast value-selector bias, not a hard incumbent -- see the comment on
+    run_online_warmstart_style below for why this is a heuristic nudge, not a proof).
+
+    job_index in the written JSON must match jobs_to_reschedule's own sort-by-job_id order (the
+    same order _schedulingUsingJavaCSP_impl exports jobs_data in). task_index must be the LOCAL
+    index within THIS solve's own NotStarted-only export (position i in
+    [t for t in job.tasks if t.status == "NotStarted"]), NOT the task's true/global task_id --
+    mixing these up silently applies a hint to the wrong task (mirrors the exact bug fixed in
+    modelCSP.py's toDict() task_id remapping; the same local/true distinction applies here, on the
+    way IN this time instead of on the way out)."""
+    jobs_to_reschedule = [new_job] + not_finished_jobs
+    sorted_jobs = sorted(jobs_to_reschedule, key=lambda j: j.job_id)
+    job_index = {j.job_id: idx for idx, j in enumerate(sorted_jobs)}
+
+    job_placements, transfers_ws = [], []
+
+    # (a) not-finished existing jobs: reuse state A's OWN committed placement for their remaining
+    # (NotStarted) tasks -- there is no "last replan" to fall back on in this frozen-state-A
+    # protocol (state A itself is the only prior decision), converted to the LOCAL (relative-to-T)
+    # time frame the solver expects.
+    for job in not_finished_jobs:
+        not_started_true_ids = [t.task_id for t in job.tasks if t.status == "NotStarted"]
+        local_index_of = {true_id: k for k, true_id in enumerate(not_started_true_ids)}
+        for entries in master._state_a_plan["works"].values():
+            for e_job_id, e_node, e_task_id, e_start, e_end, e_dur in entries:
+                if e_job_id == job.job_id and e_task_id in local_index_of:
+                    job_placements.append({
+                        "job_index": job_index[job.job_id], "task_index": local_index_of[e_task_id],
+                        "node": int(e_node), "start": int(round(e_start - now)),
+                    })
+        for entries in master._state_a_plan["transfers"].values():
+            for e_job_id, e_node, e_start, e_end, e_dur in entries:
+                if e_job_id == job.job_id:
+                    transfers_ws.append({
+                        "job_index": job_index[job.job_id], "node": int(e_node),
+                        "start": int(round(e_start - now)),
+                    })
+
+    # (b) the new job: ask Incremental, using the exact state this replan itself sees (same
+    # nodes_free_time/replicas_locations Online's own joint solve is about to use).
+    nodes_free_time = master.nodesFreeTime(master.ongoing_transfers, master.ongoing_works)
+    orig_java_main_class = master.java_main_class
+    try:
+        master.java_main_class = 'MainIncremental'
+        inc_transfers, inc_works, _ = schedulingUsingJavaCSP(master, [new_job], replicas_locations, nodes_free_time, now)
+    finally:
+        master.java_main_class = orig_java_main_class
+    for entries in (inc_works or {}).values():
+        for e_job_id, e_node, e_task_id, e_start, e_end, e_dur in entries:
+            if e_job_id == new_job.job_id:
+                # New job is exported fresh (no filtering, every task NotStarted) -- local index ==
+                # true index directly, no remapping needed.
+                job_placements.append({
+                    "job_index": job_index[new_job.job_id], "task_index": int(e_task_id),
+                    "node": int(e_node), "start": int(round(e_start - now)),
+                })
+    for entries in (inc_transfers or {}).values():
+        for e_job_id, e_node, e_start, e_end, e_dur in entries:
+            if e_job_id == new_job.job_id:
+                transfers_ws.append({
+                    "job_index": job_index[new_job.job_id], "node": int(e_node),
+                    "start": int(round(e_start - now)),
+                })
+
+    warm_start = {"job_placements": job_placements, "transfers": transfers_ws}
+    with open(os.path.join(solver_model_dir(), "inputs", "warm_start.json"), "w") as f:
+        json.dump(warm_start, f)
+
+
+def run_online_warmstart_style(master, new_job, isolated_ids, nb_nodes, now, replicas_locations, not_finished_jobs):
+    """Same joint reconsideration as run_online_style, but the search is seeded with a warm start
+    (see build_warm_start_for_reconsideration): Incremental's own decision for the new job, plus
+    state A's own committed placement for every not-finished job's remaining tasks -- i.e. "as if
+    nothing changed for existing jobs, and the new job landed wherever Incremental would put it".
+
+    IMPORTANT: this is a value-ordering HEURISTIC (Choco's IntDomainLast tries the warm-start value
+    first, falls back otherwise), not a hard incumbent -- propagation from jointly reconsidering
+    ALL not-finished jobs together (unlike Incremental's single-job solve) can still force some
+    values to deviate. There is NO mathematical guarantee this solve's result is >= Incremental's
+    own quality; it is only a strong empirical nudge (see MainOnlineWarmStart.java's own comment
+    and the docstring on build_warm_start_for_reconsideration). Compare this function's own result
+    against run_incremental_style's on the same batch to check whether the guarantee actually held
+    for a given scenario -- do not assume it."""
+    build_warm_start_for_reconsideration(master, new_job, not_finished_jobs, nb_nodes, now, replicas_locations)
+
+    jobs_to_reschedule = [new_job] + not_finished_jobs
+    nodes_free_time = master.nodesFreeTime(master.ongoing_transfers, master.ongoing_works)
+
+    master.java_main_class = 'MainOnlineWarmStart'
+    master.objective_choice = 1
+    transfers_, works_, deletions_ = schedulingUsingJavaCSP(master, jobs_to_reschedule, replicas_locations, nodes_free_time, now)
+
+    if not transfers_ or not works_:
+        return None
+
+    finish = {j.job_id: None for j in jobs_to_reschedule}
+    for key in [f'node_{i}' for i in range(nb_nodes)]:
+        for w in works_.get(key, []):
+            job_id, node_index, task_index, start_abs, end_abs, duration = w
+            if job_id in finish:
+                finish[job_id] = end_abs if finish[job_id] is None else max(finish[job_id], end_abs)
+
+    flow_by_job = {}
+    for j in master.jobs + [new_job]:
+        if j.job_id in finish and finish[j.job_id] is not None:
+            flow_by_job[j.job_id] = finish[j.job_id] - j.arriving_time
+        else:
+            cf = committed_finish_time(master, nb_nodes, j.job_id)
+            if cf is not None:
+                flow_by_job[j.job_id] = cf - j.arriving_time
+    flow_times = list(flow_by_job.values())
+    isolated_flow_times = [ft for jid, ft in flow_by_job.items() if jid in isolated_ids]
+
+    new_job_start = None
+    for key in [f'node_{i}' for i in range(nb_nodes)]:
+        for w in works_.get(key, []):
+            job_id, node_index, task_index, start_abs, end_abs, duration = w
+            if job_id == new_job.job_id:
+                new_job_start = start_abs if new_job_start is None else min(new_job_start, start_abs)
+    wait_time = (new_job_start - new_job.arriving_time) if new_job_start is not None else None
+
+    return {
+        "wait_time_new_job": wait_time,
+        "flow_time_new_job": (finish.get(new_job.job_id) - new_job.arriving_time) if finish.get(new_job.job_id) is not None else None,
+        "mean_flow_time_all": sum(flow_times) / len(flow_times) if flow_times else None,
+        "max_flow_time_all": max(flow_times) if flow_times else None,
+        "mean_flow_time_isolated": sum(isolated_flow_times) / len(isolated_flow_times) if isolated_flow_times else None,
+        "max_flow_time_isolated": max(isolated_flow_times) if isolated_flow_times else None,
+        "n_jobs_isolated": len(isolated_flow_times),
+        "jobs_to_reschedule": [j.job_id for j in jobs_to_reschedule],
+        "transfer_energy_total": compute_transfer_energy(transfers_, master),
+        "_plan": {"transfers": transfers_, "works": works_, "deletions": deletions_,
+                  "nodes_free_time": dict(nodes_free_time), "flow_by_job": flow_by_job},
+    }
+
+
 def run_incremental_style(master, new_job, isolated_ids, nb_nodes, now, replicas_locations, not_finished_jobs=None):
     """Mirrors SchedulingUsingCSPIncremental.schedulingNewJob(): place the new job alone; every
     existing job keeps whatever it was already committed to in state A, untouched. not_finished_jobs
@@ -768,6 +909,9 @@ def run_tier(config, args, results_dir, tier_name, size_range, tier_index):
         if "online" in args.approaches:
             solve("online", "ONLINE style", args.solver_time_limit,
                   lambda nj: run_online_style(master, nj, isolated_ids, args.nb_nodes, now, replicas_locations, not_finished_jobs))
+        if "online_warmstart" in args.approaches:
+            solve("online_warmstart", "ONLINE style (warm-started from Incremental + state A)", args.solver_time_limit,
+                  lambda nj: run_online_warmstart_style(master, nj, isolated_ids, args.nb_nodes, now, replicas_locations, not_finished_jobs))
         if "incremental" in args.approaches:
             solve("incremental", "INCREMENTAL style", args.incremental_time_limit,
                   lambda nj: run_incremental_style(master, nj, isolated_ids, args.nb_nodes, now, replicas_locations))
