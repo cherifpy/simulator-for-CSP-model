@@ -332,9 +332,20 @@ def _schedulingUsingJavaCSP_impl(master_node, jobs: list, replicas_locations: di
         with open(free_nodes_path, "w") as f:
             f.write("")
 
+    # Java only ever receives a job's NotStarted tasks, and numbers them 0..nb_tasks-1 in its own
+    # output (works.csv's task_index) -- a LOCAL renumbering with no relation to that task's TRUE
+    # index in job.tasks (e.g. a job with tasks 0-1 already Finished/Started and 2-5 NotStarted
+    # gets nb_tasks=4, and Java's task_index 0 means job.tasks[2], not job.tasks[0]). Recorded here,
+    # in the same NotStarted order Java receives them, so toDict() can translate its output back to
+    # the job's real task_id -- without this, a not-finished job's freshly-decided tasks can
+    # collide (by raw index) with its own already-committed Finished/Started tasks and silently
+    # evict them when a caller later merges the two (e.g. xp_dataset_size_sweep.py's merge_plans).
+    task_id_by_job = {}
     jobs_data = []
     for job in jobs:
-        if len([task.duration for task in job.tasks if task.status == "NotStarted"])> 0:
+        not_started_ids = [t.task_id for t in job.tasks if t.status == "NotStarted"]
+        if len(not_started_ids) > 0:
+            task_id_by_job[job.job_id] = not_started_ids
             jobs_data.append({
                 "job_id": job.job_id,
                 "dataset_size": job.dataset_size,
@@ -541,7 +552,10 @@ def _schedulingUsingJavaCSP_impl(master_node, jobs: list, replicas_locations: di
     #df_transfers = pd.read_csv(f"{model_output_path}/transfers.csv")
     #df_works = pd.read_csv(f"{model_output_path}/works.csv")
     job_ids = [job['job_id'] for job in jobs_data]
-    works = toDict(f"{model_output_path}/works.csv", job_list=job_ids, master_node=master_node )
+    # Parallel to job_ids: task_id_maps[job_index][local_task_index] -> that job's TRUE task_id
+    # (see the note where task_id_by_job is built above).
+    task_id_maps = [task_id_by_job[jid] for jid in job_ids]
+    works = toDict(f"{model_output_path}/works.csv", job_list=job_ids, master_node=master_node, task_id_maps=task_id_maps)
     transfers = toDict(f"{model_output_path}/transfers.csv", job_list=job_ids, master_node=master_node)
     deletions = loadDeletions(f"{model_output_path}/deletions.csv", job_list=job_ids, master_node=master_node)
 
@@ -557,7 +571,7 @@ def _schedulingUsingJavaCSP_impl(master_node, jobs: list, replicas_locations: di
     return transfers, works, deletions
 
 
-def toDict(path_to_csv, nb_nodes=None, job_list=None, time=None,master_node=None):
+def toDict(path_to_csv, nb_nodes=None, job_list=None, time=None, master_node=None, task_id_maps=None):
     import csv
     # Création du dictionnaire
     dict_info = {}
@@ -575,12 +589,17 @@ def toDict(path_to_csv, nb_nodes=None, job_list=None, time=None,master_node=None
             start_time = int(row["start_time"])
             end_time = int(row["end_time"])
             node_index = int(row["node_index"])
-            
+
             # On remplit la structure works_exec
             now = master_node.env.now
             if 'task_index' in row.keys():
-                dict_info[f"node_{node_index}"].append((job_list[job_index], node_index, task_index, now+start_time, now+end_time, end_time - start_time))
-                print(f"node_{node_index} - job {job_list[job_index]} - task {task_index} - start: {now+start_time} - end: {now+end_time}")
+                # task_index as Java returns it is LOCAL to the NotStarted-only subset it was
+                # given (see task_id_by_job in _schedulingUsingJavaCSP_impl) -- translate it back
+                # to the job's TRUE task_id, or every caller matching on (job_id, task_id) against
+                # this job's OTHER (already-committed) tasks silently collides with the wrong one.
+                true_task_index = task_id_maps[job_index][task_index] if task_id_maps is not None else task_index
+                dict_info[f"node_{node_index}"].append((job_list[job_index], node_index, true_task_index, now+start_time, now+end_time, end_time - start_time))
+                print(f"node_{node_index} - job {job_list[job_index]} - task {true_task_index} - start: {now+start_time} - end: {now+end_time}")
             else:
                 dict_info[f"node_{node_index}"].append((job_list[job_index], node_index, now+start_time, now+end_time, end_time - start_time))
                 print(f"node_{node_index} - transfer {job_list[job_index]} - start: {now+start_time} - end: {now+end_time}")

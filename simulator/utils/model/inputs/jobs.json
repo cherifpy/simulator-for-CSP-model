@@ -1,128 +1,88 @@
 [
     {
         "job_id":0,
-        "dataset_size":37302,
-        "nb_tasks":6,
+        "dataset_size":17377,
+        "nb_tasks":4,
         "task_duration":140,
-        "timelasped":325,
+        "timelasped":621,
         "job_arriving_time":0
     },
     {
         "job_id":1,
-        "dataset_size":43534,
+        "dataset_size":31056,
         "nb_tasks":9,
         "task_duration":70,
-        "timelasped":279,
+        "timelasped":619,
         "job_arriving_time":0
     },
     {
         "job_id":2,
-        "dataset_size":24117,
+        "dataset_size":18222,
         "nb_tasks":11,
         "task_duration":50,
-        "timelasped":242,
+        "timelasped":586,
         "job_arriving_time":0
     },
     {
         "job_id":3,
-        "dataset_size":45536,
+        "dataset_size":28293,
         "nb_tasks":13,
         "task_duration":50,
-        "timelasped":239,
+        "timelasped":561,
         "job_arriving_time":0
     },
     {
         "job_id":4,
-        "dataset_size":100990,
+        "dataset_size":26767,
         "nb_tasks":12,
         "task_duration":100,
-        "timelasped":219,
+        "timelasped":428,
         "job_arriving_time":0
     },
     {
         "job_id":5,
-        "dataset_size":31267,
+        "dataset_size":40736,
         "nb_tasks":15,
         "task_duration":180,
-        "timelasped":210,
+        "timelasped":315,
         "job_arriving_time":0
     },
     {
         "job_id":6,
-        "dataset_size":57199,
+        "dataset_size":26253,
         "nb_tasks":13,
         "task_duration":50,
-        "timelasped":177,
+        "timelasped":92,
         "job_arriving_time":0
     },
     {
         "job_id":7,
-        "dataset_size":61851,
-        "nb_tasks":19,
+        "dataset_size":20410,
+        "nb_tasks":20,
         "task_duration":120,
-        "timelasped":166,
+        "timelasped":83,
         "job_arriving_time":0
     },
     {
         "job_id":8,
-        "dataset_size":76528,
+        "dataset_size":18069,
         "nb_tasks":3,
         "task_duration":10,
-        "timelasped":118,
+        "timelasped":28,
         "job_arriving_time":0
     },
     {
         "job_id":9,
-        "dataset_size":99752,
+        "dataset_size":15396,
         "nb_tasks":10,
         "task_duration":50,
-        "timelasped":117,
+        "timelasped":25,
         "job_arriving_time":0
     },
     {
         "job_id":10,
-        "dataset_size":81273,
+        "dataset_size":36647,
         "nb_tasks":4,
-        "task_duration":140,
-        "timelasped":110,
-        "job_arriving_time":0
-    },
-    {
-        "job_id":11,
-        "dataset_size":51403,
-        "nb_tasks":15,
-        "task_duration":120,
-        "timelasped":73,
-        "job_arriving_time":0
-    },
-    {
-        "job_id":12,
-        "dataset_size":21042,
-        "nb_tasks":12,
-        "task_duration":120,
-        "timelasped":67,
-        "job_arriving_time":0
-    },
-    {
-        "job_id":13,
-        "dataset_size":69827,
-        "nb_tasks":9,
-        "task_duration":50,
-        "timelasped":29,
-        "job_arriving_time":0
-    },
-    {
-        "job_id":14,
-        "dataset_size":51761,
-        "nb_tasks":18,
-        "task_duration":80,
-        "timelasped":22,
-        "job_arriving_time":0
-    },
-    {
-        "job_id":15,
-        "dataset_size":99814,
-        "nb_tasks":15,
         "task_duration":140,
         "timelasped":1,
         "job_arriving_time":0
