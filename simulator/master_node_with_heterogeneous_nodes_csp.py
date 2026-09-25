@@ -10,6 +10,7 @@ import copy
 from compute_node import ComputeNode
 
 from utils.modelCSP import onLineSchedulingUsingCSP,schedulingUsingJavaCSP,startMinizincModel,MODEL_DIR
+from utils.run_export import solver_model_dir
 
 
 logger = logging.getLogger(__name__)
@@ -614,7 +615,14 @@ class SchedulingUsingCSPOnlineWarmStart(SchedulingUsingCSPOnline):
             self.java_main_class = orig_java_main_class
 
         warm_start = {"job_placements": job_placements, "transfers": transfers_ws}
-        with open(os.path.join(MODEL_DIR, "inputs", "warm_start.json"), "w") as f:
+        # solver_model_dir() (not the fixed MODEL_DIR) so this lands where the solve about to run
+        # will actually read it from -- under SIMULATOR_RUN_CWD isolation (e.g. the Grid5000
+        # submission scripts, which give each approach its own private utils/model tree so
+        # concurrent runs don't clobber each other's exchange files) MODEL_DIR is the wrong,
+        # shared location: the JVM reads warm_start.json relative to ITS OWN cwd (the isolated
+        # one), so a write to MODEL_DIR here was silently invisible to it, and warm-starting
+        # never actually applied even though this call appeared to succeed.
+        with open(os.path.join(solver_model_dir(), "inputs", "warm_start.json"), "w") as f:
             json.dump(warm_start, f)
 
 
@@ -929,6 +937,276 @@ class SchedulingUsingCSPAdaptive(SchedulingUsingCSPIncremental):
                     self.waiting_jobs.pop(0)
                 else:
                     logger.warning("[%s] Master: no CSP solution found for job %s (adaptive final), will retry", self.env.now, job.job_id)
+
+            if self._allJobsCompleted():
+                break
+
+
+class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart):
+    """
+    Incremental-first gate, but escalation is the FULL joint replan (the new job + every
+    already-running job, exactly SchedulingUsingCSPOnline's own jobs_to_reschedule), not a
+    single-job-only solve like SchedulingUsingCSPAdaptive. Matches this flow:
+
+        new job arrives -> place with Incremental alone -> F1 (no extra cost)
+                         -> F1 high enough? -> no: use that Incremental placement, done
+                                             -> yes: pre-processing (freeze large / near-done /
+                                                mid-transfer jobs among the OTHERS, via the same
+                                                freeze_* config schedulingUsingJavaCSP already
+                                                honors) -> joint online_biobj_warmstart replan,
+                                                budgeted at adaptive_alpha * F1
+                                                -> solution found: commit it (covers every job)
+                                                -> no solution: fall back to Incremental for ONLY
+                                                   the just-arrived job; every other already-
+                                                   running job's plan is left exactly as it was
+                                                   (Incremental never reconsiders them anyway, and
+                                                   nothing forced them to change).
+
+    Pre-processing matters here specifically because the escalation is a JOINT solve: with many
+    already-running jobs also in the batch, freezing the ones unlikely to benefit from
+    reconsideration (see freeze_large_jobs_threshold_mb / freeze_remaining_time_threshold /
+    freeze_jobs_with_ongoing_transfer) keeps that joint solve's search space down. It's still an
+    opt-in speed heuristic, not a correctness requirement -- if the frozen configuration happens
+    to be infeasible (confirmed possible: multiple simultaneously-frozen jobs can jointly
+    overconstrain the model even with no shared node between them), the "no solution -> fall back
+    to Incremental for the new job" path above is what keeps this safe, not a guarantee that
+    freezing itself never breaks feasibility.
+    """
+    java_main_class = 'MainIncremental'
+    escalation_java_main_class = 'MainOnlineMultiObjWarmStart'
+    adaptive_alpha = 0.2
+    adaptive_max_budget_s = 1200
+    # F1 must exceed this to bother escalating at all; None (the default) means "always try" --
+    # budget already scales with F1, so a small job naturally gets a small (cheap) escalation
+    # attempt rather than being blocked from one entirely.
+    adaptive_f1_threshold = None
+    # Budget for the internal Incremental calls (F1 probe + fallback), independent of
+    # --solver-time-limit. None (the default) falls back to whatever solver_time_limit_s
+    # currently is.
+    incremental_time_limit_s = None
+
+    def _flowTimeFromPlan(self, job, transfers_, works_):
+        """Same as SchedulingUsingCSPAdaptive's: this job's own flow time (finish - arrival) from
+        a plan's absolute times, or None if the job doesn't appear in the plan at all."""
+        end_times = []
+        for entries in transfers_.values():
+            for t_job_id, t_node, t_start, t_end, t_dur in entries:
+                if t_job_id == job.job_id:
+                    end_times.append(t_end)
+        for entries in works_.values():
+            for w_job_id, w_node, w_task, w_start, w_end, w_dur in entries:
+                if w_job_id == job.job_id:
+                    end_times.append(w_end)
+        if not end_times:
+            return None
+        return max(end_times) - job.arriving_time
+
+    def _writeWarmStart(self, jobs_to_reschedule, replicas_locations, nodes_free_time):
+        """Overrides SchedulingUsingCSPOnlineWarmStart._writeWarmStart(): that version's "brand-
+        new job(s)" loop iterates self.waiting_jobs directly, which is correct THERE because its
+        own schedulingNewJob() always puts every currently-waiting job into jobs_to_reschedule
+        together. Here, only ONE job at a time is ever escalated (self.waiting_jobs[0]) while
+        other, unrelated jobs can simultaneously sit in self.waiting_jobs still unprocessed --
+        iterating self.waiting_jobs there would build placements keyed by a job_id job_index
+        never learned about (KeyError). Deriving "new" from jobs_to_reschedule itself instead is
+        correct in both cases and doesn't depend on what else happens to be waiting."""
+        sorted_jobs = sorted(jobs_to_reschedule, key=lambda j: j.job_id)
+        job_index = {job.job_id: idx for idx, job in enumerate(sorted_jobs)}
+        now = self.env.now
+
+        job_placements = []
+        transfers_ws = []
+
+        already_known_ids = {job.job_id for job in self.getRunningJobs()}
+        for node_id in range(len(self.compute_nodes)):
+            key = f'node_{node_id}'
+            for work in self.works.get(key, []):
+                w_job_id, w_node, w_task, w_start, w_end, w_dur = work
+                if w_job_id in job_index and w_job_id in already_known_ids:
+                    job_placements.append({
+                        "job_index": job_index[w_job_id], "task_index": int(w_task),
+                        "node": int(w_node), "start": int(round(w_start - now)),
+                    })
+            for transfer in self.transfers.get(key, []):
+                t_job_id, t_node, t_start, t_end, t_dur = transfer
+                if t_job_id in job_index and t_job_id in already_known_ids:
+                    transfers_ws.append({
+                        "job_index": job_index[t_job_id], "node": int(t_node),
+                        "start": int(round(t_start - now)),
+                    })
+
+        new_jobs = [job for job in jobs_to_reschedule if job.job_id not in already_known_ids]
+        orig_java_main_class = self.java_main_class
+        try:
+            for job in new_jobs:
+                self.java_main_class = 'MainIncremental'
+                inc_transfers, inc_works, _ = schedulingUsingJavaCSP(
+                    self, [job], replicas_locations, nodes_free_time, self.env.now)
+                for node_id in range(len(self.compute_nodes)):
+                    key = f'node_{node_id}'
+                    for work in inc_works.get(key, []):
+                        w_job_id, w_node, w_task, w_start, w_end, w_dur = work
+                        if w_job_id == job.job_id:
+                            job_placements.append({
+                                "job_index": job_index[w_job_id], "task_index": int(w_task),
+                                "node": int(w_node), "start": int(round(w_start - now)),
+                            })
+                    for transfer in inc_transfers.get(key, []):
+                        t_job_id, t_node, t_start, t_end, t_dur = transfer
+                        if t_job_id == job.job_id:
+                            transfers_ws.append({
+                                "job_index": job_index[t_job_id], "node": int(t_node),
+                                "start": int(round(t_start - now)),
+                            })
+        finally:
+            self.java_main_class = orig_java_main_class
+
+        warm_start = {"job_placements": job_placements, "transfers": transfers_ws}
+        with open(os.path.join(solver_model_dir(), "inputs", "warm_start.json"), "w") as f:
+            json.dump(warm_start, f)
+
+    def _placeSingleJobIncremental(self, job):
+        """Throwaway (or final-fallback) single-job Incremental solve, using Incremental's own
+        node-availability semantics (nodesFreeTimeIncremental accounts for queued backlog, unlike
+        plain nodesFreeTime). Budgeted at incremental_time_limit_s (config or class attr) when
+        set, independently of --solver-time-limit -- Incremental's own placement is meant to be
+        cheap/fast, so it shouldn't have to share the (often much larger) budget used elsewhere
+        for the joint bi-objectif escalation or for a plain "incremental" approach run standalone."""
+        nodes_free_time = SchedulingUsingCSPIncremental.nodesFreeTimeIncremental(
+            self, self.ongoing_transfers, self.ongoing_works)
+        orig_java_main_class = self.java_main_class
+        incremental_limit = self._config.get('incremental_time_limit_s', self.incremental_time_limit_s)
+        orig_limit = self._config.get('solver_time_limit_s')
+        try:
+            self.java_main_class = 'MainIncremental'
+            if incremental_limit is not None:
+                self._config['solver_time_limit_s'] = max(1, int(round(incremental_limit)))
+            transfers_, works_, deletions_ = schedulingUsingJavaCSP(
+                self, [job], self.replicas_locations, nodes_free_time, self.env.now)
+        finally:
+            self.java_main_class = orig_java_main_class
+            if incremental_limit is not None:
+                if orig_limit is None:
+                    self._config.pop('solver_time_limit_s', None)
+                else:
+                    self._config['solver_time_limit_s'] = orig_limit
+        flow_time = self._flowTimeFromPlan(job, transfers_, works_)
+        return transfers_, works_, deletions_, flow_time
+
+    def _commitSingleJobPlan(self, transfers_, works_, deletions_):
+        """Append-only merge (mirrors SchedulingUsingCSPIncremental.schedulingNewJob): only this
+        one job's entries are added, nothing already committed for any other job is touched."""
+        for node in range(len(self.compute_nodes)):
+            key = "node_" + str(node)
+            if key in transfers_ and len(transfers_[key]) > 0:
+                for transfer in transfers_[key]:
+                    self.transfers[key].append(transfer)
+            if key in works_ and len(works_[key]) > 0:
+                for work in works_[key]:
+                    self.works[key].append(work)
+            if key in deletions_ and len(deletions_[key]) > 0:
+                for deletion in deletions_[key]:
+                    self.deletions[key].append(deletion)
+
+    def _commitJointPlan(self, transfers_, works_, deletions_):
+        """Full-replan merge (mirrors SchedulingUsingCSPOnlineWarmStart.schedulingNewJob): every
+        node's list is reset and rebuilt from this joint plan, since it re-decided everything."""
+        for node in range(len(self.compute_nodes)):
+            key = "node_" + str(node)
+            self.transfers[key] = []
+            self.works[key] = []
+            self.deletions[key] = []
+            if key in transfers_ and len(transfers_[key]) > 0:
+                ongoing = self.ongoing_transfers.get(key)
+                for transfer in transfers_[key]:
+                    transfer_job_id = transfer[0]
+                    already_present = transfer_job_id in self.replicas_locations and node in self.replicas_locations[transfer_job_id]
+                    already_in_flight = ongoing is not None and ongoing[0] == transfer_job_id
+                    if already_present or already_in_flight:
+                        continue
+                    self.transfers[key].append(transfer)
+                if len(works_.get(key, [])) > 0:
+                    for work in works_[key]:
+                        self.works[key].append(work)
+            if key in deletions_ and len(deletions_[key]) > 0:
+                for deletion in deletions_[key]:
+                    self.deletions[key].append(deletion)
+
+    def schedulingNewJob(self):
+
+        while True:
+            yield self.env.timeout(0.1)
+
+            if len(self.waiting_jobs) >= 1:
+
+                job = self.waiting_jobs[0]
+
+                logger.debug("[%s] Master: probing Incremental for job %s (adaptive-joint)", self.env.now, job.job_id)
+                inc_transfers, inc_works, inc_deletions, f1 = self._placeSingleJobIncremental(job)
+
+                if f1 is None:
+                    logger.warning("[%s] Master: no CSP solution found for job %s (adaptive-joint/incremental probe), will retry", self.env.now, job.job_id)
+                    if self._allJobsCompleted():
+                        break
+                    continue
+
+                alpha = self._config.get('adaptive_alpha', self.adaptive_alpha)
+                threshold = self._config.get('adaptive_f1_threshold', self.adaptive_f1_threshold)
+                should_escalate = threshold is None or f1 > threshold
+
+                if should_escalate:
+                    max_budget = self._config.get('adaptive_max_budget_s', self.adaptive_max_budget_s)
+                    budget = min(alpha * f1, max_budget)
+                    logger.debug("[%s] Master: job %s F1=%.3f -> joint escalation budget=%.3f (snapshot at %.3f)",
+                                 self.env.now, job.job_id, f1, budget, self.env.now + budget)
+                    yield self.env.timeout(budget)
+
+                    nodes_free_time = self.nodesFreeTime(self.ongoing_transfers, self.ongoing_works)
+                    replicas_locations = self.replicas_locations
+                    jobs_to_reschedule = [job] + self.getRunningJobs()
+
+                    self._writeWarmStart(jobs_to_reschedule, replicas_locations, nodes_free_time)
+                    orig_limit = self._config.get('solver_time_limit_s')
+                    orig_java_main_class = self.java_main_class
+                    try:
+                        self._config['solver_time_limit_s'] = max(1, int(round(budget)))
+                        # Without this, the joint solve silently runs under the class-level
+                        # default (MainIncremental, kept for the cheap F1 probe) instead of the
+                        # actual bi-objectif+warmstart escalation -- and since MainIncremental
+                        # never stops early once it can't quickly prove optimal, it then just
+                        # burns the entire budget doing the wrong solve (confirmed: a real run got
+                        # stuck for 5+ minutes on a single-job MainIncremental call carrying a
+                        # 619s budget meant for the joint replan).
+                        self.java_main_class = self.escalation_java_main_class
+                        transfers_, works_, deletions_ = schedulingUsingJavaCSP(
+                            self, jobs_to_reschedule, replicas_locations, nodes_free_time, self.env.now)
+                    finally:
+                        self.java_main_class = orig_java_main_class
+                        if orig_limit is None:
+                            self._config.pop('solver_time_limit_s', None)
+                        else:
+                            self._config['solver_time_limit_s'] = orig_limit
+
+                    if len(transfers_.keys()) > 0 and len(works_.keys()) > 0:
+                        logger.debug("[%s] Master: job %s joint escalation accepted (%s job(s) replanned)",
+                                     self.env.now, job.job_id, len(jobs_to_reschedule))
+                        self._commitJointPlan(transfers_, works_, deletions_)
+                        self.waiting_jobs.pop(0)
+                    else:
+                        logger.warning("[%s] Master: joint escalation found no solution for job %s, falling back to Incremental for it alone",
+                                       self.env.now, job.job_id)
+                        transfers_, works_, deletions_, _ = self._placeSingleJobIncremental(job)
+                        if len(transfers_.keys()) > 0 and len(works_.keys()) > 0:
+                            self._commitSingleJobPlan(transfers_, works_, deletions_)
+                            self.waiting_jobs.pop(0)
+                        else:
+                            logger.warning("[%s] Master: no CSP solution found for job %s (adaptive-joint fallback), will retry",
+                                           self.env.now, job.job_id)
+                else:
+                    logger.debug("[%s] Master: job %s F1=%.3f below threshold, using Incremental placement as-is",
+                                 self.env.now, job.job_id, f1)
+                    self._commitSingleJobPlan(inc_transfers, inc_works, inc_deletions)
+                    self.waiting_jobs.pop(0)
 
             if self._allJobsCompleted():
                 break

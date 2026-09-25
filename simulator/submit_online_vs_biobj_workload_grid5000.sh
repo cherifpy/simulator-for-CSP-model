@@ -26,6 +26,14 @@
 #                      for the real leak this prevents). Trims the search space so the solve
 #                      itself is faster, at some cost in solution quality -- see PRE_PROCESS
 #                      below for the exact thresholds used.
+#   - "hybrid":        SchedulingUsingCSPAdaptiveJoint: Incremental-first gate (F1), and only when
+#                      F1 looks high does it escalate to a FULL joint replan (new job + every
+#                      already-running job) via online_biobj_warmstart -- pre-processing (the same
+#                      freeze_* settings as online_biobj_warmstart's --pre-process) is ALWAYS
+#                      applied here, since it's core to the design, not an opt-in comparison knob.
+#                      Falls back to Incremental for just the new job if the joint replan finds no
+#                      solution -- confirmed necessary: pre-processing can make that joint solve
+#                      genuinely infeasible even with no shared node between the frozen jobs.
 #
 # Same isolation rationale as submit_nexisting_sweep.sh / submit_dataset_size_sweep_grid5000.sh:
 # schedulingUsingJavaCSP exchanges data with the Java solver through FIXED file paths under
@@ -53,6 +61,8 @@
 #   ./simulator/submit_online_vs_biobj_workload_grid5000.sh --approaches adaptive --adaptive-alpha 0.2
 #   ./simulator/submit_online_vs_biobj_workload_grid5000.sh --solver-time-limit 120 \
 #       --approaches "online_biobj_warmstart online_biobj incremental" --pre-process
+#   ./simulator/submit_online_vs_biobj_workload_grid5000.sh --solver-time-limit 120 \
+#       --approaches "hybrid online_biobj incremental"
 #
 # Requires: setup_grid5000.sh already run at least once (venv + compiled Java model in place),
 # and inst-20J-50N present under workloads/.
@@ -70,7 +80,8 @@ EPSILON_FRACTION=0.1
 EPSILON_PHASE1_FRACTION=0.5
 EPSILON_MAX_CAP=""
 ADAPTIVE_ALPHA=0.2
-ADAPTIVE_MAX_BUDGET=1200   # 20min ceiling on the escalation search budget (adaptive_alpha * F1)
+ADAPTIVE_MAX_BUDGET=300   # ceiling on the escalation search budget (adaptive_alpha * F1)
+HYBRID_INCREMENTAL_TIME_LIMIT=30   # hybrid only: budget for its internal Incremental calls (F1 probe + fallback)
 # Pre-processing (job freezing), applied ONLY to online_biobj_warmstart when --pre-process is
 # passed. Defaults calibrated to inst-20J-50N's own dataset_size distribution (1024-10240 MB):
 # 7000 freezes only its two largest sizes (7168, 10240), not everything.
@@ -93,6 +104,7 @@ while [[ $# -gt 0 ]]; do
         --epsilon-max-cap) EPSILON_MAX_CAP="$2"; shift 2 ;;
         --adaptive-alpha) ADAPTIVE_ALPHA="$2"; shift 2 ;;
         --adaptive-max-budget) ADAPTIVE_MAX_BUDGET="$2"; shift 2 ;;
+        --hybrid-incremental-time-limit) HYBRID_INCREMENTAL_TIME_LIMIT="$2"; shift 2 ;;
         --pre-process) PRE_PROCESS=1; shift 1 ;;
         --freeze-large-jobs-threshold) FREEZE_LARGE_JOBS_THRESHOLD="$2"; shift 2 ;;
         --freeze-remaining-time-threshold) FREEZE_REMAINING_TIME_THRESHOLD="$2"; shift 2 ;;
@@ -131,7 +143,8 @@ echo "### Solver time budget: ${SOLVER_TIME_LIMIT}s per replan (online_biobj spl
 echo "###   ${EPSILON_PHASE1_FRACTION} / $(python3 -c "print(1 - $EPSILON_PHASE1_FRACTION)") between phase1/phase2)"
 echo "### epsilon_fraction=$EPSILON_FRACTION  epsilon_max_cap=${EPSILON_MAX_CAP:-<none>}"
 echo "### adaptive_alpha=$ADAPTIVE_ALPHA (budget and acceptance-gain fraction, adaptive only)"
-echo "### adaptive_max_budget=${ADAPTIVE_MAX_BUDGET}s (ceiling on the escalation budget, adaptive only)"
+echo "### adaptive_max_budget=${ADAPTIVE_MAX_BUDGET}s (ceiling on the escalation budget, adaptive/hybrid)"
+echo "### hybrid_incremental_time_limit=${HYBRID_INCREMENTAL_TIME_LIMIT}s (hybrid's internal Incremental budget)"
 if [[ "$PRE_PROCESS" == "1" ]]; then
     echo "### pre-processing ON for online_biobj_warmstart: freeze_large_jobs_threshold=${FREEZE_LARGE_JOBS_THRESHOLD}MB"
     echo "###   freeze_remaining_time_threshold=${FREEZE_REMAINING_TIME_THRESHOLD}  freeze_jobs_with_ongoing_transfer=on"
@@ -155,15 +168,19 @@ for APPROACH in $APPROACHES; do
     CMD+=" --instance-dir $INSTANCE_DIR --nb-jobs $NB_JOBS --nb-nodes $NB_NODES"
     CMD+=" --solver-time-limit $SOLVER_TIME_LIMIT --lambda-rate $LAMBDA_RATE --seed $SEED"
     CMD+=" --results-dir $RESULTS_DIR"
-    if [[ "$APPROACH" == "online_biobj" || "$APPROACH" == "online_biobj_warmstart" ]]; then
+    if [[ "$APPROACH" == "online_biobj" || "$APPROACH" == "online_biobj_warmstart" || "$APPROACH" == "hybrid" ]]; then
         CMD+=" --epsilon-fraction $EPSILON_FRACTION --epsilon-phase1-fraction $EPSILON_PHASE1_FRACTION"
         if [[ -n "$EPSILON_MAX_CAP" ]]; then
             CMD+=" --epsilon-max-cap $EPSILON_MAX_CAP"
         fi
-    elif [[ "$APPROACH" == "adaptive" ]]; then
+    fi
+    if [[ "$APPROACH" == "adaptive" || "$APPROACH" == "hybrid" ]]; then
         CMD+=" --adaptive-alpha $ADAPTIVE_ALPHA --adaptive-max-budget $ADAPTIVE_MAX_BUDGET"
     fi
-    if [[ "$APPROACH" == "online_biobj_warmstart" && "$PRE_PROCESS" == "1" ]]; then
+    if [[ "$APPROACH" == "hybrid" ]]; then
+        CMD+=" --hybrid-incremental-time-limit $HYBRID_INCREMENTAL_TIME_LIMIT"
+    fi
+    if [[ "$APPROACH" == "online_biobj_warmstart" && "$PRE_PROCESS" == "1" ]] || [[ "$APPROACH" == "hybrid" ]]; then
         CMD+=" --freeze-large-jobs-threshold $FREEZE_LARGE_JOBS_THRESHOLD"
         CMD+=" --freeze-remaining-time-threshold $FREEZE_REMAINING_TIME_THRESHOLD"
         CMD+=" --freeze-jobs-with-ongoing-transfer"
