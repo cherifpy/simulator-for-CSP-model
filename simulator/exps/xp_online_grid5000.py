@@ -44,6 +44,7 @@ from master_node_with_heterogeneous_nodes_csp import (
     SchedulingUsingCSPOnlineMultiObj,
     SchedulingUsingCSPIncremental,
     SchedulingUsingCSPIncrementalFreeNodesOnly,
+    SchedulingUsingCSPAdaptive,
 )
 from utils.plots import plot_gantt_chart
 from utils.run_export import start_recording
@@ -64,6 +65,12 @@ APPROACHES = {
     # genuine infeasibility edge case in the Java model's node-domain fallback -- see notes in
     # master_node_with_heterogeneous_nodes_csp.py around restrict_to_free_nodes.
     "incremental_free_nodes_only": SchedulingUsingCSPIncrementalFreeNodesOnly,
+    # Incremental-first escalation: place each new job with Incremental to get F1, then --
+    # budgeted at adaptive_alpha * F1 seconds, using an infra snapshot taken only after that
+    # wait -- optionally escalate to online_biobj's MainOnlineMultiObj for the same single job.
+    # Escalation is kept only if it beats F1 by more than adaptive_alpha (same knob for the
+    # budget and the acceptance bar). See SchedulingUsingCSPAdaptive's docstring for the design.
+    "adaptive": SchedulingUsingCSPAdaptive,
 }
 
 
@@ -95,6 +102,21 @@ def parse_args():
     parser.add_argument("--epsilon-max-cap", type=float, default=None,
                          help="online_biobj only: absolute ceiling on the max-flow-time cap phase "
                               "2 is allowed to accept, regardless of epsilon_fraction (default: none).")
+    parser.add_argument("--adaptive-alpha", type=float, default=0.2,
+                         help="adaptive only: escalation search budget as a fraction of "
+                              "Incremental's own predicted flow time F1, and the minimum relative "
+                              "gain over F1 required to keep the escalated plan -- same knob for "
+                              "both (default: 0.2 = 20%%).")
+    parser.add_argument("--adaptive-max-budget", type=float, default=1200,
+                         help="adaptive only: hard ceiling on the escalation search budget "
+                              "(adaptive_alpha * F1), in seconds -- keeps a rare very-large-F1 "
+                              "job from running unboundedly long (default: 1200 = 20min).")
+    parser.add_argument("--freeze-large-jobs-threshold", type=float, default=None,
+                         help="online/online_biobj/adaptive: a not-finished job already resident "
+                              "somewhere whose dataset_size (MB) is at or above this threshold is "
+                              "frozen for the solve -- no new replica, no move, kept exactly where "
+                              "it is (see SchedulingUsingCSPOnline docs / frozen_jobs.txt). "
+                              "Default: unset (no job frozen, identical to before this existed).")
     return parser.parse_args()
 
 
@@ -104,6 +126,9 @@ def run(args):
         master_class.epsilon_fraction = args.epsilon_fraction
         master_class.epsilon_phase1_fraction = args.epsilon_phase1_fraction
         master_class.epsilon_max_cap = args.epsilon_max_cap
+    if args.approach == "adaptive":
+        master_class.adaptive_alpha = args.adaptive_alpha
+        master_class.adaptive_max_budget_s = args.adaptive_max_budget
 
     with open(args.config, "r", encoding="utf-8") as f:
         config = json.load(f)
@@ -112,6 +137,9 @@ def run(args):
     config["jobs_file_path"] = os.path.join(args.instance_dir, "jobs.json")
     config["solver_time_limit_s"] = args.solver_time_limit
     config["lambda_rate"] = args.lambda_rate
+    config["adaptive_alpha"] = args.adaptive_alpha
+    config["adaptive_max_budget_s"] = args.adaptive_max_budget
+    config["freeze_large_jobs_threshold_mb"] = args.freeze_large_jobs_threshold
 
     results_dir = args.results_dir or os.path.join(
         SIMULATOR_DIR, "results-grid5000",
@@ -139,7 +167,11 @@ def run(args):
                 "multi_objective": getattr(master_class, "multi_objective", None),
                 "epsilon_fraction": getattr(master_class, "epsilon_fraction", None),
                 "epsilon_phase1_fraction": getattr(master_class, "epsilon_phase1_fraction", None),
-                "epsilon_max_cap": getattr(master_class, "epsilon_max_cap", None)},
+                "epsilon_max_cap": getattr(master_class, "epsilon_max_cap", None),
+                "adaptive_alpha": getattr(master_class, "adaptive_alpha", None),
+                "adaptive_max_budget_s": getattr(master_class, "adaptive_max_budget_s", None),
+                "escalation_java_main_class": getattr(master_class, "escalation_java_main_class", None),
+                "freeze_large_jobs_threshold_mb": args.freeze_large_jobs_threshold},
         config=config, nodes_config=nodes_config)
 
     random.seed(args.seed)

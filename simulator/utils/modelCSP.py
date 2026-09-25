@@ -363,9 +363,27 @@ def _schedulingUsingJavaCSP_impl(master_node, jobs: list, replicas_locations: di
                 "job_arriving_time": max(0, job.arriving_time - master_node.env.now),
             })
     jobs_data = sorted(jobs_data, key=lambda x: x['job_id'])
-    
+
 
     pd.DataFrame(jobs_data).to_json(os.path.join(model_dir, "inputs", "jobs.json"), orient="records", indent=4)
+
+    # Jobs too costly to move, left fully untouched by this solve (see frozen_jobs.txt in
+    # MainOnline.java/MainOnlineMultiObj.java: no new replica, no move, existing replica(s) kept
+    # exactly as-is). Opt-in via master_node._config['freeze_large_jobs_threshold_mb'] -- a job
+    # already resident somewhere (there has to be a place to freeze it TO) whose dataset_size is
+    # at or above the threshold gets frozen instead of being fully re-decided like every other
+    # not-finished job; a job with no completed residency yet (data still mid-transfer) is never
+    # frozen, since forcing it to "stay" nowhere isn't meaningful. Threshold unset (the default):
+    # no job is frozen, identical to behavior before this existed. Local indices here match
+    # jobs_data's own order, the same indexing data_sizes/nb_data use on the Java side.
+    freeze_threshold = master_node._config.get('freeze_large_jobs_threshold_mb')
+    frozen_indices = []
+    if freeze_threshold is not None:
+        for idx, jd in enumerate(jobs_data):
+            if jd['dataset_size'] >= freeze_threshold and replicas_locations.get(jd['job_id']):
+                frozen_indices.append(idx)
+    with open(os.path.join(model_dir, "inputs", "frozen_jobs.txt"), "w") as f:
+        f.write(",".join(str(i) for i in frozen_indices))
 
     # Per-scheduler-class solver time budget (e.g. Online vs Incremental can be compared at
     # different budgets); Main.java falls back to 120s if this file is missing/unreadable.

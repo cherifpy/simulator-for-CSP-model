@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 # Submits a full live-simulation workload (lambda_rate=100, 20 jobs, 50 nodes, 10min solver
 # budget per replan -- same setup used before for online-vs-incremental comparisons, via
-# exps/xp_online_grid5000.py) as TWO separate oarsub jobs running in parallel:
+# exps/xp_online_grid5000.py) as separate oarsub jobs running in parallel, one per approach:
 #   - "online":       mono-objective Online, max flow time (MainOnline.java)
 #   - "online_biobj": bi-objective Online, epsilon-constraint phase1=max flow time /
 #                      phase2=transfer energy (MainOnlineMultiObj.java), same total solver
 #                      budget as "online", split 50/50 between the two phases by default.
+#   - "adaptive":     Incremental-first escalation (SchedulingUsingCSPAdaptive): each job is
+#                      placed by Incremental first (F1), then optionally escalated to
+#                      online_biobj's MainOnlineMultiObj for that same job, budgeted at
+#                      adaptive_alpha * F1 and kept only if it beats F1 by more than
+#                      adaptive_alpha. Uses --solver-time-limit only as the Incremental probe's
+#                      own budget (Incremental converges fast; the real solver-time knob for
+#                      this approach is --adaptive-alpha, since the escalation budget scales
+#                      with each job's own F1, not with a fixed wall-clock limit).
 #
 # Same isolation rationale as submit_nexisting_sweep.sh / submit_dataset_size_sweep_grid5000.sh:
 # schedulingUsingJavaCSP exchanges data with the Java solver through FIXED file paths under
@@ -29,6 +37,8 @@
 #   ./simulator/submit_online_vs_biobj_workload_grid5000.sh --walltime 05:00:00
 #   ./simulator/submit_online_vs_biobj_workload_grid5000.sh --epsilon-fraction 0.15
 #   ./simulator/submit_online_vs_biobj_workload_grid5000.sh --approaches online_biobj   # relaunch just one
+#   ./simulator/submit_online_vs_biobj_workload_grid5000.sh --approaches "online online_biobj adaptive incremental"
+#   ./simulator/submit_online_vs_biobj_workload_grid5000.sh --approaches adaptive --adaptive-alpha 0.2
 #
 # Requires: setup_grid5000.sh already run at least once (venv + compiled Java model in place),
 # and inst-20J-50N present under workloads/.
@@ -45,6 +55,8 @@ SEED=42
 EPSILON_FRACTION=0.1
 EPSILON_PHASE1_FRACTION=0.5
 EPSILON_MAX_CAP=""
+ADAPTIVE_ALPHA=0.2
+ADAPTIVE_MAX_BUDGET=1200   # 20min ceiling on the escalation search budget (adaptive_alpha * F1)
 APPROACHES="online online_biobj"
 
 while [[ $# -gt 0 ]]; do
@@ -59,6 +71,8 @@ while [[ $# -gt 0 ]]; do
         --epsilon-fraction) EPSILON_FRACTION="$2"; shift 2 ;;
         --epsilon-phase1-fraction) EPSILON_PHASE1_FRACTION="$2"; shift 2 ;;
         --epsilon-max-cap) EPSILON_MAX_CAP="$2"; shift 2 ;;
+        --adaptive-alpha) ADAPTIVE_ALPHA="$2"; shift 2 ;;
+        --adaptive-max-budget) ADAPTIVE_MAX_BUDGET="$2"; shift 2 ;;
         --approaches) APPROACHES="$2"; shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
@@ -93,6 +107,8 @@ echo "### Instance: $INSTANCE_DIR ($NB_JOBS jobs / $NB_NODES nodes, lambda_rate=
 echo "### Solver time budget: ${SOLVER_TIME_LIMIT}s per replan (online_biobj splits it "
 echo "###   ${EPSILON_PHASE1_FRACTION} / $(python3 -c "print(1 - $EPSILON_PHASE1_FRACTION)") between phase1/phase2)"
 echo "### epsilon_fraction=$EPSILON_FRACTION  epsilon_max_cap=${EPSILON_MAX_CAP:-<none>}"
+echo "### adaptive_alpha=$ADAPTIVE_ALPHA (budget and acceptance-gain fraction, adaptive only)"
+echo "### adaptive_max_budget=${ADAPTIVE_MAX_BUDGET}s (ceiling on the escalation budget, adaptive only)"
 echo "### Walltime per job: $WALLTIME"
 echo ""
 
@@ -115,6 +131,8 @@ for APPROACH in $APPROACHES; do
         if [[ -n "$EPSILON_MAX_CAP" ]]; then
             CMD+=" --epsilon-max-cap $EPSILON_MAX_CAP"
         fi
+    elif [[ "$APPROACH" == "adaptive" ]]; then
+        CMD+=" --adaptive-alpha $ADAPTIVE_ALPHA --adaptive-max-budget $ADAPTIVE_MAX_BUDGET"
     fi
 
     echo "### approach=$APPROACH -> $RESULTS_DIR (private run dir: $RUN_CWD)"
@@ -123,6 +141,6 @@ for APPROACH in $APPROACHES; do
 done
 
 echo "### All jobs submitted. Check status with: oarstat -u \$(whoami)"
-echo "### Results will land under: $RESULTS_ROOT/{online,online_biobj}/"
+echo "### Results will land under: $RESULTS_ROOT/<approach>/  (one dir per approach in \$APPROACHES)"
 echo "### Each dir will contain infos_on_jobs.csv, infos_on_tasks.csv, infos_on_replicas.csv,"
 echo "### infos_on_transfers_energy.csv, events_history.json, and gantt.png."

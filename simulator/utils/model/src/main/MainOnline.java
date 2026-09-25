@@ -606,6 +606,28 @@ public class MainOnline {
                 // File missing/unreadable: debug prints just show 0 for "now" instead of crashing.
             }
 
+            // Jobs the Python side decided are too costly to move (e.g. a large dataset already
+            // resident somewhere): comma-separated job indices (same nb_data indexing as
+            // data_sizes/replicas_location), written to frozen_jobs.txt by
+            // _schedulingUsingJavaCSP_impl. A frozen job's tasks stay confined to nodes it's
+            // ALREADY resident on (no new node, so no new transfer -- see validNodes below), and
+            // its transferHeights are fixed to its current residency instead of left free (see
+            // the transfer-task loop below) -- both trims real search space AND guarantees no
+            // network cost from moving it. File missing/empty (the default): no job is frozen,
+            // identical to behavior before this existed.
+            boolean[] isFrozen = new boolean[nb_data];
+            try {
+                String frozenText = readFile(MODEL_INPUTS_DIR + "/frozen_jobs.txt").trim();
+                if (!frozenText.isEmpty()) {
+                    for (String tok : frozenText.split(",")) {
+                        int idx = Integer.parseInt(tok.trim());
+                        if (idx >= 0 && idx < nb_data) isFrozen[idx] = true;
+                    }
+                }
+            } catch (Exception e) {
+                // File missing/unreadable: no job frozen (matches behavior before this existed).
+            }
+
             // ----- MODEL -----
             Model model = new Model("Bag of Tasks Scheduling (Java)");
             /*Settings.dev()
@@ -632,18 +654,32 @@ public class MainOnline {
                     //IntVar durationVar = model.intVar(d);
                     IntVar end;// = model.intVar("end_transfer_d" + i + "_n" + j, (int) starting_times[j] + d, makespan,true);
                     
-                    BoolVar h;
-                    if (data_sizes[i] > storage_capacity[j]) {
-                        h = model.boolVar("height_transfer_d" + i + "_n" + j, false);
-                    }else{
-                        h = model.boolVar("height_transfer_d" + i + "_n" + j);
-                    }
                     // s/end must stay internally consistent (s + d = end) regardless of which
                     // branch set h, or the Task below is contradictory and the WHOLE model
                     // becomes infeasible the moment any single node is too small for any single
                     // job -- even though h=false already means this pair can never be selected.
                     final int jForResidentCheck = j;
                     boolean isResident = Arrays.stream(replicas_location[i]).anyMatch(n -> n == jForResidentCheck);
+
+                    BoolVar h;
+                    if (data_sizes[i] > storage_capacity[j]) {
+                        h = model.boolVar("height_transfer_d" + i + "_n" + j, false);
+                    } else if (isFrozen[i] && !isResident) {
+                        // Frozen and NOT already here: no new replica reaches this node. Cannot
+                        // also force h=true on every node it's ALREADY resident on below -- h is
+                        // tied by reification to counters[j]>=1 (a task actually landing there),
+                        // and sum(counters) is constrained to equal this job's own task count
+                        // (wl.length) a few lines down. A job can easily be resident on MORE
+                        // nodes than it has tasks (replicas accumulate across many replans), so
+                        // forcing every one of those true would force sum(counters) past
+                        // wl.length -- outright infeasible. Leaving already-resident nodes free
+                        // (the else branch) lets the normal mechanism decide which of them still
+                        // keep a task this round, exactly like any non-frozen job's unused
+                        // replicas -- freezing only ever forbids reaching a NEW node.
+                        h = model.boolVar("height_transfer_d" + i + "_n" + j, false);
+                    } else {
+                        h = model.boolVar("height_transfer_d" + i + "_n" + j);
+                    }
                     if (isResident) {
                         // Data is already physically on this node from a previous solve: pin its
                         // storage-occupancy start to "now" (nodeStartingTimes[j]) instead of leaving
@@ -696,8 +732,16 @@ public class MainOnline {
                 // donc aucune tache liee a cette donnee ne peut s'y executer non plus.
                 // On retire directement ces noeuds du domaine de jobNodes.
                 List<Integer> validNodesList = new ArrayList<>();
-                for (int j = 0; j < nb_nodes; j++) {
-                    if (data_sizes[i] <= storage_capacity[j]) validNodesList.add(j);
+                if (isFrozen[i]) {
+                    // Frozen: confined to nodes it's ALREADY resident on -- no new node can ever
+                    // be reached (transferHeights fixed to false there above), so letting jobNodes
+                    // range over the rest would only let the solver explore placements it will
+                    // then find infeasible. Tasks can still move among its own existing replicas.
+                    for (int n : replicas_location[i]) validNodesList.add(n);
+                } else {
+                    for (int j = 0; j < nb_nodes; j++) {
+                        if (data_sizes[i] <= storage_capacity[j]) validNodesList.add(j);
+                    }
                 }
                 int[] validNodes = validNodesList.isEmpty()
                         ? ArrayUtils.array(0, nb_nodes - 1) // instance infaisable ; on laisse les autres contraintes le detecter

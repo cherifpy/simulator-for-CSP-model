@@ -750,6 +750,167 @@ class SchedulingUsingCSPIncrementalFreeNodesOnly(SchedulingUsingCSPIncremental):
     restrict_to_free_nodes = True
 
 
+class SchedulingUsingCSPAdaptive(SchedulingUsingCSPIncremental):
+    """
+    Incremental-first escalation: each new job is placed by Incremental (MainIncremental) first
+    to get a fast, near-free flow-time estimate F1. If escalating looks worth it, a second,
+    slower search (MainOnlineMultiObj by default) is given a budget of `adaptive_alpha * F1`
+    seconds to try to beat it for this SAME single job -- and only that job: like Incremental,
+    already-running jobs are never reconsidered here.
+
+    Two things this deliberately gets right, both learned the hard way earlier in this project:
+      - The escalation search's own decision time is not free. Its infrastructure snapshot
+        (nodes_free_time, replicas_locations) is taken only AFTER waiting out the budget --
+        i.e. at env.now == T + budget, not at the job's arrival T -- via a plain
+        `yield self.env.timeout(budget)` before the second solve, which lets every other SimPy
+        process (scheduling(), other arrivals, ongoing work finishing) advance for real during
+        that wait. schedulingUsingJavaCSP is then called with scheduling_start_time=env.now
+        (now T + budget), so toDict() anchors the escalation plan's absolute start/end times
+        there -- its flow time F2 (finish - job.arriving_time) already reflects the wait, with
+        no separate bookkeeping needed.
+      - Ongoing tasks/transfers are never touched or re-decided (same invariant as every other
+        approach here): the job stays in self.waiting_jobs, undispatched, for the whole budget
+        window, and only the one job's own placement is ever at stake -- nothing already
+        committed to other jobs is reopened.
+      - F1 itself is only ever used as a *prediction* to size the budget and as the baseline for
+        the gain check below -- by the time a decision is committed (whichever way it goes), the
+        world has moved on, so the final placement (Incremental fallback included) is always
+        computed fresh against the current state, never replayed from a now-stale probe.
+
+    Escalation is accepted only if it clears `adaptive_alpha` as a *relative gain* over F1:
+    (F1 - F2) / F1 > adaptive_alpha. Same knob for both the search budget and the acceptance bar
+    by design (one tunable parameter, not two) -- a job with F1 too small to be worth chasing
+    also gets too small a budget to plausibly clear the bar, so no separate "is F1 worth it?"
+    gate is needed on top.
+
+    The budget is capped at `adaptive_max_budget_s` (default 1200s = 20min): with short task
+    durations, alpha * F1 can be too small for the Java/Choco side (JVM startup alone eats a
+    real chunk of a very short budget) to get anywhere near a meaningful search on a 2-phase
+    epsilon-constraint problem -- so raise `adaptive_alpha` to get real solver time out of small
+    jobs too, and this cap keeps the rare very-large-F1 job from then running unboundedly long.
+    """
+    java_main_class = 'MainIncremental'
+    escalation_java_main_class = 'MainOnlineMultiObj'
+    adaptive_alpha = 0.2
+    adaptive_max_budget_s = 1200
+
+    def _flowTimeFromPlan(self, job, transfers_, works_):
+        """Flow time (finish - arrival) this job would realize under a given plan, from the
+        plan's own absolute start/end times (already anchored to whatever env.now was when the
+        solve that produced it ran -- see toDict() in utils/modelCSP.py). None if the job doesn't
+        appear in the plan at all (infeasible/empty solve)."""
+        end_times = []
+        for entries in transfers_.values():
+            for t_job_id, t_node, t_start, t_end, t_dur in entries:
+                if t_job_id == job.job_id:
+                    end_times.append(t_end)
+        for entries in works_.values():
+            for w_job_id, w_node, w_task, w_start, w_end, w_dur in entries:
+                if w_job_id == job.job_id:
+                    end_times.append(w_end)
+        if not end_times:
+            return None
+        return max(end_times) - job.arriving_time
+
+    def _placeSingleJob(self, job, nodes_free_time, java_main_class, solver_time_limit_s=None):
+        """One throwaway solve placing only `job`, using `java_main_class` -- exactly the same
+        request shape Incremental itself uses (see schedulingNewJob below), just with the main
+        class and (optionally) the solver time budget swapped out for the call and restored
+        right after, mirroring the pattern already used by SchedulingUsingCSPOnlineWarmStart."""
+        orig_java_main_class = self.java_main_class
+        orig_limit = self._config.get('solver_time_limit_s')
+        try:
+            self.java_main_class = java_main_class
+            if solver_time_limit_s is not None:
+                self._config['solver_time_limit_s'] = max(1, int(round(solver_time_limit_s)))
+            transfers_, works_, deletions_ = schedulingUsingJavaCSP(
+                self, [job], self.replicas_locations, nodes_free_time, self.env.now)
+        finally:
+            self.java_main_class = orig_java_main_class
+            if solver_time_limit_s is not None:
+                if orig_limit is None:
+                    self._config.pop('solver_time_limit_s', None)
+                else:
+                    self._config['solver_time_limit_s'] = orig_limit
+        flow_time = self._flowTimeFromPlan(job, transfers_, works_)
+        return transfers_, works_, deletions_, flow_time
+
+    def schedulingNewJob(self):
+
+        while True:
+            yield self.env.timeout(0.1)
+
+            if len(self.waiting_jobs) >= 1:
+
+                job = self.waiting_jobs[0]
+
+                nodes_free_time = self.nodesFreeTimeIncremental(self.ongoing_transfers, self.ongoing_works)
+                logger.debug("[%s] Master: probing Incremental for job %s (adaptive)", self.env.now, job.job_id)
+                transfers_, works_, deletions_, f1 = self._placeSingleJob(job, nodes_free_time, 'MainIncremental')
+
+                if f1 is None:
+                    logger.warning("[%s] Master: no CSP solution found for job %s (adaptive/incremental probe), will retry", self.env.now, job.job_id)
+                    if self._allJobsCompleted():
+                        break
+                    continue
+
+                alpha = self._config.get('adaptive_alpha', self.adaptive_alpha)
+                max_budget = self._config.get('adaptive_max_budget_s', self.adaptive_max_budget_s)
+                budget = min(alpha * f1, max_budget)
+
+                if budget > 0:
+                    logger.debug("[%s] Master: job %s F1=%.3f -> escalation budget=%.3f (snapshot at %.3f)",
+                                 self.env.now, job.job_id, f1, budget, self.env.now + budget)
+                    yield self.env.timeout(budget)
+
+                    nodes_free_time_2 = self.nodesFreeTimeIncremental(self.ongoing_transfers, self.ongoing_works)
+                    _, _, _, f2 = self._placeSingleJob(job, nodes_free_time_2, self.escalation_java_main_class,
+                                                        solver_time_limit_s=budget)
+
+                    gain = (f1 - f2) / f1 if f2 is not None else -1.0
+
+                    if f2 is not None and gain > alpha:
+                        logger.debug("[%s] Master: job %s escalation accepted (F1=%.3f -> F2=%.3f, gain=%.1f%%)",
+                                     self.env.now, job.job_id, f1, f2, gain * 100)
+                        # Re-solve one last time instead of reusing the just-computed plan: the
+                        # gain check itself takes zero extra time, but keeping the escalation
+                        # solve and the commit as two logically separate steps means a future
+                        # change adding any delay in between can't silently commit a stale plan.
+                        nodes_free_time_final = self.nodesFreeTimeIncremental(self.ongoing_transfers, self.ongoing_works)
+                        transfers_, works_, deletions_, _ = self._placeSingleJob(
+                            job, nodes_free_time_final, self.escalation_java_main_class, solver_time_limit_s=budget)
+                    else:
+                        logger.debug("[%s] Master: job %s escalation rejected (F1=%.3f, F2=%s), falling back to Incremental",
+                                     self.env.now, job.job_id, f1, f2)
+                        # State moved on during the wait -- re-probe Incremental fresh rather
+                        # than committing the now-stale pre-wait plan.
+                        nodes_free_time_fallback = self.nodesFreeTimeIncremental(self.ongoing_transfers, self.ongoing_works)
+                        transfers_, works_, deletions_, _ = self._placeSingleJob(
+                            job, nodes_free_time_fallback, 'MainIncremental')
+
+                if len(transfers_.keys()) > 0 and len(works_.keys()) > 0:
+                    for node in range(len(self.compute_nodes)):
+                        key = "node_" + str(node)
+                        if key in transfers_.keys() and len(transfers_[key]) > 0:
+                            for transfer in transfers_[key]:
+                                self.transfers[key].append(transfer)
+
+                            if key in works_.keys() and len(works_[key]) > 0:
+                                for work in works_[key]:
+                                    self.works[key].append(work)
+
+                        if key in deletions_.keys() and len(deletions_[key]) > 0:
+                            for deletion in deletions_[key]:
+                                self.deletions[key].append(deletion)
+
+                    self.waiting_jobs.pop(0)
+                else:
+                    logger.warning("[%s] Master: no CSP solution found for job %s (adaptive final), will retry", self.env.now, job.job_id)
+
+            if self._allJobsCompleted():
+                break
+
+
 class SchedulingUsingCSPSemiOnline:
     
     """Master node handles job submissions."""
