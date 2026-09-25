@@ -606,6 +606,55 @@ public class MainOnlineWarmStart {
                 // File missing/unreadable: debug prints just show 0 for "now" instead of crashing.
             }
 
+            // Jobs the Python side decided are too costly to move (large dataset already
+            // resident, close to finishing, or with a transfer currently in flight that can't be
+            // cancelled anyway): comma-separated job indices (same nb_data indexing as
+            // data_sizes/replicas_location), written to frozen_jobs.txt by
+            // _schedulingUsingJavaCSP_impl. A frozen job's tasks stay confined to nodes it's
+            // ALREADY resident on (no new node, so no new transfer -- see validNodes below), and
+            // its transferHeights are fixed to false on every OTHER node (see the transfer-task
+            // loop below) -- both trims real search space AND guarantees no network cost from
+            // moving it. File missing/empty (the default): no job is frozen, identical to
+            // behavior before this existed. See MainOnline.java's identical block for the full
+            // rationale (this file duplicates it since there's no shared base class in Java).
+            boolean[] isFrozen = new boolean[nb_data];
+            try {
+                String frozenText = readFile(MODEL_INPUTS_DIR + "/frozen_jobs.txt").trim();
+                if (!frozenText.isEmpty()) {
+                    for (String tok : frozenText.split(",")) {
+                        int idx = Integer.parseInt(tok.trim());
+                        if (idx >= 0 && idx < nb_data) isFrozen[idx] = true;
+                    }
+                }
+            } catch (Exception e) {
+                // File missing/unreadable: no job frozen (matches behavior before this existed).
+            }
+
+            // Confines an already-running job's task placement to a "powerful" subset of nodes
+            // (by bandwidth/compute_capacity) so a full replan solves faster -- see MainOnline
+            // .java's identical block for the full rationale.
+            Set<Integer> powerfulNodes = new HashSet<>();
+            try {
+                String powerfulText = readFile(MODEL_INPUTS_DIR + "/powerful_nodes.txt").trim();
+                if (!powerfulText.isEmpty()) {
+                    for (String tok : powerfulText.split(",")) powerfulNodes.add(Integer.parseInt(tok.trim()));
+                }
+            } catch (Exception e) {
+                // File missing/unreadable: no powerful-node restriction (matches prior behavior).
+            }
+            boolean[] isPowerRestricted = new boolean[nb_data];
+            try {
+                String restrictedText = readFile(MODEL_INPUTS_DIR + "/power_restricted_jobs.txt").trim();
+                if (!restrictedText.isEmpty()) {
+                    for (String tok : restrictedText.split(",")) {
+                        int idx = Integer.parseInt(tok.trim());
+                        if (idx >= 0 && idx < nb_data) isPowerRestricted[idx] = true;
+                    }
+                }
+            } catch (Exception e) {
+                // File missing/unreadable: no job power-restricted (matches prior behavior).
+            }
+
             // ----- MODEL -----
             Model model = new Model("Bag of Tasks Scheduling (Java)");
             /*Settings.dev()
@@ -632,18 +681,31 @@ public class MainOnlineWarmStart {
                     //IntVar durationVar = model.intVar(d);
                     IntVar end;// = model.intVar("end_transfer_d" + i + "_n" + j, (int) starting_times[j] + d, makespan,true);
                     
-                    BoolVar h;
-                    if (data_sizes[i] > storage_capacity[j]) {
-                        h = model.boolVar("height_transfer_d" + i + "_n" + j, false);
-                    }else{
-                        h = model.boolVar("height_transfer_d" + i + "_n" + j);
-                    }
                     // s/end must stay internally consistent (s + d = end) regardless of which
                     // branch set h, or the Task below is contradictory and the WHOLE model
                     // becomes infeasible the moment any single node is too small for any single
                     // job -- even though h=false already means this pair can never be selected.
                     final int jForResidentCheck = j;
                     boolean isResident = Arrays.stream(replicas_location[i]).anyMatch(n -> n == jForResidentCheck);
+
+                    BoolVar h;
+                    if (data_sizes[i] > storage_capacity[j]) {
+                        h = model.boolVar("height_transfer_d" + i + "_n" + j, false);
+                    } else if (isFrozen[i] && !isResident) {
+                        // Frozen and NOT already here: no new replica reaches this node. Cannot
+                        // also force h=true on every node it's ALREADY resident on -- h is tied by
+                        // reification to counters[j]>=1 (a task actually landing there), and
+                        // sum(counters) is constrained to equal this job's own task count
+                        // (wl.length) a few lines down. A job can easily be resident on MORE
+                        // nodes than it has tasks (replicas accumulate across many replans), so
+                        // forcing every one of those true would force sum(counters) past
+                        // wl.length -- outright infeasible. Leaving already-resident nodes free
+                        // (the else branch) lets the normal mechanism decide which of them still
+                        // keep a task this round.
+                        h = model.boolVar("height_transfer_d" + i + "_n" + j, false);
+                    } else {
+                        h = model.boolVar("height_transfer_d" + i + "_n" + j);
+                    }
                     if (isResident) {
                         // Data is already physically on this node from a previous solve: pin its
                         // storage-occupancy start to "now" (nodeStartingTimes[j]) instead of leaving
@@ -686,8 +748,26 @@ public class MainOnlineWarmStart {
                 // donc aucune tache liee a cette donnee ne peut s'y executer non plus.
                 // On retire directement ces noeuds du domaine de jobNodes.
                 List<Integer> validNodesList = new ArrayList<>();
-                for (int j = 0; j < nb_nodes; j++) {
-                    if (data_sizes[i] <= storage_capacity[j]) validNodesList.add(j);
+                if (isFrozen[i]) {
+                    // Frozen: confined to nodes it's ALREADY resident on -- no new node can ever
+                    // be reached (transferHeights fixed to false there above), so letting jobNodes
+                    // range over the rest would only let the solver explore placements it will
+                    // then find infeasible. Tasks can still move among its own existing replicas.
+                    for (int n : replicas_location[i]) validNodesList.add(n);
+                } else {
+                    for (int j = 0; j < nb_nodes; j++) {
+                        if (data_sizes[i] <= storage_capacity[j]) validNodesList.add(j);
+                    }
+                    if (isPowerRestricted[i] && !powerfulNodes.isEmpty()) {
+                        // Speed heuristic only: confine this already-running job to the powerful
+                        // subset, but ONLY if at least one storage-eligible node survives the
+                        // intersection -- never strand a job with a dataset too big for every
+                        // powerful node when a perfectly good non-powerful one exists. Silently
+                        // keep the full storage-eligible list (already built above) otherwise.
+                        List<Integer> restricted = new ArrayList<>();
+                        for (int n : validNodesList) if (powerfulNodes.contains(n)) restricted.add(n);
+                        if (!restricted.isEmpty()) validNodesList = restricted;
+                    }
                 }
                 int[] validNodes = validNodesList.isEmpty()
                         ? ArrayUtils.array(0, nb_nodes - 1) // instance infaisable ; on laisse les autres contraintes le detecter

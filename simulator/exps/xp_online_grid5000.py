@@ -42,6 +42,8 @@ from simulator import (
 from master_node_with_heterogeneous_nodes_csp import (
     SchedulingUsingCSPOnline,
     SchedulingUsingCSPOnlineMultiObj,
+    SchedulingUsingCSPOnlineWarmStart,
+    SchedulingUsingCSPOnlineMultiObjWarmStart,
     SchedulingUsingCSPIncremental,
     SchedulingUsingCSPIncrementalFreeNodesOnly,
     SchedulingUsingCSPAdaptive,
@@ -58,6 +60,16 @@ APPROACHES = {
     # epsilon_fraction of phase 1's result) via MainOnlineMultiObj.java. See
     # SchedulingUsingCSPOnlineMultiObj in master_node_with_heterogeneous_nodes_csp.py.
     "online_biobj": SchedulingUsingCSPOnlineMultiObj,
+    # Same full-replan Online approach (mono-objective, max flow time), but each replan seeds the
+    # Choco search with a warm start instead of starting cold: this scheduler's own last-decided
+    # plan for jobs it already knew about, plus Incremental's decision for the brand-new job(s).
+    # See SchedulingUsingCSPOnlineWarmStart in master_node_with_heterogeneous_nodes_csp.py.
+    "online_warmstart": SchedulingUsingCSPOnlineWarmStart,
+    # Combines online_biobj's epsilon-constraint bi-objective solve with online_warmstart's warm
+    # start (this scheduler's own last-decided plan for known jobs + a throwaway Incremental
+    # solve for the brand-new job(s)). See SchedulingUsingCSPOnlineMultiObjWarmStart's docstring
+    # and MainOnlineMultiObjWarmStart.java for exactly how phase 1 vs phase 2 are each seeded.
+    "online_biobj_warmstart": SchedulingUsingCSPOnlineMultiObjWarmStart,
     "incremental": SchedulingUsingCSPIncremental,
     # Hard filter: a node is only a candidate if nothing is ongoing on it right now (queued
     # backlog doesn't disqualify it -- nodes_free_time already accounts for that). Known to be
@@ -117,12 +129,34 @@ def parse_args():
                               "frozen for the solve -- no new replica, no move, kept exactly where "
                               "it is (see SchedulingUsingCSPOnline docs / frozen_jobs.txt). "
                               "Default: unset (no job frozen, identical to before this existed).")
+    parser.add_argument("--freeze-remaining-time-threshold", type=float, default=None,
+                         help="online/online_biobj/adaptive: a not-finished job already resident "
+                              "somewhere whose own remaining work (nb_tasks_not_started * "
+                              "task_duration) is at or below this threshold is frozen for the "
+                              "solve -- close enough to finishing that reconsidering it has little "
+                              "left to gain. Independent of --freeze-large-jobs-threshold; a job "
+                              "frozen by either criterion is frozen. Default: unset.")
+    parser.add_argument("--freeze-jobs-with-ongoing-transfer", action="store_true",
+                         help="online/online_biobj/adaptive: freezes any not-finished job that "
+                              "has at least one transfer currently IN FLIGHT -- it can't be "
+                              "cancelled anyway, so this stops the solver from 'changing its mind' "
+                              "about that job's placement mid-transfer, which otherwise leaves an "
+                              "orphaned, never-cleaned-up replica once the abandoned transfer "
+                              "lands (a real leak confirmed via events_history.json). Independent "
+                              "of the other two --freeze-* flags. Default: off.")
+    parser.add_argument("--reschedule-top-fraction", type=float, default=None,
+                         help="online/online_biobj/adaptive: confines every already-running "
+                              "job's reconsideration to the top fraction (0-1) of nodes ranked by "
+                              "bandwidth/compute_capacity (a brand-new arrival is never "
+                              "restricted, and a job falls back to the full storage-eligible node "
+                              "set if the powerful subset can't fit its dataset). "
+                              "Default: unset (no restriction, identical to before this existed).")
     return parser.parse_args()
 
 
 def run(args):
     master_class = APPROACHES[args.approach]
-    if args.approach == "online_biobj":
+    if args.approach in ("online_biobj", "online_biobj_warmstart"):
         master_class.epsilon_fraction = args.epsilon_fraction
         master_class.epsilon_phase1_fraction = args.epsilon_phase1_fraction
         master_class.epsilon_max_cap = args.epsilon_max_cap
@@ -140,6 +174,9 @@ def run(args):
     config["adaptive_alpha"] = args.adaptive_alpha
     config["adaptive_max_budget_s"] = args.adaptive_max_budget
     config["freeze_large_jobs_threshold_mb"] = args.freeze_large_jobs_threshold
+    config["freeze_remaining_time_threshold"] = args.freeze_remaining_time_threshold
+    config["freeze_jobs_with_ongoing_transfer"] = args.freeze_jobs_with_ongoing_transfer
+    config["reschedule_top_fraction"] = args.reschedule_top_fraction
 
     results_dir = args.results_dir or os.path.join(
         SIMULATOR_DIR, "results-grid5000",
@@ -171,7 +208,10 @@ def run(args):
                 "adaptive_alpha": getattr(master_class, "adaptive_alpha", None),
                 "adaptive_max_budget_s": getattr(master_class, "adaptive_max_budget_s", None),
                 "escalation_java_main_class": getattr(master_class, "escalation_java_main_class", None),
-                "freeze_large_jobs_threshold_mb": args.freeze_large_jobs_threshold},
+                "freeze_large_jobs_threshold_mb": args.freeze_large_jobs_threshold,
+                "freeze_remaining_time_threshold": args.freeze_remaining_time_threshold,
+                "freeze_jobs_with_ongoing_transfer": args.freeze_jobs_with_ongoing_transfer,
+                "reschedule_top_fraction": args.reschedule_top_fraction},
         config=config, nodes_config=nodes_config)
 
     random.seed(args.seed)

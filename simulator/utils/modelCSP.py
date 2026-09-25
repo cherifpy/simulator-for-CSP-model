@@ -369,21 +369,78 @@ def _schedulingUsingJavaCSP_impl(master_node, jobs: list, replicas_locations: di
 
     # Jobs too costly to move, left fully untouched by this solve (see frozen_jobs.txt in
     # MainOnline.java/MainOnlineMultiObj.java: no new replica, no move, existing replica(s) kept
-    # exactly as-is). Opt-in via master_node._config['freeze_large_jobs_threshold_mb'] -- a job
-    # already resident somewhere (there has to be a place to freeze it TO) whose dataset_size is
-    # at or above the threshold gets frozen instead of being fully re-decided like every other
-    # not-finished job; a job with no completed residency yet (data still mid-transfer) is never
-    # frozen, since forcing it to "stay" nowhere isn't meaningful. Threshold unset (the default):
-    # no job is frozen, identical to behavior before this existed. Local indices here match
-    # jobs_data's own order, the same indexing data_sizes/nb_data use on the Java side.
+    # exactly as-is). A job gets frozen if ANY opt-in criterion below is configured and satisfied:
+    #   - freeze_large_jobs_threshold_mb: already fully resident somewhere, dataset_size at or
+    #     above this threshold -- too costly (network-wise) to move.
+    #   - freeze_remaining_time_threshold: already fully resident somewhere, its own remaining
+    #     NotStarted work (nb_tasks * task_duration, i.e. ignoring node speed since that's not
+    #     decided until placement) at or below this threshold -- close enough to finishing that
+    #     reconsidering it has almost nothing left to gain.
+    #   - freeze_jobs_with_ongoing_transfer (bool): has at least one transfer currently IN FLIGHT
+    #     (master_node.ongoing_transfers) -- always on when true, no threshold to tune. An
+    #     in-flight transfer can never be cancelled (see startTransfer/the "never touch already-
+    #     started work" invariant), so a later replan "reconsidering" this job away from that
+    #     node can't actually stop it either: the transfer lands regardless, but nothing then
+    #     schedules its deletion once the plan has moved on -- a real, observed leak (confirmed
+    #     via events_history.json: a job's data landing on a node no task of it ever used, kept
+    #     forever). Freezing it here means the solver doesn't bother "changing its mind" mid-
+    #     transfer in the first place. Unlike the other two, this doesn't require prior COMPLETED
+    #     residency -- replicas_location[i] on the Java side already folds in in-flight nodes
+    #     (see the ongoing_nodes_by_job fold above), so validNodes correctly includes the pending
+    #     node once frozen.
+    # All unset (the default): no job is frozen, identical to behavior before any of this existed.
+    # Local indices here match jobs_data's own order, the same indexing data_sizes/nb_data use on
+    # the Java side.
     freeze_threshold = master_node._config.get('freeze_large_jobs_threshold_mb')
+    freeze_remaining_time_threshold = master_node._config.get('freeze_remaining_time_threshold')
+    freeze_ongoing_transfer = master_node._config.get('freeze_jobs_with_ongoing_transfer', False)
+    ongoing_transfer_job_ids = {
+        ongoing[0] for ongoing in master_node.ongoing_transfers.values() if ongoing is not None
+    }
     frozen_indices = []
-    if freeze_threshold is not None:
+    if freeze_threshold is not None or freeze_remaining_time_threshold is not None or freeze_ongoing_transfer:
         for idx, jd in enumerate(jobs_data):
-            if jd['dataset_size'] >= freeze_threshold and replicas_locations.get(jd['job_id']):
+            has_ongoing_transfer = freeze_ongoing_transfer and jd['job_id'] in ongoing_transfer_job_ids
+            already_resident = bool(replicas_locations.get(jd['job_id']))
+            large_enough = already_resident and freeze_threshold is not None and jd['dataset_size'] >= freeze_threshold
+            almost_done = (already_resident and freeze_remaining_time_threshold is not None
+                           and jd['nb_tasks'] * jd['task_duration'] <= freeze_remaining_time_threshold)
+            if large_enough or almost_done or has_ongoing_transfer:
                 frozen_indices.append(idx)
     with open(os.path.join(model_dir, "inputs", "frozen_jobs.txt"), "w") as f:
         f.write(",".join(str(i) for i in frozen_indices))
+
+    # Confines already-running jobs' reconsideration to a "powerful" subset of nodes (by
+    # bandwidth/compute_capacity -- NOTE compute_capacity is a DURATION MULTIPLIER, so lower is
+    # actually faster/more powerful, hence the division rather than a product) so a full replan
+    # touches less of the infra and solves faster -- without ever blocking a brand-new arrival,
+    # which must stay free to land anywhere: only jobs NOT in master_node.waiting_jobs are
+    # restricted. Opt-in via master_node._config['reschedule_top_fraction'] (0-1); unset (the
+    # default): no node list written, no job restricted, identical to before this existed.
+    # Java falls back to the full storage-eligible node set per-job if intersecting with the
+    # powerful subset would otherwise leave that job with nowhere feasible to go -- this is a
+    # speed heuristic, never allowed to manufacture a "no solution" that isn't real.
+    reschedule_top_fraction = master_node._config.get('reschedule_top_fraction')
+    powerful_node_ids = []
+    if reschedule_top_fraction is not None:
+        scored = sorted(
+            range(len(master_node.compute_nodes)),
+            key=lambda n: master_node.compute_nodes[n].bandwidth / master_node.compute_nodes[n].compute_capacity,
+            reverse=True,
+        )
+        k = max(1, int(round(reschedule_top_fraction * len(scored))))
+        powerful_node_ids = scored[:k]
+    with open(os.path.join(model_dir, "inputs", "powerful_nodes.txt"), "w") as f:
+        f.write(",".join(str(n) for n in powerful_node_ids))
+
+    waiting_job_ids = {j.job_id for j in getattr(master_node, 'waiting_jobs', [])}
+    power_restricted_indices = []
+    if reschedule_top_fraction is not None:
+        for idx, jd in enumerate(jobs_data):
+            if jd['job_id'] not in waiting_job_ids:
+                power_restricted_indices.append(idx)
+    with open(os.path.join(model_dir, "inputs", "power_restricted_jobs.txt"), "w") as f:
+        f.write(",".join(str(i) for i in power_restricted_indices))
 
     # Per-scheduler-class solver time budget (e.g. Online vs Incremental can be compared at
     # different budgets); Main.java falls back to 120s if this file is missing/unreadable.

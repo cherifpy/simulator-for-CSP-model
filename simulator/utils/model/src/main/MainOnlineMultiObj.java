@@ -629,6 +629,36 @@ public class MainOnlineMultiObj {
                 // File missing/unreadable: no job frozen (matches behavior before this existed).
             }
 
+            // Confines an already-running job's task placement to a "powerful" subset of nodes
+            // (by bandwidth/compute_capacity) so a full replan solves faster -- powerfulNodes is
+            // the allowed set, powerRestricted marks which jobs (never a brand-new arrival) it
+            // applies to. Both written by _schedulingUsingJavaCSP_impl. Applied per-job below
+            // (validNodes) with a fallback to the full storage-eligible set if the intersection
+            // would otherwise be empty -- this is a speed heuristic and must never manufacture an
+            // infeasibility that wasn't real. Either file missing/empty (the default): no
+            // restriction, identical to before this existed.
+            Set<Integer> powerfulNodes = new HashSet<>();
+            try {
+                String powerfulText = readFile(MODEL_INPUTS_DIR + "/powerful_nodes.txt").trim();
+                if (!powerfulText.isEmpty()) {
+                    for (String tok : powerfulText.split(",")) powerfulNodes.add(Integer.parseInt(tok.trim()));
+                }
+            } catch (Exception e) {
+                // File missing/unreadable: no powerful-node restriction (matches prior behavior).
+            }
+            boolean[] isPowerRestricted = new boolean[nb_data];
+            try {
+                String restrictedText = readFile(MODEL_INPUTS_DIR + "/power_restricted_jobs.txt").trim();
+                if (!restrictedText.isEmpty()) {
+                    for (String tok : restrictedText.split(",")) {
+                        int idx = Integer.parseInt(tok.trim());
+                        if (idx >= 0 && idx < nb_data) isPowerRestricted[idx] = true;
+                    }
+                }
+            } catch (Exception e) {
+                // File missing/unreadable: no job power-restricted (matches prior behavior).
+            }
+
             // ----- MODEL -----
             Model model = new Model("Bag of Tasks Scheduling (Java)");
             /*Settings.dev()
@@ -762,6 +792,16 @@ public class MainOnlineMultiObj {
                 } else {
                     for (int j = 0; j < nb_nodes; j++) {
                         if (data_sizes[i] <= storage_capacity[j]) validNodesList.add(j);
+                    }
+                    if (isPowerRestricted[i] && !powerfulNodes.isEmpty()) {
+                        // Speed heuristic only: confine this already-running job to the powerful
+                        // subset, but ONLY if at least one storage-eligible node survives the
+                        // intersection -- never strand a job with a dataset too big for every
+                        // powerful node when a perfectly good non-powerful one exists. Silently
+                        // keep the full storage-eligible list (already built above) otherwise.
+                        List<Integer> restricted = new ArrayList<>();
+                        for (int n : validNodesList) if (powerfulNodes.contains(n)) restricted.add(n);
+                        if (!restricted.isEmpty()) validNodesList = restricted;
                     }
                 }
                 int[] validNodes = validNodesList.isEmpty()

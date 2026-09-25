@@ -53,6 +53,7 @@ import org.chocosolver.solver.Solution;
 import org.chocosolver.solver.Solver;
 import org.chocosolver.solver.constraints.Constraint;
 import org.chocosolver.solver.constraints.Propagator;
+import org.chocosolver.solver.objective.ParetoMaximizer;
 import org.chocosolver.solver.exception.ContradictionException;
 import org.chocosolver.solver.search.limits.ICounter;
 import org.chocosolver.solver.search.loop.lns.neighbors.INeighbor;
@@ -73,7 +74,7 @@ import java.util.List;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
-public class MainOnline {
+public class MainOnlineMultiObjWarmStart {
 
     // Portable base path: the Python caller (utils/modelCSP.py) always launches this JVM with
     // its working directory set to the `simulator/` folder, so paths built from here stay valid
@@ -438,14 +439,14 @@ public class MainOnline {
             }
         }
 
-        public static void writeNodeConfigCSV(List<MainOnline.NodeConfig> nodes, String path) throws Exception {
+        public static void writeNodeConfigCSV(List<MainOnlineMultiObjWarmStart.NodeConfig> nodes, String path) throws Exception {
             FileWriter writer = new FileWriter(path);
 
             // header
             writer.write("bandwidth,computation_nodes,energy_consumption,storage_capacity\n");
 
             // rows
-            for (MainOnline.NodeConfig n : nodes) {
+            for (MainOnlineMultiObjWarmStart.NodeConfig n : nodes) {
                 writer.write(
                         n.bandwidth + "," +
                                 n.computationNodes + "," +
@@ -494,7 +495,7 @@ public class MainOnline {
             writer.close();
         }
 
-        public static SchedulingResult runScheduler(List<MainOnline.Job>  jobs,int nb_nodes, int nb_data, int[] data_sizes, int[][] works, int[] bandwidths, double[] cpus, int[] storage_capacity, double[] starting_times, int[][]  replicas_location, Model[] models, int pos, boolean solve, double[] job_arriving_times) {
+        public static SchedulingResult runScheduler(List<MainOnlineMultiObjWarmStart.Job>  jobs,int nb_nodes, int nb_data, int[] data_sizes, int[][] works, int[] bandwidths, double[] cpus, int[] storage_capacity, double[] starting_times, int[][]  replicas_location, Model[] models, int pos, boolean solve, double[] job_arriving_times, double[] node_energy_consumption) {
             final int CPU_UNIT = 1; // to scale cpu speeds
 
             // starting_times[j] (how long node j stays busy) comes from the Python simulator as
@@ -668,6 +669,25 @@ public class MainOnline {
             Task[][] transferTasks = new Task[nb_nodes][nb_data];
             BoolVar[][] transferHeights = new BoolVar[nb_nodes][nb_data];
 
+            // Per-(node,data) candidate transfer's energy cost, computed as an integer constant
+            // up front (mirrors Tracker.log_transfer / compute_transfer_energy exactly: sender +
+            // receiver*duration + network) since data_sizes[i]/bandwidths[j]/node_energy_consumption[j]
+            // are all already-known constants once (i,j) is fixed -- the only thing decided by
+            // the solver is WHETHER this candidate is selected (transferHeights[j][i]), not its
+            // cost. Filled in alongside `d` below; used to build the energy objective further down.
+            int[][] energyContrib = new int[nb_nodes][nb_data];
+            double senderEnergy = 0.0, networkEnergy = 0.0;
+            try {
+                List<String> energyLines = readLines(MODEL_INPUTS_DIR + "/energy_config.txt");
+                if (energyLines.size() >= 2) {
+                    senderEnergy = Double.parseDouble(energyLines.get(0).trim());
+                    networkEnergy = Double.parseDouble(energyLines.get(1).trim());
+                }
+            } catch (Exception e) {
+                // File missing/unreadable: energy terms default to 0 (matches config.json's own
+                // 0.0 defaults when master_energy_consumption/network_energy_per_transfer are unset).
+            }
+
             // Create transfer tasks: one per (node, data)
 
             boolean free_only = false;
@@ -735,10 +755,11 @@ public class MainOnline {
                         end = model.intVar("end_transfer_d" + i + "_n" + j, lb + d, makespan, true);
                     }
                     IntVar durationVar = model.intVar(d);
-                    
+
                     Task t = new Task(s, durationVar, end);
                     transferTasks[j][i] = t;
                     transferHeights[j][i] = h;
+                    energyContrib[j][i] = (int) Math.round(senderEnergy + node_energy_consumption[j] * d + networkEnergy);
                 }
             }
 
@@ -1000,7 +1021,7 @@ public class MainOnline {
             // ----- OBJECTIVE Make span-----
             //makespan var and ensure it's >= all end
             boolean makespan_obj = false;
-            final IntVar[] objectives = new IntVar[3];
+            final IntVar[] objectives = new IntVar[4];
             if (makespan_obj) {
                 /*IntVar makespanVar = model.intVar("makespan", 0, makespan);
 
@@ -1045,6 +1066,29 @@ public class MainOnline {
                     if (jobs.get(i).job_id > jobs.get(newJobIdx).job_id) newJobIdx = i;
                 }
                 objectives[2] = all_flow_time[newJobIdx];
+
+                // Objective 3: total transfer energy (sender + receiver*duration + network,
+                // summed over every SELECTED (node,data) candidate) -- see energyContrib above.
+                // Linear in the transferHeights BoolVars since each candidate's own cost is a
+                // known constant once (i,j) is fixed; only which candidates get chosen is a
+                // decision. Upper-bounded by the (unreachable in practice) sum of EVERY
+                // candidate's cost, since selecting fewer can only reduce the total.
+                long energyUpperBoundLong = 0;
+                for (int[] row : energyContrib) for (int v : row) energyUpperBoundLong += v;
+                int energyUpperBound = (int) Math.min(energyUpperBoundLong, Integer.MAX_VALUE / 2);
+                IntVar energyVar = model.intVar("total_energy", 0, energyUpperBound, true);
+                IntVar[] transferHeightsFlat = new IntVar[nb_nodes * nb_data];
+                int[] energyCoeffsFlat = new int[nb_nodes * nb_data];
+                int ecIdx = 0;
+                for (int j = 0; j < nb_nodes; j++) {
+                    for (int i = 0; i < nb_data; i++) {
+                        transferHeightsFlat[ecIdx] = transferHeights[j][i];
+                        energyCoeffsFlat[ecIdx] = energyContrib[j][i];
+                        ecIdx++;
+                    }
+                }
+                model.scalar(transferHeightsFlat, energyCoeffsFlat, "=", energyVar).post();
+                objectives[3] = energyVar;
             }
 
             //----- SOLVER -----
@@ -1059,6 +1103,97 @@ public class MainOnline {
             // TEMP: hints disabled to check whether they're locking in the job11-style idle gaps
             // hints(nb_nodes, nb_data, data_sizes, works, cpus, solver, jobNodes);
 
+            //----- WARM START (optional) -----
+            // Seeds the search with a known-good solution -- Incremental's decision for the
+            // newly-arrived job(s) plus this scheduler's own last-known plan for jobs it already
+            // knew about (ported verbatim from MainOnlineWarmStart.java). There is only ONE
+            // solver.setSearch(...) call below, shared by both phases, so this warmStartSolution
+            // becomes BOTH phases' value-selector hint -- unlike the original bi-objective file,
+            // where that one shared call used model.getSolver().defaultSolution() (which Choco
+            // keeps live-updated to the running best solution, so phase 2 saw phase 1's own
+            // result there). Swapping in this fixed external solution means phase 2 is seeded
+            // from the SAME external hint as phase 1, not from phase 1's own better answer -- a
+            // real behavior change versus plain MainOnlineMultiObjWarmStart, traded for a warm
+            // start at all; the value selector is only one tie-breaking heuristic among many the
+            // LNS search still relies on, so this doesn't stop either phase from improving past
+            // it, exactly as already observed for MainOnlineWarmStart.java's own single-phase
+            // search. IntDomainLast needs a Solution explicitly constructed over the exact
+            // variables we intend to set
+            // (Solver's own defaultSolution() does NOT implicitly cover every model variable --
+            // e.g. transfer starts aren't in its default set -- attempting setIntVal on one
+            // throws). Falls back to plain (cold-start) search entirely if the file is
+            // missing/empty/invalid, or if an individual value turns out stale (out of the
+            // freshly-computed domain for this solve) -- warm start must never be required for
+            // correctness.
+            Solution warmStartSolution = new Solution(model, decisionVars);
+            // IntDomainLast unconditionally calls Solution.getIntVal() for every variable it is
+            // ever asked to decide -- it does NOT gracefully skip a variable that was simply never
+            // given a value, it throws. So every one of decisionVars needs SOME recorded value
+            // (its own lower bound, as an inert default) before the search runs; the warm-start
+            // values read from warm_start.json below then override this default for whichever
+            // subset of variables we actually have a real hint for.
+            for (IntVar v : decisionVars) {
+                warmStartSolution.setIntVal(v, v.getLB());
+            }
+            try {
+                String warmStartText = readFile(MODEL_INPUTS_DIR + "/warm_start.json").trim();
+                if (!warmStartText.isEmpty()) {
+                    JSONObject warmStart = new JSONObject(warmStartText);
+                    int applied = 0, skipped = 0;
+
+                    if (warmStart.has("job_placements")) {
+                        JSONArray placements = warmStart.getJSONArray("job_placements");
+                        for (int p = 0; p < placements.length(); p++) {
+                            JSONObject entry = placements.getJSONObject(p);
+                            int i = entry.getInt("job_index");
+                            int k = entry.getInt("task_index");
+                            int node = entry.getInt("node");
+                            int start = entry.getInt("start");
+                            if (i < 0 || i >= nb_data || k < 0 || k >= works[i].length) { skipped++; continue; }
+                            try {
+                                if (jobNodes[i][k].contains(node)) {
+                                    warmStartSolution.setIntVal(jobNodes[i][k], node);
+                                    applied++;
+                                } else skipped++;
+                                if (jobStarts[i][k].contains(start)) {
+                                    warmStartSolution.setIntVal(jobStarts[i][k], start);
+                                    applied++;
+                                } else skipped++;
+                            } catch (Exception e) {
+                                skipped++;
+                            }
+                        }
+                    }
+
+                    if (warmStart.has("transfers")) {
+                        JSONArray transfersWs = warmStart.getJSONArray("transfers");
+                        for (int t = 0; t < transfersWs.length(); t++) {
+                            JSONObject entry = transfersWs.getJSONObject(t);
+                            int i = entry.getInt("job_index");
+                            int node = entry.getInt("node");
+                            int start = entry.getInt("start");
+                            if (i < 0 || i >= nb_data || node < 0 || node >= nb_nodes) { skipped++; continue; }
+                            try {
+                                if (transferHeights[node][i].contains(1)) {
+                                    warmStartSolution.setIntVal(transferHeights[node][i], 1);
+                                    applied++;
+                                } else skipped++;
+                                IntVar tStart = transferTasks[node][i].getStart();
+                                if (tStart.contains(start)) {
+                                    warmStartSolution.setIntVal(tStart, start);
+                                    applied++;
+                                } else skipped++;
+                            } catch (Exception e) {
+                                skipped++;
+                            }
+                        }
+                    }
+                    System.out.println("### Warm start loaded: " + applied + " value(s) applied, " + skipped + " skipped (stale/out-of-domain).");
+                }
+            } catch (Exception e) {
+                // File missing/unreadable/malformed: proceed without a warm start.
+            }
+
             //solver.setNoGoodRecordingFromRestarts();
             ArraySort<?> sorter = new ArraySort<>(nb_nodes, false, true);
             int[] cidx = ArrayUtils.array(0, nb_nodes - 1);
@@ -1066,7 +1201,7 @@ public class MainOnline {
             solver.setSearch(
                     Search.lastConflict(
                             Search.intVarSearch(new InputOrder<>(model),
-                                    new IntDomainLast(model.getSolver().defaultSolution(),
+                                    new IntDomainLast(warmStartSolution,
                                             new IntValueSelector() {
                                                 @Override
                                                 public int selectValue(IntVar intVar) {
@@ -1140,12 +1275,44 @@ public class MainOnline {
                     + " (0=sum all, 1=max all, 2=new job's own flow time)");
 
             boolean[] found = {false};
+            // Captured INSIDE onSolution (where every variable is guaranteed instantiated, since
+            // a solution was just accepted) rather than read from objectives[1] AFTER
+            // findOptimalSolution returns -- when the time limit cuts the search off mid-branch
+            // (not via exhaustive proof of optimality), the model's live variable state reflects
+            // wherever the search currently is, NOT necessarily the last accepted solution, and
+            // can be a not-yet-fully-instantiated intermediate node. Reading objectives[1]
+            // .getValue() directly in that case throws IllegalStateException (seen in practice
+            // on some -- not all -- runs, since it depends on the exact search state when the
+            // clock runs out). epsilon-constraint mode (below) needs phase 1's best value to set
+            // up phase 2's cap, so it must use this holder, not objectives[1] directly.
+            int[] lastMaxFlow = {-1};
+            int[] lastEnergy = {-1};
+            // Set right before phase 2 starts (epsilon-constraint mode only) so onSolution can
+            // report, on phase 2's very FIRST accepted solution, whether the warm start actually
+            // took (i.e. that first solution's maxFlowTime should equal phase 1's own, since the
+            // search is expected to re-derive phase 1's exact assignment before improving energy
+            // any further -- see the warm-start comment where phase 2 is set up below).
+            boolean[] inPhase2 = {false};
+            boolean[] phase2FirstSolutionSeen = {false};
+            int[] phase1FinalMaxFlow = {-1};
             solver.onSolution(() -> {
 
                     System.out.println("### DIAG solution found: sumFlowTime=" + objectives[0].getValue()
                             + " maxFlowTime=" + objectives[1].getValue()
-                            + " newJobFlowTime=" + objectives[2].getValue() + " nb_data=" + nb_data + " t=" + solver.getTimeCount());
+                            + " newJobFlowTime=" + objectives[2].getValue()
+                            + " energy=" + objectives[3].getValue() + " nb_data=" + nb_data + " t=" + solver.getTimeCount());
                     found[0] = true;
+                    lastMaxFlow[0] = objectives[1].getValue();
+                    if (inPhase2[0] && !phase2FirstSolutionSeen[0]) {
+                        phase2FirstSolutionSeen[0] = true;
+                        boolean warmStartHeld = lastMaxFlow[0] == phase1FinalMaxFlow[0];
+                        System.out.println("### EPSILON-CONSTRAINT: phase2's FIRST solution has "
+                                + "maxFlowTime=" + lastMaxFlow[0] + " (phase1's was " + phase1FinalMaxFlow[0]
+                                + ") -- warm start " + (warmStartHeld ? "HELD (search re-derived phase 1's "
+                                + "exact solution before improving energy)" : "DID NOT hold exactly (search "
+                                + "found a different, still cap-respecting point first instead)") + " ###");
+                    }
+                    lastEnergy[0] = objectives[3].getValue();
 
                     transfersList.clear();
                     worksList.clear();
@@ -1215,9 +1382,190 @@ public class MainOnline {
                         j, starting_times[j], nodeStartingTimes[j], currentSimTime + nodeStartingTimes[j]);
             }
 
-            solver.findOptimalSolution(objectives[objectiveChoice], false);
-            if (!found[0]) {
-                System.out.println("No solution found");
+            // Multi-objective mode, read from multi_objective.txt: 0/absent = ordinary
+            // single-objective findOptimalSolution (unchanged); 1 = raw Pareto-front search over
+            // {max flow time, energy} via ParetoMaximizer -- empirically found to perform far
+            // WORSE than single-objective search within the same budget on real scenarios (the
+            // existing LNS/restart search strategy is tuned to aggressively descend ONE scalar
+            // objective, and doesn't explore a 2D dominance frontier well: on a 5-job real
+            // scenario it got stuck oscillating between 2 points, both much worse than
+            // single-objective's result, despite exploring 200k+ solutions in 600s); 2 =
+            // epsilon-constraint, a two-phase approach that reuses the SAME well-tuned
+            // single-objective search machinery for both phases instead: phase 1 minimizes max
+            // flow time as usual, phase 2 then minimizes energy subject to max flow time staying
+            // within an epsilon slack of phase 1's result -- see the mode==2 branch below.
+            int multiObjectiveMode = 0;
+            try {
+                String multiObjectiveText = readFile(MODEL_INPUTS_DIR + "/multi_objective.txt").trim();
+                if (!multiObjectiveText.isEmpty()) multiObjectiveMode = Integer.parseInt(multiObjectiveText);
+            } catch (Exception e) {
+                // File missing/unreadable: keep the default (0 = single-objective search).
+            }
+
+            if (multiObjectiveMode == 1) {
+                System.out.println("### Multi-objective mode: searching for the Pareto front over "
+                        + "{max flow time, energy} ###");
+                // ParetoMaximizer only MAXIMIZES -- model.neg(...) views let it maximize the
+                // negated vars, equivalent to minimizing the originals, without adding real
+                // constraints or duplicating the actual objective IntVars.
+                ParetoMaximizer pareto = new ParetoMaximizer(new IntVar[]{model.neg(objectives[1]), model.neg(objectives[3])});
+                model.post(new Constraint("PARETO_MAXFLOW_ENERGY", pareto));
+                // Posting it as a constraint only wires its PROPAGATION (pruning dominated
+                // points during search) -- its own onSolution() bookkeeping (what actually
+                // fills getParetoFront()) is a SEPARATE ISearchMonitor hook that must be plugged
+                // explicitly, or the front comes back empty even though solutions were found.
+                solver.plugMonitor(pareto);
+                while (solver.solve()) { /* pareto's own onSolution() records each non-dominated point */ }
+                if (!found[0]) {
+                    System.out.println("No solution found");
+                }
+                List<Solution> paretoFront = pareto.getParetoFront();
+                System.out.println("### PARETO FRONT: " + paretoFront.size() + " solution(s) ###");
+                for (Solution sol : paretoFront) {
+                    System.out.println("  maxFlowTime=" + sol.getIntVal(objectives[1])
+                            + "  energy=" + sol.getIntVal(objectives[3]));
+                }
+            } else if (multiObjectiveMode == 2) {
+                // epsilon_fraction: how much worse than phase 1's own best max-flow-time result
+                // phase 2 is allowed to make it, as a FRACTION of that result (not an absolute
+                // value -- flow times vary wildly in magnitude across scenarios). Default 10%.
+                double epsilonFraction = 0.1;
+                try {
+                    String t = readFile(MODEL_INPUTS_DIR + "/epsilon_fraction.txt").trim();
+                    if (!t.isEmpty()) epsilonFraction = Double.parseDouble(t);
+                } catch (Exception e) { /* default 0.1 */ }
+                // How the total solver_time_limit.txt budget splits between the two phases.
+                // Default even split; phase 1 usually doesn't need as long as phase 2 in
+                // practice (it's a strictly easier, already well-tuned single-objective search),
+                // but an even split is a safe, simple default.
+                double phase1Fraction = 0.5;
+                try {
+                    String t = readFile(MODEL_INPUTS_DIR + "/epsilon_phase1_fraction.txt").trim();
+                    if (!t.isEmpty()) phase1Fraction = Double.parseDouble(t);
+                } catch (Exception e) { /* default 0.5 */ }
+                // Optional absolute ceiling on phase 2's cap -- e.g. a baseline (Incremental's)
+                // own max flow time result from a prior run, so this approach never needs to
+                // accept worse flow time than that trivial baseline already gets for free just
+                // because epsilonFraction's relative slack happened to push past it (which
+                // otherwise silently gets more likely the less phase 1's own budget lets it
+                // converge -- see the large-tier run where a 1h/1h split let the relative cap
+                // drift to +18.5% over Online's own 2h result). Absent -> no ceiling, unchanged
+                // behavior.
+                Double epsilonMaxCap = null;
+                try {
+                    String t = readFile(MODEL_INPUTS_DIR + "/epsilon_max_cap.txt").trim();
+                    if (!t.isEmpty()) epsilonMaxCap = Double.parseDouble(t);
+                } catch (Exception e) { /* default: no ceiling */ }
+
+                int phase1Seconds = Math.max(1, (int) Math.round(timeLimitSeconds * phase1Fraction));
+                int phase2Seconds = Math.max(1, timeLimitSeconds - phase1Seconds);
+                System.out.println("### EPSILON-CONSTRAINT mode: phase1 (minimize max flow time) budget="
+                        + phase1Seconds + "s, phase2 (minimize energy under flow-time cap) budget="
+                        + phase2Seconds + "s, epsilon fraction=" + epsilonFraction + " ###");
+
+                solver.limitTime(phase1Seconds + "s");
+                solver.findOptimalSolution(objectives[1], false);
+                if (!found[0]) {
+                    System.out.println("No solution found (phase 1)");
+                } else {
+                    // From the holder (captured inside onSolution, always fully instantiated
+                    // there), NOT objectives[1].getValue() directly -- if the time limit cut the
+                    // search off mid-branch rather than via an exhaustive optimality proof, the
+                    // model's LIVE variable state reflects wherever the search currently sits,
+                    // which is not necessarily the last accepted solution and can throw
+                    // IllegalStateException ("not instantiated") depending on the exact search
+                    // state when the clock ran out.
+                    int bestMaxFlow = lastMaxFlow[0];
+                    int epsilonAbs = Math.max(1, (int) Math.round(bestMaxFlow * epsilonFraction));
+                    int cap = bestMaxFlow + epsilonAbs;
+                    if (epsilonMaxCap != null) {
+                        // Never below bestMaxFlow itself: phase 1 already PROVED that value is
+                        // achievable, so a ceiling under it would make phase 2's own constraint
+                        // infeasible from the start. If the ceiling is that tight, phase 2 simply
+                        // gets zero slack (cap == bestMaxFlow) instead of crashing.
+                        int ceilingInt = (int) Math.round(epsilonMaxCap);
+                        int cappedCap = Math.max(bestMaxFlow, Math.min(cap, ceilingInt));
+                        if (cappedCap != cap) {
+                            System.out.println("### EPSILON-CONSTRAINT: relative cap " + cap
+                                    + " exceeds the absolute ceiling " + ceilingInt
+                                    + " -- clamping phase2's cap to " + cappedCap + " ###");
+                        }
+                        cap = cappedCap;
+                    }
+                    System.out.println("### EPSILON-CONSTRAINT: phase1 best maxFlowTime=" + bestMaxFlow
+                            + "  phase2 cap=maxFlowTime<=" + cap + " (epsilon=" + epsilonAbs + ") ###");
+
+                    // reset() clears the search tree, measures (getTimeCount() back to 0), and
+                    // every previously-set stop criterion (including phase 1's limitTime) --
+                    // WITHOUT undoing already-posted constraints or the model's own propagated
+                    // domains, so the newly-added cap constraint below stacks cleanly on top of
+                    // everything phase 1 already established, and phase 2's own limitTime call
+                    // counts fresh from this point rather than cumulatively from phase 1's.
+                    //
+                    // WARM START: phase 2 must not re-explore from scratch -- it should start
+                    // from phase 1's own solution, which trivially still satisfies the new cap
+                    // (cap = phase1's maxFlowTime + epsilon >= phase1's maxFlowTime).
+                    //
+                    // In plain MainOnlineMultiObj.java, this falls out for free: setSearch() is
+                    // only ever called once (before phase 1) with IntDomainLast(solver
+                    // .defaultSolution(), ...), and Solver.defaultSolution() is a Solution object
+                    // Choco auto-attaches on first use and keeps updated on EVERY accepted
+                    // solution (safe to read even after a time-limit cutoff, unlike a live
+                    // IntVar's .getValue()); reset() does NOT clear or detach it (confirmed
+                    // against Choco 5's own Solver.reset() source). So by the time phase 2 starts
+                    // branching there, defaultSolution() already holds phase 1's final assignment.
+                    //
+                    // HERE, phase 1's own setSearch() call was instead pointed at an EXTERNAL
+                    // warmStartSolution (Incremental's hint), so that free inheritance is gone --
+                    // re-pointing the SAME value selector at model.getSolver().defaultSolution()
+                    // now, AFTER phase 1 has run, restores it: defaultSolution() has been live
+                    // ever since phase 1's first accepted solution, so this second setSearch()
+                    // call immediately sees phase 1's actual final assignment, not an empty
+                    // solution. The onSolution callback above verifies this actually happens
+                    // (phase 2's first accepted solution's maxFlowTime is checked against
+                    // phase1FinalMaxFlow) rather than just assuming it from Choco's internals.
+                    phase1FinalMaxFlow[0] = bestMaxFlow;
+                    inPhase2[0] = true;
+                    solver.reset();
+                    solver.setSearch(
+                            Search.lastConflict(
+                                    Search.intVarSearch(new InputOrder<>(model),
+                                            new IntDomainLast(model.getSolver().defaultSolution(),
+                                                    new IntValueSelector() {
+                                                        @Override
+                                                        public int selectValue(IntVar intVar) {
+                                                            if (intVar.getName().startsWith("node_work_d")) {
+                                                                int i = 0;
+                                                                while (i < nb_nodes) {
+                                                                    if (intVar.contains(cidx[i])) {
+                                                                        return cidx[i];
+                                                                    }
+                                                                    i++;
+                                                                }
+                                                            }
+                                                            return intVar.getLB();
+                                                        }
+                                                    }, (i, j) -> true),
+                                            decisionVars), 2)
+                    );
+                    model.arithm(objectives[1], "<=", cap).post();
+                    solver.limitTime(phase2Seconds + "s");
+                    found[0] = false; // phase 2's own outcome, tracked separately from phase 1's
+                    solver.findOptimalSolution(objectives[3], false);
+                    if (!found[0]) {
+                        System.out.println("### EPSILON-CONSTRAINT: no solution found in phase 2 -- "
+                                + "the exported schedule is whatever phase 1 last left in "
+                                + "transfersList/worksList (maxFlowTime=" + bestMaxFlow + ") ###");
+                    } else {
+                        System.out.println("### EPSILON-CONSTRAINT: phase2 best energy=" + lastEnergy[0]
+                                + "  (maxFlowTime=" + lastMaxFlow[0] + ") ###");
+                    }
+                }
+            } else {
+                solver.findOptimalSolution(objectives[objectiveChoice], false);
+                if (!found[0]) {
+                    System.out.println("No solution found");
+                }
             }
             System.out.println("### DIAG search end: timeCount=" + solver.getTimeCount()
                     + "s  timeLimitWas=" + timeLimitSeconds + "s  objectiveOptimal=" + solver.isObjectiveOptimal()
@@ -2060,6 +2408,11 @@ public class MainOnline {
             if (j.has("storage_capacity")) {
                 node.storageCapacity = j.getInt("storage_capacity");
             }
+            // Absent on older nodes.json exports (only this multi-objective file needs it, to
+            // price each candidate transfer's energy the same way Tracker.log_transfer /
+            // compute_transfer_energy already do on the Python side): default 0 so a stale input
+            // just makes energy free rather than failing the whole solve.
+            node.energyConsumption = j.has("energy_consumption") ? j.getDouble("energy_consumption") : 0.0;
             nodes.add(node);
             //System.out.println("Loaded node " + i + ": " + node.computationNodes + " CPUs, " + node.bandwidth + " bandwidth, " + node.freeTime + " free time");
         }
@@ -2069,6 +2422,7 @@ public class MainOnline {
         double[] cpus = new double[nodes.size()];
         double[] nodes_free_time = new double[nodes.size()];
         int[] storage_capacity = new int[nodes.size()];
+        double[] node_energy_consumption = new double[nodes.size()];
         double[] jobs_arrival_time = new double[jobsArray.length()];
 
         for (int i = 0; i < nodes.size(); i++) {
@@ -2077,6 +2431,7 @@ public class MainOnline {
             cpus[i] = node.computationNodes;
             nodes_free_time[i] = node.freeTime;
             storage_capacity[i] = node.storageCapacity;
+            node_energy_consumption[i] = node.energyConsumption;
         }
 
         for (int i = 0; i < jobsArray.length(); i++) {
@@ -2114,7 +2469,7 @@ public class MainOnline {
 
         // Call scheduler
         SchedulingWithDiffN.SchedulingResult result = SchedulingWithDiffN.runScheduler(
-            jobs,nodes.size(), nbData, data_sizes, works, bandwidths, cpus, storage_capacity, nodes_free_time, replicas_location,null, 0, true,jobs_arrival_time);
+            jobs,nodes.size(), nbData, data_sizes, works, bandwidths, cpus, storage_capacity, nodes_free_time, replicas_location,null, 0, true,jobs_arrival_time, node_energy_consumption);
 
         String basePath = MODEL_OUTPUTS_DIR + "/";
 

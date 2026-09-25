@@ -618,6 +618,29 @@ class SchedulingUsingCSPOnlineWarmStart(SchedulingUsingCSPOnline):
             json.dump(warm_start, f)
 
 
+class SchedulingUsingCSPOnlineMultiObjWarmStart(SchedulingUsingCSPOnlineWarmStart):
+    """
+    Combines SchedulingUsingCSPOnlineMultiObj's epsilon-constraint bi-objective solve (phase 1 =
+    max flow time, phase 2 = transfer energy within epsilon_fraction of phase 1's result) with
+    SchedulingUsingCSPOnlineWarmStart's warm-starting (this scheduler's own last-known plan for
+    already-known jobs + a throwaway Incremental solve for the brand-new job(s)) -- the
+    schedulingNewJob()/_writeWarmStart() machinery is inherited as-is from
+    SchedulingUsingCSPOnlineWarmStart, only java_main_class and the epsilon settings differ.
+
+    See utils/model/src/main/MainOnlineMultiObjWarmStart.java for the Java side: it seeds ONLY
+    the shared search's value selector with the external warm start (Incremental's hint), and
+    re-points that same value selector at model.getSolver().defaultSolution() right after phase 1
+    ends so phase 2 still inherits phase 1's own result -- restoring plain
+    MainOnlineMultiObj.java's phase1->phase2 warm-start property that would otherwise be lost by
+    overriding the search strategy's hint for the external warm start.
+    """
+    java_main_class = 'MainOnlineMultiObjWarmStart'
+    multi_objective = 2  # epsilon-constraint (2-phase): phase 1 = max flow time, phase 2 = energy
+    epsilon_fraction = 0.1
+    epsilon_phase1_fraction = 0.5
+    epsilon_max_cap = None
+
+
 class SchedulingUsingCSPOnlineThreeStep(SchedulingUsingCSPOnline):
     """
     Same online full-replan machinery as SchedulingUsingCSPOnline, but delegates the
