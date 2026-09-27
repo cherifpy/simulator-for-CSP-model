@@ -1,5 +1,8 @@
 import re
 import os
+import csv
+import threading
+import contextlib
 from pychoco import *
 import pandas as pd
 import random as rnd
@@ -14,6 +17,37 @@ UTILS_DIR = os.path.dirname(os.path.abspath(__file__))
 SIMULATOR_DIR = os.path.dirname(UTILS_DIR)
 MODEL_DIR = os.path.join(UTILS_DIR, "model")
 MINIZINC_DIR = os.path.join(UTILS_DIR, "minizincModel")
+
+# Per-THREAD override of SIMULATOR_RUN_CWD (the env var normally used to isolate concurrent
+# solves -- see _schedulingUsingJavaCSP_impl's own comment), for when isolation is needed BETWEEN
+# THREADS of the SAME process rather than between separate process invocations. os.environ is
+# process-wide, so two threads can't each set it without racing each other; this thread-local
+# takes precedence over the env var when set, letting each thread point at its own private
+# utils/model/{inputs,outputs,bin} tree. Used by SchedulingUsingCSPAdaptiveJoint's parallel
+# warm-vs-cold escalation search (master_node_with_heterogeneous_nodes_csp.py).
+_run_cwd_local = threading.local()
+
+
+@contextlib.contextmanager
+def run_cwd_override(path):
+    """Context manager: within this THREAD only, _schedulingUsingJavaCSP_impl resolves its
+    model_dir from `path` instead of the SIMULATOR_RUN_CWD env var (or the global default)."""
+    previous = getattr(_run_cwd_local, "run_cwd", None)
+    _run_cwd_local.run_cwd = path
+    try:
+        yield
+    finally:
+        if previous is None:
+            del _run_cwd_local.run_cwd
+        else:
+            _run_cwd_local.run_cwd = previous
+
+
+def get_run_cwd_override():
+    """This thread's run_cwd_override value, or None if unset -- used by both
+    _schedulingUsingJavaCSP_impl (below) and utils.run_export.solver_model_dir() so every path
+    that needs to agree on "where is this solve's utils/model" resolves it the same way."""
+    return getattr(_run_cwd_local, "run_cwd", None)
 
 CPU_UNIT = 1  # defines one unit of work per second
 #rnd.seed(42)
@@ -252,6 +286,41 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
                          scheduling_start_time, archive_dir)
 
 
+def log_phase1_vs_final_flow_times(env_now, jobs, phase1_works, final_works, model_dir):
+    """Diagnostic-only, never read back by the solver: for every job in this solve's batch, its
+    own flow time under phase 1 ALONE (epsilon-constraint's minimize-max-flow-time-only phase, see
+    MainOnlineMultiObj*.java's phase1_works.csv export) vs the FINAL result (phase 2's energy-
+    minimized plan, or phase 1's own if phase 2 found nothing) -- appended (one row per job per
+    qualifying solve) to phase1_vs_final_flow_times.csv under this solve's own outputs/ dir, so a
+    later analysis can see exactly how much energy-driven consolidation costs each INDIVIDUAL job,
+    not just the batch-wide max flow time the epsilon cap already bounds (that cap only protects
+    the single worst job in the batch -- see the hybrid-vs-online_biobj investigation this was
+    added for)."""
+    def finish_time(works_dict, job_id):
+        end = None
+        for entries in works_dict.values():
+            for e_job_id, e_node, e_task_id, e_start, e_end, e_dur in entries:
+                if e_job_id == job_id:
+                    end = e_end if end is None else max(end, e_end)
+        return end
+
+    arriving_time_by_id = {j.job_id: j.arriving_time for j in jobs}
+    log_path = os.path.join(model_dir, "outputs", "phase1_vs_final_flow_times.csv")
+    is_new = not os.path.exists(log_path)
+    with open(log_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        if is_new:
+            writer.writerow(["sim_time", "job_id", "arriving_time", "phase1_flow_time", "final_flow_time", "degradation"])
+        for job_id, arriving_time in arriving_time_by_id.items():
+            p1_end = finish_time(phase1_works, job_id)
+            fin_end = finish_time(final_works, job_id)
+            if p1_end is None or fin_end is None:
+                continue
+            p1_flow = p1_end - arriving_time
+            fin_flow = fin_end - arriving_time
+            writer.writerow([env_now, job_id, arriving_time, round(p1_flow, 3), round(fin_flow, 3), round(fin_flow - p1_flow, 3)])
+
+
 def _schedulingUsingJavaCSP_impl(master_node, jobs: list, replicas_locations: dict, nodes_free_time: list, scheduling_start_time=None):
     """
     Wrapper to call the Java CSP solver via command line.
@@ -267,8 +336,10 @@ def _schedulingUsingJavaCSP_impl(master_node, jobs: list, replicas_locations: di
     # utils/model/{inputs,outputs,bin}, with lib/src symlinked back to the canonical copy since
     # those are read-only) redirects both Python's own reads/writes AND Java's (which resolves
     # its paths from its own cwd, i.e. this same directory) to that private location instead.
-    # Unset (the default): behavior is byte-identical to before this existed.
-    run_cwd = os.environ.get("SIMULATOR_RUN_CWD", SIMULATOR_DIR)
+    # Unset (the default): behavior is byte-identical to before this existed. A per-thread
+    # override (run_cwd_override above) takes precedence over the env var for isolating
+    # concurrent solves WITHIN the same process (env vars are process-wide, not thread-local).
+    run_cwd = get_run_cwd_override() or os.environ.get("SIMULATOR_RUN_CWD", SIMULATOR_DIR)
     model_dir = os.path.join(run_cwd, "utils", "model") if run_cwd != SIMULATOR_DIR else MODEL_DIR
 
     matrix = []
@@ -409,6 +480,15 @@ def _schedulingUsingJavaCSP_impl(master_node, jobs: list, replicas_locations: di
                 frozen_indices.append(idx)
     with open(os.path.join(model_dir, "inputs", "frozen_jobs.txt"), "w") as f:
         f.write(",".join(str(i) for i in frozen_indices))
+
+    # Opt-in (see MainOnlineMultiObjWarmStart.java's own comment on freezeBlocksNodeUntilDone):
+    # when on, a frozen job's resident node(s) are reserved for it until its own last task ends,
+    # instead of leaving its task timing free to be pushed later to accommodate other jobs
+    # sharing that node (the collateral-damage mechanism confirmed responsible for freeze's own
+    # quality regression). Unset (the default): off, identical to before this existed.
+    freeze_blocks_node_until_done = master_node._config.get('freeze_blocks_node_until_done', False)
+    with open(os.path.join(model_dir, "inputs", "freeze_blocks_node_until_done.txt"), "w") as f:
+        f.write("1" if freeze_blocks_node_until_done else "0")
 
     # Confines already-running jobs' reconsideration to a "powerful" subset of nodes (by
     # bandwidth/compute_capacity -- NOTE compute_capacity is a DURATION MULTIPLIER, so lower is
@@ -633,6 +713,20 @@ def _schedulingUsingJavaCSP_impl(master_node, jobs: list, replicas_locations: di
     works = toDict(f"{model_output_path}/works.csv", job_list=job_ids, master_node=master_node, task_id_maps=task_id_maps)
     transfers = toDict(f"{model_output_path}/transfers.csv", job_list=job_ids, master_node=master_node)
     deletions = loadDeletions(f"{model_output_path}/deletions.csv", job_list=job_ids, master_node=master_node)
+
+    # Diagnostic-only: only these two classes ever write phase1_works.csv/phase1_transfers.csv
+    # (see MainOnlineMultiObjWarmStart.java's own comment); gated on java_main_class rather than
+    # just the files' existence, since a STALE pair left over from an earlier solve in this same
+    # model_dir would otherwise get silently misattributed to a later, unrelated solve (e.g. a
+    # plain Incremental probe right after an escalation).
+    if java_main_class in ('MainOnlineMultiObj', 'MainOnlineMultiObjWarmStart'):
+        phase1_works_path = f"{model_output_path}/phase1_works.csv"
+        if os.path.exists(phase1_works_path):
+            try:
+                phase1_works = toDict(phase1_works_path, job_list=job_ids, master_node=master_node, task_id_maps=task_id_maps)
+                log_phase1_vs_final_flow_times(master_node.env.now, jobs, phase1_works, works, model_dir)
+            except Exception as e:
+                print(f"### WARNING: failed to log phase1-vs-final flow times: {e} ###")
 
     # toDict()/loadDeletions() always pre-populate one key per node (even with an empty CSV), so
     # their dicts are never actually empty -- callers can't tell "no solution" apart from "solved"

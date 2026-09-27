@@ -81,6 +81,7 @@ EPSILON_PHASE1_FRACTION=0.5
 EPSILON_MAX_CAP=""
 ADAPTIVE_ALPHA=0.2
 ADAPTIVE_MAX_BUDGET=300   # ceiling on the escalation search budget (adaptive_alpha * F1)
+ADAPTIVE_F1_THRESHOLD=""   # hybrid only: below this Incremental's own F1, never escalate at all
 HYBRID_INCREMENTAL_TIME_LIMIT=30   # hybrid only: budget for its internal Incremental calls (F1 probe + fallback)
 # Pre-processing (job freezing), applied ONLY to online_biobj_warmstart when --pre-process is
 # passed. Defaults calibrated to inst-20J-50N's own dataset_size distribution (1024-10240 MB):
@@ -104,6 +105,7 @@ while [[ $# -gt 0 ]]; do
         --epsilon-max-cap) EPSILON_MAX_CAP="$2"; shift 2 ;;
         --adaptive-alpha) ADAPTIVE_ALPHA="$2"; shift 2 ;;
         --adaptive-max-budget) ADAPTIVE_MAX_BUDGET="$2"; shift 2 ;;
+        --adaptive-f1-threshold) ADAPTIVE_F1_THRESHOLD="$2"; shift 2 ;;
         --hybrid-incremental-time-limit) HYBRID_INCREMENTAL_TIME_LIMIT="$2"; shift 2 ;;
         --pre-process) PRE_PROCESS=1; shift 1 ;;
         --freeze-large-jobs-threshold) FREEZE_LARGE_JOBS_THRESHOLD="$2"; shift 2 ;;
@@ -117,8 +119,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../simulator-for
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"                      # .../simulator-for-CSP-model
 VENV_PYTHON="$PROJECT_ROOT/env/bin/python3"
 INSTANCE_DIR="$SCRIPT_DIR/workloads/workloads-100-for_storage_constraintes/$INSTANCE_NAME"
-RESULTS_ROOT="$SCRIPT_DIR/results-grid5000/online_vs_biobj_workload"
-RUN_CWD_ROOT="$SCRIPT_DIR/.run_cwd/online_vs_biobj_workload"   # private per-run utils/model trees
+# Namespaced by instance so re-running against a different instance (e.g. a bigger-dataset
+# variant) never silently overwrites a previous instance's results/run dirs.
+RESULTS_ROOT="$SCRIPT_DIR/results-grid5000/online_vs_biobj_workload_$INSTANCE_NAME"
+RUN_CWD_ROOT="$SCRIPT_DIR/.run_cwd/online_vs_biobj_workload_$INSTANCE_NAME"   # private per-run utils/model trees
 
 if [[ ! -f "$INSTANCE_DIR/jobs.json" ]]; then
     echo "ERROR: instance not found at $INSTANCE_DIR (expected jobs.json there)." >&2
@@ -145,6 +149,7 @@ echo "### epsilon_fraction=$EPSILON_FRACTION  epsilon_max_cap=${EPSILON_MAX_CAP:
 echo "### adaptive_alpha=$ADAPTIVE_ALPHA (budget and acceptance-gain fraction, adaptive only)"
 echo "### adaptive_max_budget=${ADAPTIVE_MAX_BUDGET}s (ceiling on the escalation budget, adaptive/hybrid)"
 echo "### hybrid_incremental_time_limit=${HYBRID_INCREMENTAL_TIME_LIMIT}s (hybrid's internal Incremental budget)"
+echo "### adaptive_f1_threshold=${ADAPTIVE_F1_THRESHOLD:-<unset, always escalates>} (hybrid: below this F1, never escalate)"
 if [[ "$PRE_PROCESS" == "1" ]]; then
     echo "### pre-processing ON for online_biobj_warmstart: freeze_large_jobs_threshold=${FREEZE_LARGE_JOBS_THRESHOLD}MB"
     echo "###   freeze_remaining_time_threshold=${FREEZE_REMAINING_TIME_THRESHOLD}  freeze_jobs_with_ongoing_transfer=on"
@@ -179,6 +184,9 @@ for APPROACH in $APPROACHES; do
     fi
     if [[ "$APPROACH" == "hybrid" ]]; then
         CMD+=" --hybrid-incremental-time-limit $HYBRID_INCREMENTAL_TIME_LIMIT"
+        if [[ -n "$ADAPTIVE_F1_THRESHOLD" ]]; then
+            CMD+=" --adaptive-f1-threshold $ADAPTIVE_F1_THRESHOLD"
+        fi
     fi
     if [[ "$APPROACH" == "online_biobj_warmstart" && "$PRE_PROCESS" == "1" ]] || [[ "$APPROACH" == "hybrid" ]]; then
         CMD+=" --freeze-large-jobs-threshold $FREEZE_LARGE_JOBS_THRESHOLD"

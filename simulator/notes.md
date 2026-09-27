@@ -147,3 +147,57 @@ lancer sur grenoble
 
 ### Relance
 1- sur lille j'ai relancé sur la taille des données pour avoir des stats plus detaillé
+
+
+# Objectif actuell: accelere le model a travers des optimisations 
+
+Bloquer des jobs et bloquer des noueds 
+
+jusqu'a present on bloque que les jobs qui sont en fin de leurs flow time 
+
+## exps en cours
+- Warm start+ freazing
+
+- PRoblmemes:
+    - JObs qui n'on pas fini leurs transfers 
+    - LEs jobs a qui rest peu de temps pour fenir 
+    - Les jobs 
+
+
+lancer actuellement le 26 sep une exp pour comparer 
+
+Hypride, Incremental, OnlineBiobj
+
+# Récap — session du jour
+
+## Code modifié
+**Fichier** : `exps/xp_dataset_size_sweep.py` (protocole state-A figé)
+
+- Ajout de `run_hybrid_style` (1ère version), puis **réécrite** selon la spec :
+  - `incremental` — inchangé
+  - `online_warmstart` — inchangé (déjà mono-obj)
+  - `online_biobj_warmstart` — **nouvelle fonction** (reconsidération jointe + warmstart, bi-objectif epsilon-constraint)
+  - `hybrid` — réécrit :
+    - F1 (probe Incremental, 15s par défaut) réutilisé directement comme warm-start → plus de double-solve redondant
+    - budget d'escalade = 10% de F1 (`hybrid_alpha=0.1`, avant 0.2)
+- `build_warm_start_for_reconsideration` : accepte un placement déjà calculé (évite un 2e solve)
+- Synchronisé vers la copie de déploiement nested + compilé sans erreur
+
+## Expés locales (smoke tests, instance 10J-10N)
+
+| # | Test | Résultat |
+|---|------|----------|
+| 1 | incremental / epsilon / hybrid (1ère version) | OK |
+| 2 | State-A sur **job17** (instance heterogeneous 20J-50N, 5 approches) | Crash initial (`arriving_time` manquant) → corrigé avec `--arrival-lambda` → temps de scheduling obtenus |
+| 3 | 4 méthodes finales (incremental / online_warmstart / online_biobj_warmstart / hybrid) | Confirmé : hybrid passe de **152s → 31s** de wall time après le fix |
+
+## Grid5000 (observation seule, pas de modif)
+
+- Job `4157990` (hybrid eps=5%, protocole live) — toujours en cours, job18/19 restants
+- Job17 traité : flow time ≈ **4041s** (vs 6183.5s à eps=10%) → amélioration confirmée
+- ⚠️ **Anomalie non résolue** : le solve final de job17 ne montre pas le header bi-objectif attendu (possible fallback légitime vers Incremental, ou bug dans la classe live `SchedulingUsingCSPAdaptiveJoint`) — à investiguer si besoin
+
+## État
+
+- Rien n'a été commité (comme convenu)
+- Rien n'a été poussé

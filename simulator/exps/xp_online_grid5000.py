@@ -115,9 +115,9 @@ def parse_args():
     parser.add_argument("--epsilon-fraction", type=float, default=0.1,
                          help="online_biobj only: max flow time slack allowed in phase 2, as a "
                               "fraction of phase 1's result (default: 0.1 = 10%%).")
-    parser.add_argument("--epsilon-phase1-fraction", type=float, default=0.5,
+    parser.add_argument("--epsilon-phase1-fraction", type=float, default=0.75,
                          help="online_biobj only: fraction of --solver-time-limit given to phase "
-                              "1 (max flow time); the rest goes to phase 2 (energy) (default: 0.5).")
+                              "1 (max flow time); the rest goes to phase 2 (energy) (default: 0.75).")
     parser.add_argument("--epsilon-max-cap", type=float, default=None,
                          help="online_biobj only: absolute ceiling on the max-flow-time cap phase "
                               "2 is allowed to accept, regardless of epsilon_fraction (default: none).")
@@ -135,6 +135,31 @@ def parse_args():
                               "all. Default: unset (always try escalating -- the budget already "
                               "scales with F1, so a small job gets a proportionally cheap attempt "
                               "rather than being blocked from one entirely).")
+    parser.add_argument("--no-charge-thinking-time", action="store_true",
+                         help="ALL approaches: DON'T charge each CSP solve's own real wall-clock "
+                              "time as simulated wait (yield env.timeout(elapsed)) against the "
+                              "flow time of whatever job(s) it just decided -- see "
+                              "SchedulingUsingCSPOnline.charge_thinking_time's own comment. "
+                              "Applies uniformly to online/online_biobj/online_warmstart/"
+                              "online_biobj_warmstart/incremental/hybrid, so every approach pays "
+                              "the same way for its own actual decision time. Default: off "
+                              "(charge it -- the fair default; before this existed, only hybrid's "
+                              "escalation charged anything at all, and only an ESTIMATE, not its "
+                              "real solve time).")
+    parser.add_argument("--parallel-warm-cold-escalation", action="store_true",
+                         help="hybrid only: run the escalation as TWO concurrent solves -- warm-"
+                              "started (the usual escalation_java_main_class, seeded via "
+                              "_writeWarmStart) and cold (MainOnlineMultiObj, Choco's own default "
+                              "search) -- and keep whichever finds the lower max flow time "
+                              "(phase 1's own objective; energy is the tie-breaker). A warm-"
+                              "started time-limited search can converge to a MUCH worse optimum "
+                              "than a cold one on a bigger joint problem (confirmed: identical "
+                              "15s phase-1 budget, warm-started result 2592 vs cold 1228 on the "
+                              "same 4-job batch) -- this hedges against that at the cost of "
+                              "roughly 2x the CPU (though not 2x the wall-clock time charged, "
+                              "since both run concurrently and only the slower one's real elapsed "
+                              "time is charged). Default: off (single warm-started solve only, "
+                              "identical to before this existed).")
     parser.add_argument("--hybrid-incremental-time-limit", type=float, default=None,
                          help="hybrid only: solver time budget (seconds) for its internal "
                               "Incremental calls (the F1 probe and the fallback-on-failure "
@@ -163,6 +188,16 @@ def parse_args():
                               "orphaned, never-cleaned-up replica once the abandoned transfer "
                               "lands (a real leak confirmed via events_history.json). Independent "
                               "of the other two --freeze-* flags. Default: off.")
+    parser.add_argument("--freeze-blocks-node-until-done", action="store_true",
+                         help="hybrid only: a frozen job's resident node(s) are reserved for it "
+                              "until its OWN last task ends -- no other job's task may start "
+                              "there any earlier. Without this, a frozen job's node is fixed but "
+                              "its own task TIMING stays free, so the solver can (and does) push "
+                              "the frozen job's own tasks later to make room for other jobs "
+                              "sharing that node, inflating the frozen job's own flow time as "
+                              "collateral damage (confirmed root cause of freeze's own quality "
+                              "regression vs not freezing at all). Default: off (identical to "
+                              "before this existed).")
     parser.add_argument("--reschedule-top-fraction", type=float, default=None,
                          help="online/online_biobj/adaptive: confines every already-running "
                               "job's reconsideration to the top fraction (0-1) of nodes ranked by "
@@ -175,6 +210,9 @@ def parse_args():
 
 def run(args):
     master_class = APPROACHES[args.approach]
+    # Applies to every approach uniformly -- see charge_thinking_time's own comment on the
+    # SchedulingUsingCSPOnline base class (inherited by all of them).
+    master_class.charge_thinking_time = not args.no_charge_thinking_time
     if args.approach in ("online_biobj", "online_biobj_warmstart", "hybrid"):
         master_class.epsilon_fraction = args.epsilon_fraction
         master_class.epsilon_phase1_fraction = args.epsilon_phase1_fraction
@@ -185,6 +223,7 @@ def run(args):
     if args.approach == "hybrid":
         master_class.adaptive_f1_threshold = args.adaptive_f1_threshold
         master_class.incremental_time_limit_s = args.hybrid_incremental_time_limit
+        master_class.parallel_warm_cold_escalation = args.parallel_warm_cold_escalation
 
     with open(args.config, "r", encoding="utf-8") as f:
         config = json.load(f)
@@ -196,10 +235,13 @@ def run(args):
     config["adaptive_alpha"] = args.adaptive_alpha
     config["adaptive_max_budget_s"] = args.adaptive_max_budget
     config["adaptive_f1_threshold"] = args.adaptive_f1_threshold
+    config["parallel_warm_cold_escalation"] = args.parallel_warm_cold_escalation
+    config["charge_thinking_time"] = not args.no_charge_thinking_time
     config["incremental_time_limit_s"] = args.hybrid_incremental_time_limit
     config["freeze_large_jobs_threshold_mb"] = args.freeze_large_jobs_threshold
     config["freeze_remaining_time_threshold"] = args.freeze_remaining_time_threshold
     config["freeze_jobs_with_ongoing_transfer"] = args.freeze_jobs_with_ongoing_transfer
+    config["freeze_blocks_node_until_done"] = args.freeze_blocks_node_until_done
     config["reschedule_top_fraction"] = args.reschedule_top_fraction
 
     results_dir = args.results_dir or os.path.join(
@@ -232,6 +274,8 @@ def run(args):
                 "adaptive_alpha": getattr(master_class, "adaptive_alpha", None),
                 "adaptive_max_budget_s": getattr(master_class, "adaptive_max_budget_s", None),
                 "adaptive_f1_threshold": getattr(master_class, "adaptive_f1_threshold", None),
+                "parallel_warm_cold_escalation": getattr(master_class, "parallel_warm_cold_escalation", None),
+                "charge_thinking_time": getattr(master_class, "charge_thinking_time", None),
                 "incremental_time_limit_s": getattr(master_class, "incremental_time_limit_s", None),
                 "escalation_java_main_class": getattr(master_class, "escalation_java_main_class", None),
                 "freeze_large_jobs_threshold_mb": args.freeze_large_jobs_threshold,

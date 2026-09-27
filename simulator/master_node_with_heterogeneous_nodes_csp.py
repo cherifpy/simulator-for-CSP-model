@@ -3,13 +3,15 @@ import math
 import os
 import random
 import simpy
+import time
+import concurrent.futures
 import numpy as np
 import logging
 from classes.job import Task, Replica, Job
 import copy
 from compute_node import ComputeNode
 
-from utils.modelCSP import onLineSchedulingUsingCSP,schedulingUsingJavaCSP,startMinizincModel,MODEL_DIR
+from utils.modelCSP import onLineSchedulingUsingCSP,schedulingUsingJavaCSP,startMinizincModel,MODEL_DIR,SIMULATOR_DIR,run_cwd_override
 from utils.run_export import solver_model_dir
 
 
@@ -28,6 +30,18 @@ class SchedulingUsingCSPOnline:
     # Dedicated Java entry point (utils/model/src/main/MainOnline.java) so Online-specific
     # storage handling can evolve independently of Incremental's.
     java_main_class = 'MainOnline'
+    # Whether a CSP solve's own real wall-clock time is charged against simulated time (yield
+    # env.timeout(elapsed)) right after it returns -- modeling "the system must wait for the
+    # solver to actually finish" as a real cost against every job's own flow time, uniformly
+    # across every approach (see _timedSchedulingUsingJavaCSP below). True is the FAIR default:
+    # before this existed, only SchedulingUsingCSPAdaptiveJoint ever charged anything (its own
+    # escalation budget, an estimate, not the real solve time), while online/online_biobj/
+    # incremental charged nothing at all -- a structural asymmetry that penalized hybrid in any
+    # flow-time comparison regardless of solution quality (confirmed: disabling hybrid's own
+    # charge alone made its very first job's result land EXACTLY on online_biobj's own result).
+    # Set to False to reproduce the old (asymmetric) behavior for a specific approach/run.
+    charge_thinking_time = True
+
     def __init__(self, env, compute_nodes, tracker, config, overlap=False):
         self.env = env
         self.queue = simpy.Store(env)
@@ -107,6 +121,19 @@ class SchedulingUsingCSPOnline:
             if self._allJobsCompleted():
                 break
 
+    def _timedSchedulingUsingJavaCSP(self, jobs_to_reschedule, replicas_locations, nodes_free_time, now):
+        """Generator wrapper around schedulingUsingJavaCSP: times the real wall-clock cost of the
+        solve and (if charge_thinking_time) yields that same duration against simulated time
+        before returning -- see the charge_thinking_time class attribute's own comment for why.
+        Callers must use `yield from` (this is a generator itself, not a plain function)."""
+        start = time.time()
+        transfers_, works_, deletions_ = schedulingUsingJavaCSP(self, jobs_to_reschedule, replicas_locations, nodes_free_time, now)
+        elapsed = time.time() - start
+        charge = self._config.get('charge_thinking_time', self.charge_thinking_time)
+        if charge:
+            yield self.env.timeout(elapsed)
+        return transfers_, works_, deletions_
+
     def schedulingNewJob(self):
 
         while True:
@@ -131,7 +158,7 @@ class SchedulingUsingCSPOnline:
                         transfers_, works_, deletions_ = startMinizincModel(self, jobs_to_reschedule, replicas_locations, nodes_free_time)
 
                     else:
-                        transfers_, works_, deletions_ = schedulingUsingJavaCSP(self, jobs_to_reschedule, replicas_locations, nodes_free_time, self.env.now)
+                        transfers_, works_, deletions_ = yield from self._timedSchedulingUsingJavaCSP(jobs_to_reschedule, replicas_locations, nodes_free_time, self.env.now)
                 else:
                     transfers_, works_, deletions_ = {}, {}, {}
 
@@ -521,7 +548,7 @@ class SchedulingUsingCSPOnlineWarmStart(SchedulingUsingCSPOnline):
                 if len(jobs_to_reschedule) > 0:
                     self._writeWarmStart(jobs_to_reschedule, replicas_locations, nodes_free_time)
                     logger.debug("[%s] Master: looking for a solution for %s job(s) (warm-started)", self.env.now, len(jobs_to_reschedule))
-                    transfers_, works_, deletions_ = schedulingUsingJavaCSP(self, jobs_to_reschedule, replicas_locations, nodes_free_time, self.env.now)
+                    transfers_, works_, deletions_ = yield from self._timedSchedulingUsingJavaCSP(jobs_to_reschedule, replicas_locations, nodes_free_time, self.env.now)
                 else:
                     transfers_, works_, deletions_ = {}, {}, {}
 
@@ -741,7 +768,7 @@ class SchedulingUsingCSPIncremental(SchedulingUsingCSPOnline):
                 if self._config['use_minizinc_model']:
                     transfers_, works_, deletions_ = startMinizincModel(self, jobs_to_reschedule, replicas_locations, nodes_free_time)
                 else:
-                    transfers_, works_, deletions_ = schedulingUsingJavaCSP(self, jobs_to_reschedule, replicas_locations, nodes_free_time, self.env.now)
+                    transfers_, works_, deletions_ = yield from self._timedSchedulingUsingJavaCSP(jobs_to_reschedule, replicas_locations, nodes_free_time, self.env.now)
 
                 if len(transfers_.keys()) > 0 and len(works_.keys()) > 0:
                     for node in range(len(self.compute_nodes)):
@@ -984,7 +1011,6 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
     # --solver-time-limit. None (the default) falls back to whatever solver_time_limit_s
     # currently is.
     incremental_time_limit_s = None
-
     def _flowTimeFromPlan(self, job, transfers_, works_):
         """Same as SchedulingUsingCSPAdaptive's: this job's own flow time (finish - arrival) from
         a plan's absolute times, or None if the job doesn't appear in the plan at all."""
@@ -1037,7 +1063,15 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
 
         new_jobs = [job for job in jobs_to_reschedule if job.job_id not in already_known_ids]
         orig_java_main_class = self.java_main_class
+        # incremental_time_limit_s applies here too -- this throwaway call is itself an
+        # Incremental solve, and without this it silently ran under whatever solver_time_limit_s
+        # was set for the OUTER context instead (confirmed: with --solver-time-limit 600 this made
+        # every escalating job pay up to an extra 600s just to build its own warm start).
+        incremental_limit = self._config.get('incremental_time_limit_s', self.incremental_time_limit_s)
+        orig_limit = self._config.get('solver_time_limit_s')
         try:
+            if incremental_limit is not None:
+                self._config['solver_time_limit_s'] = max(1, int(round(incremental_limit)))
             for job in new_jobs:
                 self.java_main_class = 'MainIncremental'
                 inc_transfers, inc_works, _ = schedulingUsingJavaCSP(
@@ -1060,10 +1094,159 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
                             })
         finally:
             self.java_main_class = orig_java_main_class
+            if incremental_limit is not None:
+                if orig_limit is None:
+                    self._config.pop('solver_time_limit_s', None)
+                else:
+                    self._config['solver_time_limit_s'] = orig_limit
 
         warm_start = {"job_placements": job_placements, "transfers": transfers_ws}
         with open(os.path.join(solver_model_dir(), "inputs", "warm_start.json"), "w") as f:
             json.dump(warm_start, f)
+
+    # Opt-in: run the escalation as TWO concurrent solves (warm-started vs cold) and keep
+    # whichever finds the better phase-1 optimum, instead of only ever warm-starting. See
+    # _timedParallelEscalation's own docstring for why (a warm-started time-limited search can
+    # converge to a MUCH worse optimum than a cold one on a bigger joint problem -- confirmed:
+    # identical 15s phase-1 budget, warm-started result 2592 vs cold 1228 on the same 4-job
+    # batch). None (the default): single warm-started solve only, identical to before this
+    # existed.
+    parallel_warm_cold_escalation = False
+
+    # Labels for the concurrent escalation variants -- see _timedParallelEscalation. "coldnofreeze"
+    # is diagnostic: cold search (no warm start) with pre-processing (freeze_*) also disabled,
+    # matching exactly what plain online_biobj does for the same batch -- added to test whether
+    # freezing (not warm-starting, which the warm-vs-cold comparison already ruled out: 13/14
+    # controlled comparisons landed on the identical optimum) explains why hybrid's escalation
+    # scored worse than a standalone online_biobj run on comparable batches.
+    _PARALLEL_ESCALATION_LABELS = ("warm", "cold", "coldnofreeze")
+
+    def _ensureParallelRunDirs(self):
+        """Lazily creates one isolated utils/model tree per concurrent escalation variant (own
+        inputs/outputs/bin -- javac recompiles into bin/ on every solve, so concurrent threads
+        can't share one without racing each other's compile -- lib/src symlinked back to the
+        canonical copy, which is read-only and safe to share). Cached on self after the first
+        call. Base directory is wherever this process's own solves already resolve to
+        (SIMULATOR_RUN_CWD if set, else the canonical simulator checkout)."""
+        cached = getattr(self, '_parallel_run_cwds', None)
+        if cached is not None:
+            return cached
+        base_run_cwd = os.environ.get("SIMULATOR_RUN_CWD", SIMULATOR_DIR)
+        canonical_model_dir = os.path.join(base_run_cwd, "utils", "model") if base_run_cwd != SIMULATOR_DIR else MODEL_DIR
+        run_cwds = {}
+        for label in self._PARALLEL_ESCALATION_LABELS:
+            run_cwd = os.path.join(base_run_cwd, f"parallel_{label}_escalation")
+            model_dir = os.path.join(run_cwd, "utils", "model")
+            for sub in ("inputs", "outputs", "bin"):
+                os.makedirs(os.path.join(model_dir, sub), exist_ok=True)
+            for shared in ("lib", "src"):
+                link_path = os.path.join(model_dir, shared)
+                if not os.path.islink(link_path) and not os.path.exists(link_path):
+                    os.symlink(os.path.join(canonical_model_dir, shared), link_path)
+            run_cwds[label] = run_cwd
+        self._parallel_run_cwds = run_cwds
+        return run_cwds
+
+    def _timedParallelEscalation(self, jobs_to_reschedule, replicas_locations, nodes_free_time, now, budget):
+        """Runs the escalation as THREE concurrent Java solves -- warm-started
+        (escalation_java_main_class, seeded via _writeWarmStart, pre-processing/freeze applied as
+        usual), cold (MainOnlineMultiObj, Choco's own default search, no hint, freeze still
+        applied), and coldnofreeze (same cold search but with pre-processing/freeze DISABLED,
+        matching exactly what plain online_biobj does for this batch) -- and keeps whichever
+        achieves the lower max flow time (phase 1's own objective; energy is the tie-breaker).
+        Real OS-level parallelism: schedulingUsingJavaCSP blocks on a Java subprocess, which
+        releases the GIL, so the threads' Java processes genuinely run side by side on separate
+        cores, not one after the other. Each thread gets its own utils/model tree
+        (_ensureParallelRunDirs) and its own shallow-copied master_node "view" (independent
+        java_main_class/_config, everything else -- env, compute_nodes, jobs -- shared by
+        reference and only ever READ during a solve) so no thread's bookkeeping races another's.
+        Charges the REAL wall-clock time of the SLOWEST variant against simulated time (they ran
+        concurrently, not back to back) -- callers must use `yield from`."""
+        run_cwds = self._ensureParallelRunDirs()
+        freeze_keys = ('freeze_large_jobs_threshold_mb', 'freeze_remaining_time_threshold',
+                       'freeze_jobs_with_ongoing_transfer')
+
+        def run_variant(label, java_main_class, write_warm_start, disable_freeze):
+            proxy = copy.copy(self)
+            proxy._config = dict(self._config)
+            proxy.java_main_class = java_main_class
+            proxy._config['solver_time_limit_s'] = max(1, int(round(budget)))
+            if disable_freeze:
+                for key in freeze_keys:
+                    proxy._config.pop(key, None)
+            with run_cwd_override(run_cwds[label]):
+                if write_warm_start:
+                    proxy._writeWarmStart(jobs_to_reschedule, replicas_locations, nodes_free_time)
+                start = time.time()
+                transfers_, works_, deletions_ = schedulingUsingJavaCSP(
+                    proxy, jobs_to_reschedule, replicas_locations, nodes_free_time, now)
+                elapsed = time.time() - start
+            return transfers_, works_, deletions_, elapsed
+
+        variant_specs = {
+            "warm": (self.escalation_java_main_class, True, False),
+            "cold": ("MainOnlineMultiObj", False, False),
+            "coldnofreeze": ("MainOnlineMultiObj", False, True),
+        }
+        # Safety timeout, not just a nicety: with 3 concurrent variants, this was observed to
+        # occasionally hang indefinitely on macOS (0 Java processes left running, one Python
+        # thread pegged at 100% CPU, seemingly stuck inside ThreadPoolExecutor's own bookkeeping
+        # after every variant's solve had already returned a value) -- root cause not fully
+        # isolated (possibly a CPython/macOS thread-pool interaction after several rounds of
+        # concurrent subprocess forking; unconfirmed whether Linux/Grid5000 is affected the same
+        # way). Bounding each future's wait means a hang degrades to "this variant is skipped",
+        # never "the whole simulation is stuck forever". pool.shutdown(wait=False): don't also
+        # block on joining worker threads here, in case THAT is where a hang actually sits --
+        # any lingering thread is harmless (it never touches shared state after returning).
+        result_timeout_s = budget + 90
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(variant_specs))
+        try:
+            futures = {
+                label: pool.submit(run_variant, label, java_main_class, write_warm_start, disable_freeze)
+                for label, (java_main_class, write_warm_start, disable_freeze) in variant_specs.items()
+            }
+            results = {}
+            for label, future in futures.items():
+                try:
+                    results[label] = future.result(timeout=result_timeout_s)
+                except Exception as e:
+                    print(f"### WARNING: parallel escalation variant '{label}' failed/timed out ({e}) -- treated as no solution ###")
+                    results[label] = ({}, {}, {}, result_timeout_s)
+        finally:
+            pool.shutdown(wait=False)
+
+        def batch_quality(works_):
+            """(max flow time, total energy) for this candidate -- lower is better on both,
+            energy only breaks ties on max flow time. None (no solution) sorts last."""
+            if not works_:
+                return None
+            finish = {}
+            for entries in works_.values():
+                for job_id, node_index, task_index, start_abs, end_abs, duration in entries:
+                    finish[job_id] = end_abs if job_id not in finish else max(finish[job_id], end_abs)
+            arrival_by_id = {j.job_id: j.arriving_time for j in jobs_to_reschedule}
+            flows = [finish[jid] - arrival_by_id[jid] for jid in finish if jid in arrival_by_id]
+            if not flows:
+                return None
+            return (max(flows), 0.0)
+
+        qualities = {label: batch_quality(works_) for label, (_, works_, _, _) in results.items()}
+        print("### PARALLEL ESCALATION: " + ", ".join(
+            f"{label}={qualities[label]} ({results[label][3]:.3f}s)" for label in variant_specs) + " ###")
+
+        ranked = [label for label in variant_specs if qualities[label] is not None]
+        ranked.sort(key=lambda label: qualities[label])
+        if ranked:
+            best = ranked[0]
+            transfers_, works_, deletions_, _ = results[best]
+        else:
+            transfers_, works_, deletions_ = {}, {}, {}
+
+        charge_thinking_time = self._config.get('charge_thinking_time', self.charge_thinking_time)
+        if charge_thinking_time:
+            yield self.env.timeout(max(elapsed for (_, _, _, elapsed) in results.values()))
+
+        return transfers_, works_, deletions_
 
     def _placeSingleJobIncremental(self, job):
         """Throwaway (or final-fallback) single-job Incremental solve, using Incremental's own
@@ -1071,7 +1254,9 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
         plain nodesFreeTime). Budgeted at incremental_time_limit_s (config or class attr) when
         set, independently of --solver-time-limit -- Incremental's own placement is meant to be
         cheap/fast, so it shouldn't have to share the (often much larger) budget used elsewhere
-        for the joint bi-objectif escalation or for a plain "incremental" approach run standalone."""
+        for the joint bi-objectif escalation or for a plain "incremental" approach run standalone.
+        Generator (charges this solve's own real wall-clock time via _timedSchedulingUsingJavaCSP,
+        see charge_thinking_time) -- callers must use `yield from`."""
         nodes_free_time = SchedulingUsingCSPIncremental.nodesFreeTimeIncremental(
             self, self.ongoing_transfers, self.ongoing_works)
         orig_java_main_class = self.java_main_class
@@ -1081,8 +1266,8 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
             self.java_main_class = 'MainIncremental'
             if incremental_limit is not None:
                 self._config['solver_time_limit_s'] = max(1, int(round(incremental_limit)))
-            transfers_, works_, deletions_ = schedulingUsingJavaCSP(
-                self, [job], self.replicas_locations, nodes_free_time, self.env.now)
+            transfers_, works_, deletions_ = yield from self._timedSchedulingUsingJavaCSP(
+                [job], self.replicas_locations, nodes_free_time, self.env.now)
         finally:
             self.java_main_class = orig_java_main_class
             if incremental_limit is not None:
@@ -1142,7 +1327,7 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
                 job = self.waiting_jobs[0]
 
                 logger.debug("[%s] Master: probing Incremental for job %s (adaptive-joint)", self.env.now, job.job_id)
-                inc_transfers, inc_works, inc_deletions, f1 = self._placeSingleJobIncremental(job)
+                inc_transfers, inc_works, inc_deletions, f1 = yield from self._placeSingleJobIncremental(job)
 
                 if f1 is None:
                     logger.warning("[%s] Master: no CSP solution found for job %s (adaptive-joint/incremental probe), will retry", self.env.now, job.job_id)
@@ -1157,35 +1342,51 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
                 if should_escalate:
                     max_budget = self._config.get('adaptive_max_budget_s', self.adaptive_max_budget_s)
                     budget = min(alpha * f1, max_budget)
-                    logger.debug("[%s] Master: job %s F1=%.3f -> joint escalation budget=%.3f (snapshot at %.3f)",
-                                 self.env.now, job.job_id, f1, budget, self.env.now + budget)
-                    yield self.env.timeout(budget)
+                    logger.debug("[%s] Master: job %s F1=%.3f -> joint escalation budget=%.3f",
+                                 self.env.now, job.job_id, f1, budget)
 
                     nodes_free_time = self.nodesFreeTime(self.ongoing_transfers, self.ongoing_works)
                     replicas_locations = self.replicas_locations
                     jobs_to_reschedule = [job] + self.getRunningJobs()
 
-                    self._writeWarmStart(jobs_to_reschedule, replicas_locations, nodes_free_time)
-                    orig_limit = self._config.get('solver_time_limit_s')
-                    orig_java_main_class = self.java_main_class
-                    try:
-                        self._config['solver_time_limit_s'] = max(1, int(round(budget)))
-                        # Without this, the joint solve silently runs under the class-level
-                        # default (MainIncremental, kept for the cheap F1 probe) instead of the
-                        # actual bi-objectif+warmstart escalation -- and since MainIncremental
-                        # never stops early once it can't quickly prove optimal, it then just
-                        # burns the entire budget doing the wrong solve (confirmed: a real run got
-                        # stuck for 5+ minutes on a single-job MainIncremental call carrying a
-                        # 619s budget meant for the joint replan).
-                        self.java_main_class = self.escalation_java_main_class
-                        transfers_, works_, deletions_ = schedulingUsingJavaCSP(
-                            self, jobs_to_reschedule, replicas_locations, nodes_free_time, self.env.now)
-                    finally:
-                        self.java_main_class = orig_java_main_class
-                        if orig_limit is None:
-                            self._config.pop('solver_time_limit_s', None)
-                        else:
-                            self._config['solver_time_limit_s'] = orig_limit
+                    parallel_escalation = self._config.get('parallel_warm_cold_escalation', self.parallel_warm_cold_escalation)
+                    if parallel_escalation:
+                        # Runs warm-started and cold searches CONCURRENTLY and keeps the better
+                        # one -- see _timedParallelEscalation's own docstring for why a warm
+                        # start can actively hurt a time-limited search on a bigger joint
+                        # problem. Handles its own java_main_class/_config/warm-start/timing via
+                        # per-thread proxies, so nothing here needs mutating self for it.
+                        transfers_, works_, deletions_ = yield from self._timedParallelEscalation(
+                            jobs_to_reschedule, replicas_locations, nodes_free_time, self.env.now, budget)
+                    else:
+                        self._writeWarmStart(jobs_to_reschedule, replicas_locations, nodes_free_time)
+                        orig_limit = self._config.get('solver_time_limit_s')
+                        orig_java_main_class = self.java_main_class
+                        try:
+                            self._config['solver_time_limit_s'] = max(1, int(round(budget)))
+                            # Without this, the joint solve silently runs under the class-level
+                            # default (MainIncremental, kept for the cheap F1 probe) instead of the
+                            # actual bi-objectif+warmstart escalation -- and since MainIncremental
+                            # never stops early once it can't quickly prove optimal, it then just
+                            # burns the entire budget doing the wrong solve (confirmed: a real run got
+                            # stuck for 5+ minutes on a single-job MainIncremental call carrying a
+                            # 619s budget meant for the joint replan).
+                            self.java_main_class = self.escalation_java_main_class
+                            # _timedSchedulingUsingJavaCSP charges this solve's REAL wall-clock time
+                            # (not the budget estimate above, which only bounds the solver's time
+                            # limit) against simulated time -- see charge_thinking_time. Replaced an
+                            # earlier version that pre-emptively charged `budget` itself (a fixed
+                            # estimate, not what the solve actually took) before even running the
+                            # solve; this way every approach (online/online_biobj/incremental/hybrid)
+                            # is charged the same way, for its own actual solve, not an estimate.
+                            transfers_, works_, deletions_ = yield from self._timedSchedulingUsingJavaCSP(
+                                jobs_to_reschedule, replicas_locations, nodes_free_time, self.env.now)
+                        finally:
+                            self.java_main_class = orig_java_main_class
+                            if orig_limit is None:
+                                self._config.pop('solver_time_limit_s', None)
+                            else:
+                                self._config['solver_time_limit_s'] = orig_limit
 
                     if len(transfers_.keys()) > 0 and len(works_.keys()) > 0:
                         logger.debug("[%s] Master: job %s joint escalation accepted (%s job(s) replanned)",
@@ -1195,7 +1396,7 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
                     else:
                         logger.warning("[%s] Master: joint escalation found no solution for job %s, falling back to Incremental for it alone",
                                        self.env.now, job.job_id)
-                        transfers_, works_, deletions_, _ = self._placeSingleJobIncremental(job)
+                        transfers_, works_, deletions_, _ = yield from self._placeSingleJobIncremental(job)
                         if len(transfers_.keys()) > 0 and len(works_.keys()) > 0:
                             self._commitSingleJobPlan(transfers_, works_, deletions_)
                             self.waiting_jobs.pop(0)

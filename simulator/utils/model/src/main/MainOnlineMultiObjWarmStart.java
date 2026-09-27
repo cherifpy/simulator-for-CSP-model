@@ -629,6 +629,19 @@ public class MainOnlineMultiObjWarmStart {
                 // File missing/unreadable: no job frozen (matches behavior before this existed).
             }
 
+            // Opt-in (see the constraint block below, right after jobEndTime is built): when on,
+            // a frozen job's resident node(s) are reserved for it until its own last task ends --
+            // no other job's task may start there any earlier. File missing/empty/"0" (the
+            // default): off, identical to behavior before this existed (frozen jobs' own task
+            // timing stays fully free, exactly like everyone else's).
+            boolean freezeBlocksNodeUntilDone = false;
+            try {
+                String t = readFile(MODEL_INPUTS_DIR + "/freeze_blocks_node_until_done.txt").trim();
+                freezeBlocksNodeUntilDone = t.equals("1");
+            } catch (Exception e) {
+                // File missing/unreadable: off (matches behavior before this existed).
+            }
+
             // Confines an already-running job's task placement to a "powerful" subset of nodes
             // (by bandwidth/compute_capacity) so a full replan solves faster -- powerfulNodes is
             // the allowed set, powerRestricted marks which jobs (never a brand-new arrival) it
@@ -1022,17 +1035,29 @@ public class MainOnlineMultiObjWarmStart {
             //makespan var and ensure it's >= all end
             boolean makespan_obj = false;
             final IntVar[] objectives = new IntVar[4];
+            // Per-job flow time, indexed like data_sizes/replicas_location/isFrozen (nb_data
+            // entries) -- declared here (not inside the else branch below, where it's
+            // actually filled in) so the epsilon-constraint phase 2 code, much further down in
+            // this same method, can read each job's OWN phase-1 value and constrain each job
+            // individually instead of only the batch-wide max (see the per-job cap block below).
+            final IntVar[] all_flow_time = new IntVar[nb_data];
+            // This job's own last task end time (BEFORE adding elapsedTime -- i.e. purely "when
+            // do ITS OWN NotStarted tasks in this batch finish"), indexed like all_flow_time.
+            // Only used for the frozen-jobs-block-the-node-until-done constraint below; declared
+            // here for the same reason as all_flow_time (needed further down, filled in inside
+            // the else branch).
+            final IntVar[] jobEndTime = new IntVar[nb_data];
             if (makespan_obj) {
                 /*IntVar makespanVar = model.intVar("makespan", 0, makespan);
 
-                
+
                 model.setObjective(false, makespanVar); // false => MINIMIZE (see Choco API)*/
             } else {
 
-                IntVar[] all_flow_time = new IntVar[nb_data];
                 for (int i = 0; i < nb_data; i++) {
                     IntVar end_time = model.intVar(0, makespan);
                     model.max(end_time, jobEnds[i]).post();
+                    jobEndTime[i] = end_time;
 
                     IntVar elapsedTime =  model.intVar(jobs.get(i).timelasped);
 
@@ -1053,6 +1078,35 @@ public class MainOnlineMultiObjWarmStart {
                 //model.setObjective(false, maxFlowTime);
                 objectives[1] = maxFlowTime;
                 objectives[0] = sumFlowTime;
+
+                // Opt-in (see MainOnlineMultiObjWarmStart.freezeBlocksNodeUntilDone / the Python
+                // config key of the same purpose): a frozen job i is confined to its own
+                // resident nodes (validNodesList above), but its OWN task timing was left fully
+                // free -- meaning the solver could (and did) push a frozen job's tasks LATER to
+                // make room for some other, more flexible job sharing that node, inflating the
+                // frozen job's own flow time as collateral damage (confirmed: this is exactly
+                // why freezing degraded the batch's max flow time in the hybrid-vs-online_biobj
+                // investigation). This block instead reserves each frozen job's resident node(s)
+                // for it until it's done: any OTHER job's task landing on a node frozen job i
+                // resides on must start at or after i's own last task end (jobEndTime[i]) --
+                // i.e. the frozen job runs to completion first, then the node is released,
+                // exactly like a real reservation, instead of the solver being free to interleave
+                // or delay it.
+                if (freezeBlocksNodeUntilDone) {
+                    for (int i = 0; i < nb_data; i++) {
+                        if (!isFrozen[i]) continue;
+                        for (int n : replicas_location[i]) {
+                            for (int i2 = 0; i2 < nb_data; i2++) {
+                                if (i2 == i) continue;
+                                int[] wl2 = works[i2];
+                                for (int k2 = 0; k2 < wl2.length; k2++) {
+                                    BoolVar onSameNode = jobNodes[i2][k2].eq(n).boolVar();
+                                    model.ifThen(onSameNode, model.arithm(jobStarts[i2][k2], ">=", jobEndTime[i]));
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Objective 2: the flow time of ONE specific job -- by convention, whichever job
                 // in this batch has the HIGHEST job_id. Every experiment driving this from Python
@@ -1287,6 +1341,14 @@ public class MainOnlineMultiObjWarmStart {
             // up phase 2's cap, so it must use this holder, not objectives[1] directly.
             int[] lastMaxFlow = {-1};
             int[] lastEnergy = {-1};
+            // Per-job flow time on the last accepted solution -- same instantiation-safety
+            // rationale as lastMaxFlow (captured inside onSolution, not read from all_flow_time
+            // directly after a time-limited findOptimalSolution returns). Snapshotted into
+            // phase1FlowTimeByJob right when phase 1 ends, so phase 2 can cap EACH job's own flow
+            // time against ITS OWN phase-1 value, not just the batch-wide max (see the per-job
+            // cap block below -- this is what actually stops phase 2 from arbitrarily sacrificing
+            // a non-worst job for energy, which the batch-wide-only cap never protected against).
+            int[] lastFlowTimeByJob = new int[nb_data];
             // Set right before phase 2 starts (epsilon-constraint mode only) so onSolution can
             // report, on phase 2's very FIRST accepted solution, whether the warm start actually
             // took (i.e. that first solution's maxFlowTime should equal phase 1's own, since the
@@ -1303,6 +1365,7 @@ public class MainOnlineMultiObjWarmStart {
                             + " energy=" + objectives[3].getValue() + " nb_data=" + nb_data + " t=" + solver.getTimeCount());
                     found[0] = true;
                     lastMaxFlow[0] = objectives[1].getValue();
+                    for (int i = 0; i < nb_data; i++) lastFlowTimeByJob[i] = all_flow_time[i].getValue();
                     if (inPhase2[0] && !phase2FirstSolutionSeen[0]) {
                         phase2FirstSolutionSeen[0] = true;
                         boolean warmStartHeld = lastMaxFlow[0] == phase1FinalMaxFlow[0];
@@ -1457,6 +1520,14 @@ public class MainOnlineMultiObjWarmStart {
                     if (!t.isEmpty()) epsilonMaxCap = Double.parseDouble(t);
                 } catch (Exception e) { /* default: no ceiling */ }
 
+                // Clear any phase1 snapshot left over from a PREVIOUS solve in this same model_dir
+                // -- if phase 1 finds nothing THIS time (below), these files must be absent, not
+                // silently still showing a stale prior solve's placement (the Python-side reader
+                // gates on java_main_class but has no way to tell "fresh" from "stale" once a
+                // file exists).
+                new java.io.File(MODEL_OUTPUTS_DIR + "/phase1_works.csv").delete();
+                new java.io.File(MODEL_OUTPUTS_DIR + "/phase1_transfers.csv").delete();
+
                 int phase1Seconds = Math.max(1, (int) Math.round(timeLimitSeconds * phase1Fraction));
                 int phase2Seconds = Math.max(1, timeLimitSeconds - phase1Seconds);
                 System.out.println("### EPSILON-CONSTRAINT mode: phase1 (minimize max flow time) budget="
@@ -1476,24 +1547,8 @@ public class MainOnlineMultiObjWarmStart {
                     // IllegalStateException ("not instantiated") depending on the exact search
                     // state when the clock ran out.
                     int bestMaxFlow = lastMaxFlow[0];
-                    int epsilonAbs = Math.max(1, (int) Math.round(bestMaxFlow * epsilonFraction));
-                    int cap = bestMaxFlow + epsilonAbs;
-                    if (epsilonMaxCap != null) {
-                        // Never below bestMaxFlow itself: phase 1 already PROVED that value is
-                        // achievable, so a ceiling under it would make phase 2's own constraint
-                        // infeasible from the start. If the ceiling is that tight, phase 2 simply
-                        // gets zero slack (cap == bestMaxFlow) instead of crashing.
-                        int ceilingInt = (int) Math.round(epsilonMaxCap);
-                        int cappedCap = Math.max(bestMaxFlow, Math.min(cap, ceilingInt));
-                        if (cappedCap != cap) {
-                            System.out.println("### EPSILON-CONSTRAINT: relative cap " + cap
-                                    + " exceeds the absolute ceiling " + ceilingInt
-                                    + " -- clamping phase2's cap to " + cappedCap + " ###");
-                        }
-                        cap = cappedCap;
-                    }
                     System.out.println("### EPSILON-CONSTRAINT: phase1 best maxFlowTime=" + bestMaxFlow
-                            + "  phase2 cap=maxFlowTime<=" + cap + " (epsilon=" + epsilonAbs + ") ###");
+                            + "  (per-job caps below, epsilon=" + epsilonFraction + ") ###");
 
                     // reset() clears the search tree, measures (getTimeCount() back to 0), and
                     // every previously-set stop criterion (including phase 1's limitTime) --
@@ -1525,6 +1580,26 @@ public class MainOnlineMultiObjWarmStart {
                     // (phase 2's first accepted solution's maxFlowTime is checked against
                     // phase1FinalMaxFlow) rather than just assuming it from Choco's internals.
                     phase1FinalMaxFlow[0] = bestMaxFlow;
+                    int[] phase1FlowTimeByJob = lastFlowTimeByJob.clone();
+
+                    // Snapshot phase 1's OWN solution before phase 2 starts -- onSolution (above)
+                    // clears() and rebuilds transfersList/worksList on every accepted solution, so
+                    // phase 2's first accepted solution would otherwise silently overwrite phase
+                    // 1's placement with no way to recover it afterward. Exported separately (not
+                    // part of the SchedulingResult this call returns, which stays phase 2's/the
+                    // fallback's as before) purely so an outside analysis can compute each job's
+                    // OWN flow time under phase 1 alone and compare it against the final result --
+                    // i.e. measure exactly how much the energy-driven consolidation in phase 2
+                    // costs each individual job, not just the batch-wide max flow time the
+                    // epsilon cap already bounds (see the hybrid-vs-online_biobj investigation
+                    // this was added for).
+                    try {
+                        writeTransferConfigCSV(new ArrayList<>(transfersList), MODEL_OUTPUTS_DIR + "/phase1_transfers.csv");
+                        writeWorkConfigCSV(new ArrayList<>(worksList), MODEL_OUTPUTS_DIR + "/phase1_works.csv");
+                    } catch (Exception e) {
+                        System.out.println("### WARNING: failed to export phase1 snapshot (" + e.getMessage() + ") ###");
+                    }
+
                     inPhase2[0] = true;
                     solver.reset();
                     solver.setSearch(
@@ -1548,12 +1623,34 @@ public class MainOnlineMultiObjWarmStart {
                                                     }, (i, j) -> true),
                                             decisionVars), 2)
                     );
-                    model.arithm(objectives[1], "<=", cap).post();
+                    // PER-JOB cap, not just the batch-wide max: model.arithm(objectives[1], "<=",
+                    // cap) alone only bounds whichever job ends up being the WORST -- it says
+                    // NOTHING about every other job, so phase 2 was previously free to arbitrarily
+                    // reshuffle any non-worst job for energy (confirmed: with epsilon=0.1%, the
+                    // batch's own worst job stayed EXACTLY at its phase-1 value while two other
+                    // jobs in the same batch degraded by +888 and +1898 -- nothing in the old
+                    // constraint touched them at all). Capping EACH job's own flow time against
+                    // ITS OWN phase-1 value closes that gap: no job can be sacrificed beyond its
+                    // own epsilon slack, whether or not it's the batch's worst.
+                    StringBuilder jobCapsLog = new StringBuilder();
+                    for (int i = 0; i < nb_data; i++) {
+                        int jobEpsilonAbs = Math.max(1, (int) Math.round(phase1FlowTimeByJob[i] * epsilonFraction));
+                        int jobCap = phase1FlowTimeByJob[i] + jobEpsilonAbs;
+                        if (epsilonMaxCap != null) {
+                            int ceilingInt = (int) Math.round(epsilonMaxCap);
+                            jobCap = Math.max(phase1FlowTimeByJob[i], Math.min(jobCap, ceilingInt));
+                        }
+                        model.arithm(all_flow_time[i], "<=", jobCap).post();
+                        if (i > 0) jobCapsLog.append(", ");
+                        jobCapsLog.append("job").append(jobs.get(i).job_id).append(":")
+                                .append(phase1FlowTimeByJob[i]).append("<=").append(jobCap);
+                    }
+                    System.out.println("### EPSILON-CONSTRAINT: per-job caps (phase1<=cap) -- " + jobCapsLog + " ###");
                     solver.limitTime(phase2Seconds + "s");
                     found[0] = false; // phase 2's own outcome, tracked separately from phase 1's
                     solver.findOptimalSolution(objectives[3], false);
                     if (!found[0]) {
-                        System.out.println("### EPSILON-CONSTRAINT: no solution found in phase 2 -- "
+                        System.out.println("### EPSILON-CONSTRAINT: no solution found in phase 2 (per-job caps) -- "
                                 + "the exported schedule is whatever phase 1 last left in "
                                 + "transfersList/worksList (maxFlowTime=" + bestMaxFlow + ") ###");
                     } else {

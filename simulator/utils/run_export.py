@@ -71,8 +71,12 @@ def run_captured(fn, *fargs):
 
 def solver_model_dir():
     """utils/model directory the Java solver actually reads/writes for THIS process (honours the
-    SIMULATOR_RUN_CWD isolation used when several runs share one checkout)."""
-    return os.path.join(os.environ.get("SIMULATOR_RUN_CWD", SIMULATOR_DIR), "utils", "model")
+    SIMULATOR_RUN_CWD isolation used when several runs share one checkout, and -- taking
+    precedence over it -- a per-thread override for isolating concurrent solves WITHIN one
+    process; see utils.modelCSP.run_cwd_override)."""
+    from utils.modelCSP import get_run_cwd_override
+    run_cwd = get_run_cwd_override() or os.environ.get("SIMULATOR_RUN_CWD", SIMULATOR_DIR)
+    return os.path.join(run_cwd, "utils", "model")
 
 
 def snapshot_solver_io(run_dir):
