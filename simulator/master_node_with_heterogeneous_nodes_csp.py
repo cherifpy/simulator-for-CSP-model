@@ -255,24 +255,17 @@ class SchedulingUsingCSPOnline:
                     task = self.jobs[job_id].tasks[k]
                     if task.status == "Finished":
                         self.ongoing_works[f'node_{node_id}'] = None
-                    elif self.env.now > exp_end + 1:
-                        # Diagnostic added 2026-09-28: this node's "ongoing" slot is occupied by a
-                        # task whose own expected end time is long past, yet task.status never
-                        # reached "Finished" -- blocks this node from ever dispatching its NEXT
-                        # queued works entry (line ~272's own gate requires ongoing_works is None),
-                        # a second possible head-of-line-blocking mechanism alongside the
-                        # dataset_events one below. Throttled.
-                        stall_key = ('ongoing_works', node_id, job_id, k)
-                        stall_counts = getattr(self, '_dispatch_stall_counts', None)
-                        if stall_counts is None:
-                            stall_counts = {}
-                            self._dispatch_stall_counts = stall_counts
-                        stall_counts[stall_key] = stall_counts.get(stall_key, 0) + 1
-                        if stall_counts[stall_key] in (1, 100, 10000, 1000000):
-                            print(f"### DIAG ongoing_works STALLED: node_{node_id} job {job_id} task_k={k} "
-                                  f"status={task.status!r} expected_end={exp_end:.2f} now={self.env.now:.2f} "
-                                  f"stall count={stall_counts[stall_key]} ###", flush=True)
 
+                        # Bug found 2026-09-28: this release used to live in an `elif
+                        # self.env.now > exp_end + 1` branch instead -- which fires for ANY task
+                        # still not "Finished" long after its expected end, the NORMAL state for a
+                        # task still waiting on its own data transfer, not a sign the node's copy
+                        # is unneeded. Confirmed via live trace: a node's data was deleted within
+                        # 0.1s of its transfer completing, before the waiting task's own retry loop
+                        # ever saw it, stranding it in "Scheduled" forever. The ongoing task that
+                        # occupies this very slot is itself proof the data is still needed on this
+                        # node, so the release may only run once that task has actually finished.
+                        #
                         # The job's data is only needed on this node for as long as one of
                         # its tasks is still queued to run here. No task of this job left in
                         # this node's queue -> the data can be released right away, instead of
@@ -299,25 +292,6 @@ class SchedulingUsingCSPOnline:
 
                     ready = t_start <= self.env.now
                     has_event = (node_id, job_id) in self.dataset_events.keys()
-                    if ready and not has_event:
-                        # Diagnostic added 2026-09-28: investigating jobs that never finish at
-                        # larger scale (20j/50n) -- head-of-line blocking suspected: a works entry
-                        # stuck here forever (t_start long past, but no dataset_events key for this
-                        # (node,job) pair) blocks every OTHER works entry queued behind it on this
-                        # same node too, even for unrelated jobs. Throttled to avoid flooding.
-                        stall_key = (node_id, job_id)
-                        stall_counts = getattr(self, '_dispatch_stall_counts', None)
-                        if stall_counts is None:
-                            stall_counts = {}
-                            self._dispatch_stall_counts = stall_counts
-                        stall_counts[stall_key] = stall_counts.get(stall_key, 0) + 1
-                        if stall_counts[stall_key] in (1, 100, 10000, 1000000):
-                            print(f"### DIAG works dispatch STALLED: node_{node_id} job {job_id} task_k={k} "
-                                  f"t_start={t_start:.2f} now={self.env.now:.2f} -- no dataset_events "
-                                  f"entry for (node_{node_id}, job {job_id}) -- stall count="
-                                  f"{stall_counts[stall_key]}, queue_len={len(self.works[f'node_{node_id}'])}, "
-                                  f"replicas_locations[{job_id}]={self.replicas_locations.get(job_id)} ###",
-                                  flush=True)
 
                     if ready and has_event:
                         (job_id, _, k, t_start, t_end, duration) = self.works[f'node_{node_id}'].pop(0)
@@ -326,9 +300,18 @@ class SchedulingUsingCSPOnline:
 
                         compute_node = self.compute_nodes[node_id]
 
-                        not_executed_tasks = [task for task in job.tasks if task.status == "NotStarted"]
-
-                        task = None if len(not_executed_tasks) == 0 else not_executed_tasks[0]
+                        # Bug found 2026-09-28: this used to grab whichever task happened to be
+                        # first "NotStarted" in the job's own task list, ignoring which specific
+                        # task_k the CSP solver actually assigned to THIS node in the works entry
+                        # just popped above. Confirmed via live trace: the solver's raw output
+                        # assigned task_k 5/6/7 of a job to one node, but dispatch put task_k=3
+                        # there instead. Must respect the solver's own per-node assignment.
+                        task = job.tasks[k]
+                        if task.status != "NotStarted":
+                            logger.warning("[%s] Master: works entry for job %s task_k=%s on node %s "
+                                           "but that task is already %r -- skipping (stale work item)",
+                                           self.env.now, job_id, k, node_id, task.status)
+                            task = None
 
                         if task:
                             task.dataset_ready_event = self.dataset_events[(node_id, job_id)]
@@ -346,8 +329,32 @@ class SchedulingUsingCSPOnline:
 
                 # Actually free this node's storage for replicas the CSP chose to abandon
                 # (rather than keep indefinitely) once their scheduled deletion time is reached.
+                #
+                # Bug found 2026-09-28: deletion_time comes straight from the CSP's own idealized
+                # plan, computed assuming every transfer/task dispatches right on its planned
+                # t_start -- but real dispatch regularly lags the plan by 100+ sim-time-units (the
+                # blocking Java-CSP subprocess call freezes the whole simulation while it runs, see
+                # _timedSchedulingUsingJavaCSP). deletion_time <= env.now can therefore become true
+                # well before a still-queued (or still-ongoing) task of this exact job on this exact
+                # node has had a chance to actually run, silently deleting the data out from under
+                # it -- same failure class as the ongoing_works release bug fixed above, but via
+                # this separate, unguarded path. Confirmed via live trace: a node's data appeared
+                # (transfer done) then vanished before a task already queued on that very node ever
+                # got dispatched, stranding it in "Scheduled" forever.
                 while self.deletions[f'node_{node_id}'] and self.deletions[f'node_{node_id}'][0][1] <= self.env.now:
-                    job_id, deletion_time = self.deletions[f'node_{node_id}'].pop(0)
+                    job_id, deletion_time = self.deletions[f'node_{node_id}'][0]
+
+                    still_needed_here = any(w[0] == job_id for w in self.works[f'node_{node_id}'])
+                    ongoing = self.ongoing_works[f'node_{node_id}']
+                    if ongoing is not None and ongoing[0] == job_id:
+                        still_needed_here = True
+
+                    if still_needed_here:
+                        # Leave it queued -- retry on a later scheduling() tick once the task(s)
+                        # that still need this node's copy have actually run.
+                        break
+
+                    self.deletions[f'node_{node_id}'].pop(0)
                     compute_node = self.compute_nodes[node_id]
 
                     if job_id in self.replicas_locations and node_id in self.replicas_locations[job_id]:
