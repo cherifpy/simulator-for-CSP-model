@@ -32,6 +32,7 @@ import os
 os.environ.setdefault("MPLBACKEND", "Agg")
 
 import argparse
+import copy
 import csv
 import json
 import logging
@@ -48,7 +49,9 @@ import simpy
 from classes.tracker import Tracker
 from classes.job import Job
 from compute_node import ComputeNode
-from master_node_with_heterogeneous_nodes_csp import SchedulingUsingCSPOnline, SchedulingUsingCSPIncremental
+from master_node_with_heterogeneous_nodes_csp import (
+    SchedulingUsingCSPOnline, SchedulingUsingCSPIncremental, SchedulingUsingCSPAdaptiveJoint,
+)
 from utils.modelCSP import schedulingUsingJavaCSP
 from utils.run_export import (
     TASKS_FIELDS, TRANSFERS_FIELDS, DELETIONS_FIELDS, TRAJECTORY_FIELDS,
@@ -147,37 +150,19 @@ def parse_args():
                               "baseline already achieves for free when phase 1 itself under-"
                               "converges (seen on the large tier with a 1h/1h split: the relative "
                               "cap ended up +18.5%% over Online's own 2h result). Default: no ceiling.")
-    parser.add_argument("--hybrid-alpha", type=float, default=0.1,
-                         help="hybrid approach only: Incremental-first gate -- if F1 (Incremental's "
-                              "own flow time for the new job alone) clears --hybrid-f1-threshold, "
-                              "escalates to online_biobj_warmstart budgeted at hybrid_alpha * F1 "
-                              "seconds (capped at --hybrid-max-budget). Default: 0.1 (10%% of F1).")
+    parser.add_argument("--hybrid-alpha", type=float, default=0.2,
+                         help="hybrid approach only: escalation budget = min(hybrid_alpha * F1, "
+                              "--hybrid-max-budget) seconds, where F1 is Incremental's own flow "
+                              "time for the new job alone. Default: 0.2 (20%% of F1) -- matches the "
+                              "live simulator's own default.")
     parser.add_argument("--hybrid-max-budget", type=float, default=1200,
                          help="hybrid approach only: hard ceiling (seconds) on the escalation budget "
                               "(hybrid_alpha * F1). Default: 1200 = 20min.")
-    parser.add_argument("--hybrid-f1-threshold", type=float, default=None,
-                         help="hybrid approach only: F1 must exceed this to bother escalating at all "
-                              "-- below it, Incremental's own placement is used directly, no extra "
-                              "solve. Default: unset (always try escalating).")
     parser.add_argument("--hybrid-incremental-time-limit", type=float, default=15,
                          help="hybrid approach only: solver budget (seconds) for its own Incremental "
-                              "F1 probe -- this same solve's placement is ALSO reused directly as "
-                              "the new job's warm-start hint for the escalation (no second, "
-                              "throwaway Incremental solve). Independent of --incremental-time-limit "
-                              "(which governs the standalone incremental approach). Default: 15.")
-    parser.add_argument("--freeze-large-jobs-threshold", type=float, default=None,
-                         help="hybrid approach only (pre-processing): a not-finished job already "
-                              "resident somewhere whose dataset_size (MB) is at or above this "
-                              "threshold is frozen for the joint escalation solve -- confined to its "
-                              "current node(s), no new replica. Default: unset.")
-    parser.add_argument("--freeze-remaining-time-threshold", type=float, default=None,
-                         help="hybrid approach only (pre-processing): freezes a not-finished job "
-                              "whose own remaining work (nb_tasks_not_started * task_duration) is at "
-                              "or below this threshold. Default: unset.")
-    parser.add_argument("--freeze-jobs-with-ongoing-transfer", action="store_true",
-                         help="hybrid approach only (pre-processing): freezes any not-finished job "
-                              "with a transfer currently in flight (per state A's own snapshot) -- "
-                              "it can't be redirected anyway. Default: off.")
+                              "F1 probe (_placeSingleJobIncremental). Independent of "
+                              "--incremental-time-limit (which governs the standalone incremental "
+                              "approach). Default: 15.")
     parser.add_argument("--state-a-time-limit", type=int, default=30,
                          help="CSP solver time budget for the ONE joint solve that builds state A over "
                               "all --n-existing jobs at once, per tier (default: 30s).")
@@ -560,13 +545,14 @@ def finalize_run(master, new_job, res, log_text, wall_s, run_dir, tier_name, rep
             "epsilon_max_cap": args.epsilon_max_cap if approach in ("epsilon", "online_biobj_warmstart", "hybrid") else None,
             "hybrid_alpha": args.hybrid_alpha if approach == "hybrid" else None,
             "hybrid_max_budget": args.hybrid_max_budget if approach == "hybrid" else None,
-            "hybrid_f1_threshold": args.hybrid_f1_threshold if approach == "hybrid" else None,
-            "freeze_large_jobs_threshold": args.freeze_large_jobs_threshold if approach == "hybrid" else None,
-            "freeze_remaining_time_threshold": args.freeze_remaining_time_threshold if approach == "hybrid" else None,
-            "freeze_jobs_with_ongoing_transfer": args.freeze_jobs_with_ongoing_transfer if approach == "hybrid" else None}
+            "hybrid_incremental_time_limit": args.hybrid_incremental_time_limit if approach == "hybrid" else None}
     if res is None:
         write_run_folder(run_dir, {"trajectory": trajectory}, {**meta, "result": None}, log_text)
         return None, None
+    # Surfaced into the aggregate results.json (not just this run's own summary.json) so it's
+    # directly readable next to mean/max_flow_time_all -- the one stat missing from the original
+    # online/incremental-only version of this sweep and its results_analysis.ipynb.
+    res["scheduling_time_s"] = wall_s
     plan = res.pop("_plan")
     freeze_at = master._freeze_at
     rescheduled = set(res["jobs_to_reschedule"])
@@ -976,47 +962,43 @@ def run_epsilon_style(master, new_job, isolated_ids, nb_nodes, now, replicas_loc
 
 
 def run_hybrid_style(master, new_job, isolated_ids, nb_nodes, now, replicas_locations, not_finished_jobs,
-                      hybrid_alpha, hybrid_max_budget, hybrid_f1_threshold, hybrid_incremental_time_limit,
-                      epsilon_fraction, epsilon_phase1_fraction, epsilon_max_cap,
-                      freeze_large_jobs_threshold, freeze_remaining_time_threshold, freeze_jobs_with_ongoing_transfer):
-    """Exact spec: (1) Incremental alone computes F1 for the new job, budgeted at
-    hybrid_incremental_time_limit (default 15s) -- this solve's own placement doubles as the
-    fallback result AND as the new job's warm-start hint below, so it is only ever computed once
-    (unlike an earlier version of this function, which wastefully ran a second throwaway
-    Incremental solve inside build_warm_start_for_reconsideration just to seed the warm start).
-    (2) If F1 clears hybrid_f1_threshold: pre-processing (freeze_*) selects which not-finished
-    jobs get confined to their current node(s), then online-warmstart-bi-obj
-    (MainOnlineMultiObjWarmStart's epsilon-constraint: minimize max flow time, then energy within
-    epsilon_fraction of it) jointly reconsiders the new job + every not-finished job, budgeted at
-    hybrid_alpha * F1 (default 10%, capped at hybrid_max_budget). A found solution is accepted
-    unconditionally (no gain check, matching the live SchedulingUsingCSPAdaptiveJoint). (3) No
-    solution found -> falls back to step 1's own Incremental placement, untouched."""
-    nodes_free_time = SchedulingUsingCSPIncremental.nodesFreeTimeIncremental(master, master.ongoing_transfers, master.ongoing_works)
-    orig_limit = master._config.get('solver_time_limit_s')
-    try:
-        master._config['solver_time_limit_s'] = max(1, int(round(hybrid_incremental_time_limit)))
-        master.java_main_class = 'MainIncremental'
-        inc_transfers, inc_works, inc_deletions = schedulingUsingJavaCSP(master, [new_job], replicas_locations, nodes_free_time, now)
-    finally:
-        if orig_limit is None:
-            master._config.pop('solver_time_limit_s', None)
-        else:
-            master._config['solver_time_limit_s'] = orig_limit
+                      hybrid_alpha, hybrid_max_budget, hybrid_incremental_time_limit,
+                      epsilon_fraction, epsilon_phase1_fraction):
+    """Mirrors SchedulingUsingCSPAdaptiveJoint.schedulingNewJob()'s escalation branch EXACTLY --
+    same code, not a reimplementation. Replaces this function's 2025-era single-warmstart-solve
+    version (which predates the live class's 4-way parallel escalation, and used the old
+    freeze_large_jobs_threshold/freeze_remaining_time_threshold/freeze_jobs_with_ongoing_transfer
+    pre-processing -- both since superseded by the median-split freeze_below_median/
+    freeze_above_median/nofreeze/warm_nofreeze design; see _timedParallelEscalation's own
+    docstring in master_node_with_heterogeneous_nodes_csp.py for why). Probes Incremental for F1
+    (bounded by hybrid_incremental_time_limit), then runs the real 4-way parallel escalation
+    budgeted at min(hybrid_alpha*F1, hybrid_max_budget) seconds. Reached by shallow-copying master
+    and reassigning its class to SchedulingUsingCSPAdaptiveJoint -- state A itself is always built
+    the plain Online/MainOnline way (see build_state_a), so this only ever affects how the new
+    job's own placement gets solved. charge_thinking_time is off: run_tier's own run_captured
+    already measures this whole call's wall-clock time (see finalize_run's scheduling_time_s), and
+    there is no live SimPy env.run() loop here for env.timeout() to advance anyway."""
+    hybrid_master = copy.copy(master)
+    hybrid_master.__class__ = SchedulingUsingCSPAdaptiveJoint
+    hybrid_master._config = dict(master._config)
+    hybrid_master._config['charge_thinking_time'] = False
+    hybrid_master._config['epsilon_fraction'] = epsilon_fraction
+    hybrid_master._config['epsilon_phase1_fraction'] = epsilon_phase1_fraction
+    hybrid_master._config['parallel_warm_cold_escalation'] = True
+    hybrid_master._config['incremental_time_limit_s'] = hybrid_incremental_time_limit
+    hybrid_master._config['adaptive_alpha'] = hybrid_alpha
+    hybrid_master._config['adaptive_max_budget_s'] = hybrid_max_budget
 
-    if not inc_transfers or not inc_works:
-        return None
+    def drive(gen):
+        try:
+            next(gen)
+        except StopIteration as e:
+            return e.value
+        raise RuntimeError("hybrid: generator unexpectedly yielded -- charge_thinking_time should be False")
 
-    new_job_finish = None
-    new_job_start = None
-    for key in [f'node_{i}' for i in range(nb_nodes)]:
-        for w in inc_works.get(key, []):
-            job_id, node_index, task_index, start_abs, end_abs, duration = w
-            if job_id == new_job.job_id:
-                new_job_finish = end_abs if new_job_finish is None else max(new_job_finish, end_abs)
-                new_job_start = start_abs if new_job_start is None else min(new_job_start, start_abs)
-    if new_job_finish is None:
+    inc_transfers, inc_works, inc_deletions, f1 = drive(hybrid_master._placeSingleJobIncremental(new_job))
+    if f1 is None:
         return None
-    f1 = new_job_finish - new_job.arriving_time
 
     inc_flow_by_job = {}
     for j in master.jobs + [new_job]:
@@ -1028,8 +1010,10 @@ def run_hybrid_style(master, new_job, isolated_ids, nb_nodes, now, replicas_loca
                 inc_flow_by_job[j.job_id] = cf - j.arriving_time
     inc_flow_times = list(inc_flow_by_job.values())
     inc_isolated_flow_times = [ft for jid, ft in inc_flow_by_job.items() if jid in isolated_ids]
+    fallback_nodes_free_time = SchedulingUsingCSPIncremental.nodesFreeTimeIncremental(
+        master, master.ongoing_transfers, master.ongoing_works)
     incremental_result = {
-        "wait_time_new_job": (new_job_start - new_job.arriving_time) if new_job_start is not None else None,
+        "wait_time_new_job": None,
         "flow_time_new_job": f1,
         "mean_flow_time_all": sum(inc_flow_times) / len(inc_flow_times) if inc_flow_times else None,
         "max_flow_time_all": max(inc_flow_times) if inc_flow_times else None,
@@ -1041,49 +1025,19 @@ def run_hybrid_style(master, new_job, isolated_ids, nb_nodes, now, replicas_loca
         "hybrid_f1": f1,
         "hybrid_escalation_budget": None,
         "_plan": {"transfers": inc_transfers, "works": inc_works, "deletions": inc_deletions,
-                  "nodes_free_time": dict(nodes_free_time), "flow_by_job": inc_flow_by_job},
+                  "nodes_free_time": dict(fallback_nodes_free_time), "flow_by_job": inc_flow_by_job},
     }
 
-    should_escalate = hybrid_f1_threshold is None or f1 > hybrid_f1_threshold
-    if not should_escalate:
-        return incremental_result
-
     budget = min(hybrid_alpha * f1, hybrid_max_budget)
-
-    build_warm_start_for_reconsideration(master, new_job, not_finished_jobs, nb_nodes, now, replicas_locations,
-                                         new_job_placement=(inc_transfers, inc_works))
-
     jobs_to_reschedule = [new_job] + not_finished_jobs
-    nodes_free_time = master.nodesFreeTime(master.ongoing_transfers, master.ongoing_works)
+    nodes_free_time = hybrid_master.nodesFreeTime(hybrid_master.ongoing_transfers, hybrid_master.ongoing_works)
 
-    orig_limit = master._config.get('solver_time_limit_s')
-    orig_freeze_large = master._config.get('freeze_large_jobs_threshold_mb')
-    orig_freeze_remaining = master._config.get('freeze_remaining_time_threshold')
-    orig_freeze_ongoing = master._config.get('freeze_jobs_with_ongoing_transfer')
-    try:
-        master._config['solver_time_limit_s'] = max(1, int(round(budget)))
-        master._config['freeze_large_jobs_threshold_mb'] = freeze_large_jobs_threshold
-        master._config['freeze_remaining_time_threshold'] = freeze_remaining_time_threshold
-        master._config['freeze_jobs_with_ongoing_transfer'] = freeze_jobs_with_ongoing_transfer
-        master.java_main_class = 'MainOnlineMultiObjWarmStart'
-        master.multi_objective = 2
-        master.epsilon_fraction = epsilon_fraction
-        master.epsilon_phase1_fraction = epsilon_phase1_fraction
-        master.epsilon_max_cap = epsilon_max_cap
-        transfers_, works_, deletions_ = schedulingUsingJavaCSP(master, jobs_to_reschedule, replicas_locations, nodes_free_time, now)
-    finally:
-        if orig_limit is None:
-            master._config.pop('solver_time_limit_s', None)
-        else:
-            master._config['solver_time_limit_s'] = orig_limit
-        master._config['freeze_large_jobs_threshold_mb'] = orig_freeze_large
-        master._config['freeze_remaining_time_threshold'] = orig_freeze_remaining
-        master._config['freeze_jobs_with_ongoing_transfer'] = orig_freeze_ongoing
+    transfers_, works_, deletions_ = drive(hybrid_master._timedParallelEscalation(
+        jobs_to_reschedule, not_finished_jobs, replicas_locations, nodes_free_time, now, budget))
 
     if not transfers_ or not works_:
-        # Joint escalation found no solution -- confirmed possible even when pre-processing's
-        # frozen jobs share no node (see the live version's own investigation): fall back to the
-        # Incremental placement already computed above, untouched.
+        # 4-way escalation found no solution -- fall back to the Incremental placement already
+        # computed above, untouched (mirrors the live schedulingNewJob's own fallback).
         return incremental_result
 
     finish = {j.job_id: None for j in jobs_to_reschedule}
@@ -1205,13 +1159,11 @@ def run_tier(config, args, results_dir, tier_name, size_range, tier_index):
             hybrid_incremental_limit = args.hybrid_incremental_time_limit
             if hybrid_incremental_limit is None:
                 hybrid_incremental_limit = args.incremental_time_limit
-            solve("hybrid", "HYBRID style (Incremental-gated joint escalation)", args.hybrid_max_budget,
+            solve("hybrid", "HYBRID style (F1 probe + 4-way parallel escalation)", args.hybrid_max_budget,
                   lambda nj: run_hybrid_style(master, nj, isolated_ids, args.nb_nodes, now, replicas_locations,
                                               not_finished_jobs, args.hybrid_alpha, args.hybrid_max_budget,
-                                              args.hybrid_f1_threshold, hybrid_incremental_limit,
-                                              args.epsilon_fraction, args.epsilon_phase1_fraction, args.epsilon_max_cap,
-                                              args.freeze_large_jobs_threshold, args.freeze_remaining_time_threshold,
-                                              args.freeze_jobs_with_ongoing_transfer))
+                                              hybrid_incremental_limit, args.epsilon_fraction,
+                                              args.epsilon_phase1_fraction))
 
         trials.append({
             "repeat": r,

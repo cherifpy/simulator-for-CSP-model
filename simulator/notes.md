@@ -201,3 +201,16 @@ Hypride, Incremental, OnlineBiobj
 
 - Rien n'a été commité (comme convenu)
 - Rien n'a été poussé
+
+#faut vraiment verifier ca Non, pas exactement comme tu le décris — j'ai vérifié dans le code, et voici précisément ce qui se passe, identique pour les 3 approches (incremental, online_biobj, hybrid) :
+
+- nodes_free_time/replicas_locations sont capturés AVANT le solve, à l'instant T (self.env.now au moment de l'appel).
+- Le solveur Java prend sa décision de placement sur cette photo de l'infra à T, comme si résoudre était instantané.
+- Après le solve, le temps réel écoulé (elapsed) est chargé via yield self.env.timeout(elapsed) — ça fait avancer l'horloge simulée à T+elapsed.
+- Mais rien ne re-capture l'état de l'infra à T+elapsed avant de committer le plan. Le plan a été décidé sur l'état à T, pas sur l'état "T + temps de scheduling".
+
+Donc le temps de scheduling est bien facturé comme un coût (ça retarde tout ce qui suit dans la simulation), mais le solveur ne voit jamais l'état réel de l'infra tel qu'il sera une fois ce temps écoulé — il décide comme si c'était instantané à T, puis on paie le délai après coup.
+
+Autre point que j'ai vérifié en creusant ta question : l'exécution réelle des tâches (compute_node.py:processTasks) n'utilise même pas les timestamps absolus (start_time/end_time) que le solveur calcule — elle dépile la queue FIFO et utilise self.env.now réel au moment où chaque tâche démarre vraiment. Donc les timestamps du solveur servent à la décision de placement (quel job sur quel nœud, dans quel ordre) et à l'affichage/logging, mais pas à piloter directement le timing réel de la simulation.
+
+C'est le même comportement pour les 3 approches — donc pas de biais entre elles sur ce point précis, mais c'est une approximation (photo figée à T) présente partout.

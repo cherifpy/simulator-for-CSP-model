@@ -4,6 +4,7 @@ import os
 import random
 import simpy
 import time
+import threading
 import concurrent.futures
 import numpy as np
 import logging
@@ -215,12 +216,19 @@ class SchedulingUsingCSPOnline:
 
             for node_id in range(len(self.compute_nodes)):
 
-                # Free up this node's transfer slot once its ongoing transfer has completed.
-                if self.ongoing_transfers[f'node_{node_id}'] is not None:
-                    job_id, _, t_start, t_end, duration = self.ongoing_transfers[f'node_{node_id}']
-                    if self.env.now >= t_start + duration:
-                        self.ongoing_transfers[f'node_{node_id}'] = None
-
+                # Bug found 2026-09-28: this used to free the slot on a naive ESTIMATE
+                # (env.now >= t_start + duration) instead of the transfer's REAL completion.
+                # transferData() must first acquire compute_node.bandwidth_lock (a capacity-
+                # limited simpy.Resource -- several transfers can be genuinely concurrent up to
+                # that capacity), so under contention the real transfer can finish LATER than
+                # this estimate assumed. The slot then looked "free" while the old transfer was
+                # still in flight, letting scheduling() dispatch a SECOND transfer for the same
+                # (node, job) pair -- confirmed via a live crash: "Event ... has already been
+                # triggered" in transferData, from two dispatches racing to succeed() the same
+                # dataset_events entry (and, when timing differs slightly, an orphaned event
+                # instead of a crash -- the task waiting on it then never starts, i.e. the job
+                # never finishes). Freeing the slot is now transferData's own job, done exactly
+                # once, right when ITS transfer genuinely completes -- see its own comment.
                 if len(self.transfers[f'node_{node_id}']) > 0:
                     if self.ongoing_transfers[f'node_{node_id}'] is None:
 
@@ -243,10 +251,27 @@ class SchedulingUsingCSPOnline:
 
                 # Free up this node's work slot once its ongoing task has completed.
                 if self.ongoing_works[f'node_{node_id}'] is not None:
-                    job_id, _, k, _, _, _ = self.ongoing_works[f'node_{node_id}']
+                    job_id, _, k, _, exp_end, _ = self.ongoing_works[f'node_{node_id}']
                     task = self.jobs[job_id].tasks[k]
                     if task.status == "Finished":
                         self.ongoing_works[f'node_{node_id}'] = None
+                    elif self.env.now > exp_end + 1:
+                        # Diagnostic added 2026-09-28: this node's "ongoing" slot is occupied by a
+                        # task whose own expected end time is long past, yet task.status never
+                        # reached "Finished" -- blocks this node from ever dispatching its NEXT
+                        # queued works entry (line ~272's own gate requires ongoing_works is None),
+                        # a second possible head-of-line-blocking mechanism alongside the
+                        # dataset_events one below. Throttled.
+                        stall_key = ('ongoing_works', node_id, job_id, k)
+                        stall_counts = getattr(self, '_dispatch_stall_counts', None)
+                        if stall_counts is None:
+                            stall_counts = {}
+                            self._dispatch_stall_counts = stall_counts
+                        stall_counts[stall_key] = stall_counts.get(stall_key, 0) + 1
+                        if stall_counts[stall_key] in (1, 100, 10000, 1000000):
+                            print(f"### DIAG ongoing_works STALLED: node_{node_id} job {job_id} task_k={k} "
+                                  f"status={task.status!r} expected_end={exp_end:.2f} now={self.env.now:.2f} "
+                                  f"stall count={stall_counts[stall_key]} ###", flush=True)
 
                         # The job's data is only needed on this node for as long as one of
                         # its tasks is still queued to run here. No task of this job left in
@@ -272,7 +297,29 @@ class SchedulingUsingCSPOnline:
 
                     (job_id, _, k, t_start, _, _) = self.works[f'node_{node_id}'][0]
 
-                    if t_start <= self.env.now and (node_id, job_id) in self.dataset_events.keys():
+                    ready = t_start <= self.env.now
+                    has_event = (node_id, job_id) in self.dataset_events.keys()
+                    if ready and not has_event:
+                        # Diagnostic added 2026-09-28: investigating jobs that never finish at
+                        # larger scale (20j/50n) -- head-of-line blocking suspected: a works entry
+                        # stuck here forever (t_start long past, but no dataset_events key for this
+                        # (node,job) pair) blocks every OTHER works entry queued behind it on this
+                        # same node too, even for unrelated jobs. Throttled to avoid flooding.
+                        stall_key = (node_id, job_id)
+                        stall_counts = getattr(self, '_dispatch_stall_counts', None)
+                        if stall_counts is None:
+                            stall_counts = {}
+                            self._dispatch_stall_counts = stall_counts
+                        stall_counts[stall_key] = stall_counts.get(stall_key, 0) + 1
+                        if stall_counts[stall_key] in (1, 100, 10000, 1000000):
+                            print(f"### DIAG works dispatch STALLED: node_{node_id} job {job_id} task_k={k} "
+                                  f"t_start={t_start:.2f} now={self.env.now:.2f} -- no dataset_events "
+                                  f"entry for (node_{node_id}, job {job_id}) -- stall count="
+                                  f"{stall_counts[stall_key]}, queue_len={len(self.works[f'node_{node_id}'])}, "
+                                  f"replicas_locations[{job_id}]={self.replicas_locations.get(job_id)} ###",
+                                  flush=True)
+
+                    if ready and has_event:
                         (job_id, _, k, t_start, t_end, duration) = self.works[f'node_{node_id}'].pop(0)
 
                         job = self.jobs[job_id]
@@ -456,6 +503,18 @@ class SchedulingUsingCSPOnline:
 
     def transferData(self, job_id, dataset_size, compute_node, dataset_ready_event, task_id=-1, send_task=False, duration=None):
 
+        # Bug found 2026-09-28: ongoing_transfers[node_id] (the "this node's transfer slot is
+        # busy" flag) used to be freed by scheduling() itself on a naive time ESTIMATE, before
+        # this coroutine's real transfer necessarily finished (see scheduling()'s own comment on
+        # this) -- freeing it here instead, exactly once, right when THIS transfer genuinely
+        # completes, closes that race. Guarded on job_id matching in case some other, unrelated
+        # bug ever leaves a mismatched entry there -- never clear a slot this call doesn't own.
+        def _freeOwnSlot():
+            key = f'node_{compute_node.node_id}'
+            current = self.ongoing_transfers.get(key)
+            if current is not None and current[0] == job_id:
+                self.ongoing_transfers[key] = None
+
         if job_id in self.replicas_locations.keys() and compute_node.node_id in self.replicas_locations[job_id]:
             # Data already present on this node (e.g. re-planned after the original transfer
             # already completed): nothing to transfer, just unblock whoever is waiting on it.
@@ -466,6 +525,7 @@ class SchedulingUsingCSPOnline:
             # here loops in the 0.01-tick retry queue indefinitely instead of ever starting.
             if job_id not in compute_node.datasets:
                 compute_node.datasets.append(job_id)
+            _freeOwnSlot()
             dataset_ready_event.succeed()
             return
 
@@ -485,9 +545,16 @@ class SchedulingUsingCSPOnline:
 
             yield self.env.timeout(transfer_time)
             end_time = self.env.now
+            _freeOwnSlot()
 
-            if (compute_node.node_id, job_id) in self.dataset_events.keys() and compute_node.node_id not in self.replicas_locations[job_id]:
-                self.dataset_events[(compute_node.node_id, job_id)].succeed()
+            # Succeed the event THIS call was actually asked to signal (the parameter), not
+            # whatever schedulingUsingJavaCSP's dispatch loop currently has in self.dataset_events
+            # for this (node, job) key -- that dict entry can only ever be reassigned to a NEW
+            # event now that the race above is closed, but reading through the parameter instead
+            # of the dict is the more directly correct semantic regardless, and was the actual
+            # crash site (double-succeed()) when the race above still existed.
+            if compute_node.node_id not in self.replicas_locations[job_id]:
+                dataset_ready_event.succeed()
                 self.replicas_locations[job_id].append(compute_node.node_id)
 
             self.compute_nodes[compute_node.node_id].datasets.append(job_id)
@@ -1113,13 +1180,13 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
     # existed.
     parallel_warm_cold_escalation = False
 
-    # Labels for the concurrent escalation variants -- see _timedParallelEscalation. "coldnofreeze"
-    # is diagnostic: cold search (no warm start) with pre-processing (freeze_*) also disabled,
-    # matching exactly what plain online_biobj does for the same batch -- added to test whether
-    # freezing (not warm-starting, which the warm-vs-cold comparison already ruled out: 13/14
-    # controlled comparisons landed on the identical optimum) explains why hybrid's escalation
-    # scored worse than a standalone online_biobj run on comparable batches.
-    _PARALLEL_ESCALATION_LABELS = ("warm", "cold", "coldnofreeze")
+    # Labels for the concurrent escalation variants -- see _timedParallelEscalation. Four
+    # variants, crossing "which jobs get frozen" (below-median / above-median / none) with
+    # "warm-started or not" (only the no-freeze case tries both, since the earlier warm-vs-cold
+    # investigation already found no meaningful difference between them: 13/14 controlled
+    # comparisons landed on the identical optimum) -- see _estimateJobFlowTime /
+    # _splitRunningJobsByMedianFlowTime for how the two groups are chosen each escalation.
+    _PARALLEL_ESCALATION_LABELS = ("freeze_below_median", "freeze_above_median", "nofreeze", "warm_nofreeze")
 
     def _ensureParallelRunDirs(self):
         """Lazily creates one isolated utils/model tree per concurrent escalation variant (own
@@ -1147,13 +1214,88 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
         self._parallel_run_cwds = run_cwds
         return run_cwds
 
-    def _timedParallelEscalation(self, jobs_to_reschedule, replicas_locations, nodes_free_time, now, budget):
-        """Runs the escalation as THREE concurrent Java solves -- warm-started
-        (escalation_java_main_class, seeded via _writeWarmStart, pre-processing/freeze applied as
-        usual), cold (MainOnlineMultiObj, Choco's own default search, no hint, freeze still
-        applied), and coldnofreeze (same cold search but with pre-processing/freeze DISABLED,
-        matching exactly what plain online_biobj does for this batch) -- and keeps whichever
-        achieves the lower max flow time (phase 1's own objective; energy is the tie-breaker).
+    def _ensureEscalationPool(self):
+        """Lazily creates ONE ThreadPoolExecutor for the whole simulation's lifetime, reused by
+        every _timedParallelEscalation call, instead of a fresh pool per replan. A run of ~5
+        escalations on Grid5000 (Linux) was observed to accumulate 65 live threads and then hang
+        forever with one Python thread pegged at ~100% CPU and zero Java subprocesses left --
+        i.e. stuck inside ThreadPoolExecutor's own bookkeeping after every variant had already
+        returned, the same symptom the old per-call `pool.shutdown(wait=False)` was already known
+        to trigger on macOS. Reusing a single long-lived pool (never shut down mid-run) removes
+        the repeated create/destroy cycle that's the leading suspect for that bookkeeping getting
+        corrupted, and incidentally also fixes the thread-count leak itself."""
+        pool = getattr(self, '_escalation_pool', None)
+        if pool is None:
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(self._PARALLEL_ESCALATION_LABELS))
+            self._escalation_pool = pool
+        return pool
+
+    def _estimateJobFlowTime(self, job):
+        """Iterative greedy list-scheduling estimate of this job's OWN total flow time, ported
+        from replication-policies-simulator's own estimateFlowTime/checkUtility
+        (utils/searchAlgo.py). Two things distinguish this from a naive "remaining work / number
+        of replicas" average: (1) it uses job.nb_tasks (the FULL task count, not just
+        NotStarted) recomputed from job.arriving_time across the CURRENT replica set -- i.e.
+        "what would this job's flow time be if this exact replica set had been load-balanced
+        since arrival", a consistent quantity across jobs regardless of how much of each has
+        actually executed so far; (2) it accounts for each replica's own transfer-completion
+        time and its node's own speed (compute_capacity), not an equal split. Job.replicas is
+        populated by startTransfer() with real transfer_start_time/transfer_time per replica.
+        Simulates greedily: repeatedly hand the next task to whichever replica becomes free
+        earliest, which is the standard approximation for makespan-minimizing scheduling on
+        unrelated machines and naturally balances finish times across replicas of different
+        speed and staggered availability. Returns None if the job has no replicas yet (nothing
+        to estimate from)."""
+        if not job.replicas:
+            return None
+        task_duration = job.tasks[0].duration if job.tasks else 0
+        next_free = {}
+        for rep in job.replicas:
+            available_at = (rep.transfer_start_time - job.arriving_time) + rep.transfer_time
+            speed = task_duration * self.compute_nodes[rep.node_id].compute_capacity
+            # A job can end up with more than one Replica entry for the same node across
+            # replans (e.g. re-confirmed on a later escalation) -- keep only the latest, it
+            # reflects the most current transfer, not a phantom duplicate capacity.
+            next_free[rep.node_id] = [available_at, speed]
+        for _ in range(job.nb_tasks):
+            n = min(next_free, key=lambda node_id: next_free[node_id][0])
+            next_free[n][0] += next_free[n][1]
+        return max(state[0] for state in next_free.values())
+
+    def _splitRunningJobsByMedianFlowTime(self, jobs):
+        """(below, above): `jobs` split around the MEDIAN of their own _estimateJobFlowTime --
+        jobs with no estimate yet (no replicas, e.g. still mid-first-transfer-decision) are
+        excluded from both groups entirely (left unfrozen either way, since there's nothing to
+        rank them by). Ties go to the below-median group (arbitrary but deterministic)."""
+        estimates = [(job, self._estimateJobFlowTime(job)) for job in jobs]
+        measurable = [(job, est) for job, est in estimates if est is not None]
+        if not measurable:
+            return [], []
+        measurable.sort(key=lambda pair: pair[1])
+        median = measurable[len(measurable) // 2][1]
+        below = [job for job, est in measurable if est <= median]
+        above = [job for job, est in measurable if est > median]
+        return below, above
+
+    def _timedParallelEscalation(self, jobs_to_reschedule, not_finished_jobs, replicas_locations, nodes_free_time, now, budget):
+        """Runs the escalation as FOUR concurrent Java solves, crossing "which not-finished jobs
+        get frozen" with "warm-started or not":
+          - freeze_below_median: cold search, freeze whichever not-finished jobs have the SMALLER
+            half of _estimateJobFlowTime (i.e. the jobs closest to done / with the least to gain
+            from reconsideration -- see the whole freeze-criterion investigation this replaces).
+          - freeze_above_median: cold search, freeze the LARGER half instead -- included as the
+            direct comparison point, expected to reproduce the same regression the old
+            large-dataset/ongoing-transfer freeze criteria caused (confining a job with lots of
+            remaining work to a single node kills its own parallelism).
+          - nofreeze: cold search, nothing frozen at all.
+          - warm_nofreeze: warm-started search (escalation_java_main_class, seeded via
+            _writeWarmStart), nothing frozen -- kept only to double check warm-vs-cold still
+            doesn't matter once freezing is out of the picture (the earlier warm-vs-cold
+            investigation already found 13/14 controlled comparisons identical).
+        The new arriving job (jobs_to_reschedule[0]) is never frozen in any variant -- only
+        not_finished_jobs are eligible, and only those with an existing replica (median split
+        needs an estimate; see _splitRunningJobsByMedianFlowTime).
+
         Real OS-level parallelism: schedulingUsingJavaCSP blocks on a Java subprocess, which
         releases the GIL, so the threads' Java processes genuinely run side by side on separate
         cores, not one after the other. Each thread gets its own utils/model tree
@@ -1163,17 +1305,22 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
         Charges the REAL wall-clock time of the SLOWEST variant against simulated time (they ran
         concurrently, not back to back) -- callers must use `yield from`."""
         run_cwds = self._ensureParallelRunDirs()
-        freeze_keys = ('freeze_large_jobs_threshold_mb', 'freeze_remaining_time_threshold',
-                       'freeze_jobs_with_ongoing_transfer')
 
-        def run_variant(label, java_main_class, write_warm_start, disable_freeze):
+        below_median_jobs, above_median_jobs = self._splitRunningJobsByMedianFlowTime(not_finished_jobs)
+        below_ids = [j.job_id for j in below_median_jobs]
+        above_ids = [j.job_id for j in above_median_jobs]
+        print(f"### PARALLEL ESCALATION median split -- below (frozen in freeze_below_median): "
+              f"{below_ids}, above (frozen in freeze_above_median): {above_ids} ###")
+
+        def run_variant(label, java_main_class, write_warm_start, frozen_job_ids):
             proxy = copy.copy(self)
             proxy._config = dict(self._config)
             proxy.java_main_class = java_main_class
             proxy._config['solver_time_limit_s'] = max(1, int(round(budget)))
-            if disable_freeze:
-                for key in freeze_keys:
-                    proxy._config.pop(key, None)
+            # Bypasses the threshold-based freeze_large_jobs_threshold_mb/freeze_remaining_time_
+            # threshold/freeze_jobs_with_ongoing_transfer criteria entirely: this experiment picks
+            # the exact frozen set itself (median-based), not via a fixed magic threshold.
+            proxy._config['frozen_job_ids_override'] = frozen_job_ids
             with run_cwd_override(run_cwds[label]):
                 if write_warm_start:
                     proxy._writeWarmStart(jobs_to_reschedule, replicas_locations, nodes_free_time)
@@ -1184,9 +1331,10 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
             return transfers_, works_, deletions_, elapsed
 
         variant_specs = {
-            "warm": (self.escalation_java_main_class, True, False),
-            "cold": ("MainOnlineMultiObj", False, False),
-            "coldnofreeze": ("MainOnlineMultiObj", False, True),
+            "freeze_below_median": ("MainOnlineMultiObj", False, below_ids),
+            "freeze_above_median": ("MainOnlineMultiObj", False, above_ids),
+            "nofreeze": ("MainOnlineMultiObj", False, []),
+            "warm_nofreeze": (self.escalation_java_main_class, True, []),
         }
         # Safety timeout, not just a nicety: with 3 concurrent variants, this was observed to
         # occasionally hang indefinitely on macOS (0 Java processes left running, one Python
@@ -1199,21 +1347,23 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
         # block on joining worker threads here, in case THAT is where a hang actually sits --
         # any lingering thread is harmless (it never touches shared state after returning).
         result_timeout_s = budget + 90
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(variant_specs))
-        try:
-            futures = {
-                label: pool.submit(run_variant, label, java_main_class, write_warm_start, disable_freeze)
-                for label, (java_main_class, write_warm_start, disable_freeze) in variant_specs.items()
-            }
-            results = {}
-            for label, future in futures.items():
-                try:
-                    results[label] = future.result(timeout=result_timeout_s)
-                except Exception as e:
-                    print(f"### WARNING: parallel escalation variant '{label}' failed/timed out ({e}) -- treated as no solution ###")
-                    results[label] = ({}, {}, {}, result_timeout_s)
-        finally:
-            pool.shutdown(wait=False)
+        pool = self._ensureEscalationPool()
+        print(f"### PARALLEL ESCALATION diag: submitting at {time.strftime('%H:%M:%S')}, "
+              f"active_count={threading.active_count()} ###")
+        futures = {
+            label: pool.submit(run_variant, label, java_main_class, write_warm_start, frozen_job_ids)
+            for label, (java_main_class, write_warm_start, frozen_job_ids) in variant_specs.items()
+        }
+        results = {}
+        for label, future in futures.items():
+            try:
+                results[label] = future.result(timeout=result_timeout_s)
+                print(f"### PARALLEL ESCALATION diag: '{label}' returned at {time.strftime('%H:%M:%S')} ###")
+            except Exception as e:
+                print(f"### WARNING: parallel escalation variant '{label}' failed/timed out ({e}) -- treated as no solution ###")
+                results[label] = ({}, {}, {}, result_timeout_s)
+        print(f"### PARALLEL ESCALATION diag: all gathered at {time.strftime('%H:%M:%S')}, "
+              f"active_count={threading.active_count()} ###")
 
         def batch_quality(works_):
             """(max flow time, total energy) for this candidate -- lower is better on both,
@@ -1310,17 +1460,38 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
                     if already_present or already_in_flight:
                         continue
                     self.transfers[key].append(transfer)
-                if len(works_.get(key, [])) > 0:
-                    for work in works_[key]:
-                        self.works[key].append(work)
+            # Bug found 2026-09-27: this used to be nested inside the `if key in transfers_`
+            # block above, so a node with real task placements but NO new transfer this round
+            # (the normal case: the job's data is already resident there from an earlier round,
+            # e.g. a frozen job confined to its existing replicas) silently lost its works
+            # entries every time -- the affected job's remaining tasks then stayed "NotStarted"
+            # forever, finished_jobs never reached total_nb_jobs, and the simulation spun in
+            # place (schedulingNewJob/checkOnJobs polling every 0.1 with nothing left to do) for
+            # the rest of the run. Present since _commitJointPlan's introduction (e1de3a4), just
+            # never triggered until frozen-job escalation made "no new transfer, real work exists"
+            # common. Works/transfers are independent outputs of the same solve -- neither should
+            # gate the other.
+            if key in works_ and len(works_[key]) > 0:
+                for work in works_[key]:
+                    self.works[key].append(work)
             if key in deletions_ and len(deletions_[key]) > 0:
                 for deletion in deletions_[key]:
                     self.deletions[key].append(deletion)
 
     def schedulingNewJob(self):
 
+        poll_count = 0
         while True:
             yield self.env.timeout(0.1)
+            poll_count += 1
+            if poll_count % 2000 == 0:
+                # Diagnostic added to isolate a 2026-09-27 Grid5000 hang: this loop polling
+                # forever with no escalation in flight would show up here (large poll_count,
+                # waiting_jobs empty, _allJobsCompleted() stuck False) as opposed to the hang
+                # being inside _timedParallelEscalation's ThreadPoolExecutor bookkeeping instead.
+                print(f"### DIAG schedulingNewJob poll #{poll_count} at sim_time={self.env.now:.2f}: "
+                      f"waiting_jobs={len(self.waiting_jobs)}, finished_jobs={self.finished_jobs}/{self._config['total_nb_jobs']}, "
+                      f"node_queues={[len(cn.queue.items) for cn in self.compute_nodes]} ###")
 
             if len(self.waiting_jobs) >= 1:
 
@@ -1351,13 +1522,13 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
 
                     parallel_escalation = self._config.get('parallel_warm_cold_escalation', self.parallel_warm_cold_escalation)
                     if parallel_escalation:
-                        # Runs warm-started and cold searches CONCURRENTLY and keeps the better
-                        # one -- see _timedParallelEscalation's own docstring for why a warm
-                        # start can actively hurt a time-limited search on a bigger joint
-                        # problem. Handles its own java_main_class/_config/warm-start/timing via
-                        # per-thread proxies, so nothing here needs mutating self for it.
+                        # Runs 4 candidate escalations CONCURRENTLY (freeze the below-median
+                        # group / freeze the above-median group / no freeze / no freeze but
+                        # warm-started) and keeps the best -- see _timedParallelEscalation's own
+                        # docstring. Handles its own java_main_class/_config/warm-start/freeze/
+                        # timing via per-thread proxies, so nothing here needs mutating self.
                         transfers_, works_, deletions_ = yield from self._timedParallelEscalation(
-                            jobs_to_reschedule, replicas_locations, nodes_free_time, self.env.now, budget)
+                            jobs_to_reschedule, self.getRunningJobs(), replicas_locations, nodes_free_time, self.env.now, budget)
                     else:
                         self._writeWarmStart(jobs_to_reschedule, replicas_locations, nodes_free_time)
                         orig_limit = self._config.get('solver_time_limit_s')
@@ -1389,20 +1560,33 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
                                 self._config['solver_time_limit_s'] = orig_limit
 
                     if len(transfers_.keys()) > 0 and len(works_.keys()) > 0:
-                        logger.debug("[%s] Master: job %s joint escalation accepted (%s job(s) replanned)",
-                                     self.env.now, job.job_id, len(jobs_to_reschedule))
-                        self._commitJointPlan(transfers_, works_, deletions_)
+                        # Quality gate: the escalation is a full joint replan under a TIGHT budget
+                        # (and, in the parallel case, split across freeze variants) -- nothing
+                        # about it guarantees the new job itself comes out ahead of what the cheap
+                        # Incremental probe already found (F1). Compare the two on THIS job's own
+                        # flow time (the only metric directly comparable between a single-job
+                        # placement and a joint replan) and keep whichever is actually better,
+                        # instead of accepting the escalation unconditionally just because it
+                        # found *a* solution. inc_transfers/inc_works/inc_deletions are the exact
+                        # placement the F1 probe already computed above -- reused here instead of
+                        # re-solving.
+                        escalation_flow = self._flowTimeFromPlan(job, transfers_, works_)
+                        if escalation_flow is not None and escalation_flow > f1:
+                            logger.debug("[%s] Master: job %s joint escalation (flow=%.3f) worse than "
+                                         "F1 (%.3f) -- keeping Incremental's placement instead",
+                                         self.env.now, job.job_id, escalation_flow, f1)
+                            self._commitSingleJobPlan(inc_transfers, inc_works, inc_deletions)
+                        else:
+                            logger.debug("[%s] Master: job %s joint escalation accepted (%s job(s) replanned)",
+                                         self.env.now, job.job_id, len(jobs_to_reschedule))
+                            self._commitJointPlan(transfers_, works_, deletions_)
                         self.waiting_jobs.pop(0)
                     else:
-                        logger.warning("[%s] Master: joint escalation found no solution for job %s, falling back to Incremental for it alone",
+                        logger.warning("[%s] Master: joint escalation found no solution for job %s, "
+                                       "keeping Incremental's placement (already computed above)",
                                        self.env.now, job.job_id)
-                        transfers_, works_, deletions_, _ = yield from self._placeSingleJobIncremental(job)
-                        if len(transfers_.keys()) > 0 and len(works_.keys()) > 0:
-                            self._commitSingleJobPlan(transfers_, works_, deletions_)
-                            self.waiting_jobs.pop(0)
-                        else:
-                            logger.warning("[%s] Master: no CSP solution found for job %s (adaptive-joint fallback), will retry",
-                                           self.env.now, job.job_id)
+                        self._commitSingleJobPlan(inc_transfers, inc_works, inc_deletions)
+                        self.waiting_jobs.pop(0)
                 else:
                     logger.debug("[%s] Master: job %s F1=%.3f below threshold, using Incremental placement as-is",
                                  self.env.now, job.job_id, f1)

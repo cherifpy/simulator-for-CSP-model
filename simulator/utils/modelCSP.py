@@ -468,8 +468,18 @@ def _schedulingUsingJavaCSP_impl(master_node, jobs: list, replicas_locations: di
     ongoing_transfer_job_ids = {
         ongoing[0] for ongoing in master_node.ongoing_transfers.values() if ongoing is not None
     }
+    # Explicit override: bypasses every threshold-based criterion above entirely and freezes
+    # EXACTLY these job_ids (e.g. a median-based split computed by the caller itself -- see
+    # SchedulingUsingCSPAdaptiveJoint._timedParallelEscalation). None (the default): fall back to
+    # the threshold-based criteria; [] (empty list, distinct from None): explicitly freeze
+    # nothing, also bypassing the thresholds -- lets a caller force "no freeze at all" even if
+    # freeze_large_jobs_threshold_mb/etc. happen to be set in the same config.
+    frozen_job_ids_override = master_node._config.get('frozen_job_ids_override')
     frozen_indices = []
-    if freeze_threshold is not None or freeze_remaining_time_threshold is not None or freeze_ongoing_transfer:
+    if frozen_job_ids_override is not None:
+        frozen_job_ids_set = set(frozen_job_ids_override)
+        frozen_indices = [idx for idx, jd in enumerate(jobs_data) if jd['job_id'] in frozen_job_ids_set]
+    elif freeze_threshold is not None or freeze_remaining_time_threshold is not None or freeze_ongoing_transfer:
         for idx, jd in enumerate(jobs_data):
             has_ongoing_transfer = freeze_ongoing_transfer and jd['job_id'] in ongoing_transfer_job_ids
             already_resident = bool(replicas_locations.get(jd['job_id']))
