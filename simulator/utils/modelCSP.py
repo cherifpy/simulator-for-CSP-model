@@ -552,6 +552,24 @@ def _schedulingUsingJavaCSP_impl(master_node, jobs: list, replicas_locations: di
         with open(objective_choice_path, "w") as f:
             f.write("")
 
+    # Optional: per-job upper bound on this solve's own flow_time variable (objectives[]'s own
+    # all_flow_time[i], one entry per jobs_data row in the SAME sorted-by-job_id order as
+    # power_restricted_jobs.txt's indices above) -- lets a caller ask "minimize the new job's
+    # flow time (objective_choice=2) but never let any OTHER job's flow time exceed X" (the
+    # "hybrid-n_j" design, 2026-10-05: escalate purely for the new arrival, with a hard cap --
+    # e.g. 1.2x its own pre-escalation committed flow time -- on every already-running job, so a
+    # narrow objective can't buy the new job a win by silently wrecking an existing one). Only
+    # written when a caller opts in via master_node.flow_time_caps (dict job_id -> cap, any job
+    # absent from the dict gets no cap); absent otherwise, so every existing caller is unaffected.
+    flow_time_caps = getattr(master_node, 'flow_time_caps', None)
+    flow_time_caps_path = os.path.join(model_dir, "inputs", "flow_time_caps.txt")
+    with open(flow_time_caps_path, "w") as f:
+        if flow_time_caps:
+            f.write(",".join(str(int(flow_time_caps[jd['job_id']])) if jd['job_id'] in flow_time_caps else "-1"
+                              for jd in jobs_data))
+        else:
+            f.write("")
+
     # Java only ever works in a LOCAL frame (0 = "now" for this solve) -- it has no idea what
     # the simulator's absolute clock reads. Pass it along purely so debug prints can show
     # absolute times directly comparable to the final solution's "start:"/"end:" values.

@@ -130,6 +130,7 @@ class SchedulingUsingCSPOnline:
         start = time.time()
         transfers_, works_, deletions_ = schedulingUsingJavaCSP(self, jobs_to_reschedule, replicas_locations, nodes_free_time, now)
         elapsed = time.time() - start
+        print(f"### SCHEDULING ELAPSED: {elapsed:.3f}s (sim_now={now:.2f}, n_jobs={len(jobs_to_reschedule)}) ###", flush=True)
         charge = self._config.get('charge_thinking_time', self.charge_thinking_time)
         if charge:
             yield self.env.timeout(elapsed)
@@ -306,12 +307,29 @@ class SchedulingUsingCSPOnline:
                         # just popped above. Confirmed via live trace: the solver's raw output
                         # assigned task_k 5/6/7 of a job to one node, but dispatch put task_k=3
                         # there instead. Must respect the solver's own per-node assignment.
-                        task = job.tasks[k]
-                        if task.status != "NotStarted":
+                        #
+                        # Bug found 2026-09-28 (later same session): k can be OUT OF RANGE for
+                        # job.tasks -- confirmed via a live crash (IndexError) at 11+ job joint
+                        # reconsideration scale. Root cause not yet isolated (task_id_by_job /
+                        # task_id_maps translation in modelCSP.py's toDict() is the suspect --
+                        # k is supposed to already be translated from the solver's own LOCAL
+                        # NotStarted-subset numbering back to job.tasks' real index). Bounds-
+                        # checked here as a stopgap so a mistranslated/stale k logs and skips
+                        # instead of crashing the whole run.
+                        if not (0 <= k < len(job.tasks)):
                             logger.warning("[%s] Master: works entry for job %s task_k=%s on node %s "
-                                           "but that task is already %r -- skipping (stale work item)",
-                                           self.env.now, job_id, k, node_id, task.status)
+                                           "is out of range for job.tasks (len=%s) -- skipping "
+                                           "(stale/mistranslated work item); job status snapshot: %s",
+                                           self.env.now, job_id, k, node_id, len(job.tasks),
+                                           [t.status for t in job.tasks])
                             task = None
+                        else:
+                            task = job.tasks[k]
+                            if task.status != "NotStarted":
+                                logger.warning("[%s] Master: works entry for job %s task_k=%s on node %s "
+                                               "but that task is already %r -- skipping (stale work item)",
+                                               self.env.now, job_id, k, node_id, task.status)
+                                task = None
 
                         if task:
                             task.dataset_ready_event = self.dataset_events[(node_id, job_id)]
@@ -475,11 +493,17 @@ class SchedulingUsingCSPOnline:
             free_via_transfer = 0
             free_via_work = 0
 
+            # Clamped at 0 (max(0, ...)): t_end/t_start were computed by the CSP solver assuming
+            # its own decision was instantaneous, but real dispatch regularly lags that plan by a
+            # lot (a replan's blocking Java subprocess call can take minutes -- see
+            # _timedSchedulingUsingJavaCSP's own comment) -- so by the time this actually runs,
+            # the "planned" end time can already be in the past relative to env.now. A node that's
+            # ALREADY DONE (even if later than planned) is simply free now, i.e. in 0 time units,
+            # never a negative amount -- there used to be a warning here for the un-clamped case;
+            # removed since this makes it structurally impossible, not just diagnosed.
             if f'node_{node_id}' in ongoing_transfers.keys() and ongoing_transfers[f'node_{node_id}'] is not None:
                 _, node_id, _, t_end, duration = ongoing_transfers[f'node_{node_id}']
-                free_via_transfer = int(t_end - self.env.now) + 1
-                if free_via_transfer < 0:
-                    logger.warning("[%s] Master: negative free time computed for node %s (ongoing transfer)", self.env.now, node_id)
+                free_via_transfer = max(0, int(t_end - self.env.now) + 1)
 
             if f'node_{node_id}' in ongoing_works.keys() and ongoing_works[f'node_{node_id}'] is not None:
                 job_id, node_id, k, t_start, t_end, duration = ongoing_works[f'node_{node_id}']
@@ -488,7 +512,7 @@ class SchedulingUsingCSPOnline:
 
                 if task.status == "Started":
                     execution_time = task.duration * self.compute_nodes[node_id].compute_capacity
-                    free_via_work = int(t_start + execution_time - self.env.now) + 1
+                    free_via_work = max(0, int(t_start + execution_time - self.env.now) + 1)
 
                 elif task.status == "Finished":
                     # Same +1 margin as the other branches: this value gets truncated to an int
@@ -1081,10 +1105,87 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
     # budget already scales with F1, so a small job naturally gets a small (cheap) escalation
     # attempt rather than being blocked from one entirely.
     adaptive_f1_threshold = None
+    # Alternative to adaptive_f1_threshold's fixed/absolute cutoff: escalate only if F1 exceeds
+    # the MEAN _estimateJobFlowTime of currently-running jobs by more than this fraction (e.g.
+    # 0.25 = F1 must be at least 25% worse than the running jobs' own average before bothering).
+    # None (the default): disabled, adaptive_f1_threshold's fixed cutoff applies instead. When
+    # set, takes precedence over adaptive_f1_threshold -- the two are alternative trigger designs,
+    # not combined. Context-sensitive by construction: the same F1 value can trigger escalation
+    # when the system is lightly loaded (low running-job average) but not when it's already
+    # congested (high running-job average), unlike a fixed threshold which treats both the same.
+    adaptive_f1_relative_margin = None
+    # When True, adaptive_f1_relative_margin is used as a BASE margin that shrinks as F1 already
+    # exceeds the running mean (see the escalation-trigger site below for the exact formula) --
+    # instead of one fixed margin applied uniformly regardless of how congested the system is.
+    adaptive_f1_dynamic_margin = False
+    # Vetoes escalation when the running jobs' own committed flow times are already "stable" --
+    # coefficient of variation (std/mean) below this threshold -- regardless of what the F1
+    # margin check says. None (default) disables this veto. Added 2026-10-04 after a real case
+    # (a max-sized new job arriving mid-batch) where escalation was accepted by the batch-max
+    # gate yet just shuffled the imbalance onto different jobs (two existing jobs each lost
+    # >1300s) without any real aggregate benefit: the running batch was already fairly even
+    # (nothing in genuine distress), so there was nothing legitimate to rescue in the first
+    # place -- a low-CV batch is exactly the signature of that situation.
+    adaptive_f1_stability_cv_threshold = None
+    # "hybrid-n_j" design (2026-10-05): when True, every one of the 6 parallel escalation
+    # variants solves with objective_choice=2 (MainOnline.java/MainOnlineMultiObj.java: minimize
+    # ONLY the new job's own flow time, instead of the whole batch's max/sum) AND a hard per-job
+    # cap on every already-running job's own flow time -- see adaptive_degradation_cap_pct.
+    # Meant to be paired with adaptive_selection_metric='new_job' and adaptive_gate_metric=
+    # 'new_job' (both already exist) so the whole pipeline -- objective, variant selection, final
+    # gate -- optimizes the new arrival consistently, with the cap as the only thing stopping it
+    # from doing that at an existing job's expense.
+    adaptive_new_job_objective = False
+    # Cap on an already-running job's flow time, as a fraction ABOVE its own pre-escalation
+    # committed flow time (e.g. 0.20 = may not grow by more than 20%). Only used when
+    # adaptive_new_job_objective is True; None disables the cap (objective_choice=2 still
+    # applies, unconstrained).
+    adaptive_degradation_cap_pct = None
+    # Controls whether the 6 escalation variants run bi-objective (epsilon-constraint, 2 phases:
+    # phase 1 = new job's flow time, phase 2 = energy under a per-job epsilon cap) or plain
+    # single-objective (phase 1 only, no energy term at all). True (default) = bi-objective.
+    # 2026-10-05 finding: switching this to False recovers the validated 7/10 acceptance rate
+    # from before bi-objective was (re)enabled, REGARDLESS of degradation_cap_pct or budget --
+    # bi-objective's own 2-phase structure (4 tracked objectives, shared search machinery)
+    # converges to a measurably worse phase-1 result within the same wall-clock than running
+    # objective_choice=2 alone does, even when phase 1's own time slice is unchanged or larger.
+    # This is a genuine quality/energy-awareness trade-off, not a tunable bug.
+    adaptive_bi_objective = True
     # Budget for the internal Incremental calls (F1 probe + fallback), independent of
     # --solver-time-limit. None (the default) falls back to whatever solver_time_limit_s
     # currently is.
     incremental_time_limit_s = None
+    # Metric the post-escalation quality gate (below) uses to compare the chosen escalation
+    # plan against Incremental's own placement:
+    #   "new_job" (default, original behavior): only the new arrival's own flow time.
+    #   "max" / "mean": the max / mean flow time across the WHOLE batch (jobs_to_reschedule),
+    #   with Incremental's side of the comparison reconstructed as F1 for the new job + each
+    #   other job's CURRENTLY COMMITTED flow time (since Incremental never touches them) -- see
+    #   _currentCommittedBatchFlowTimes. "new_job" can accept an escalation that helps the new
+    #   job while quietly making an already-running job worse (confirmed on a real run); "max"/
+    #   "mean" catch that at the cost of needing the other jobs' committed timings.
+    adaptive_gate_metric = 'new_job'
+    # Metric _timedParallelEscalation's own batch_quality uses to pick the best of the 6
+    # concurrent variants (separate from adaptive_gate_metric above, which only judges the
+    # ALREADY-PICKED plan against Incremental -- this controls which plan gets picked in the
+    # first place). "max" (default): batch-wide max flow time, the validated-safe choice since
+    # 2026-10-02. "new_job": the new arrival's own flow time only -- see batch_quality's own
+    # docstring for why this is deliberately reintroducing a known blind spot, to measure it.
+    adaptive_selection_metric = 'max'
+
+    def _currentCommittedBatchFlowTimes(self, jobs):
+        """Each job's flow time under its CURRENTLY COMMITTED plan (self.works, as of the last
+        successful commit) -- not a proposed plan. Used to reconstruct what "Incremental changes
+        nothing else" implies for jobs other than the new arrival, for the adaptive_gate_metric
+        'max'/'mean' comparison. Jobs with no committed work entry yet (e.g. mid-first-transfer)
+        are simply absent from the result."""
+        finish = {}
+        for entries in self.works.values():
+            for job_id, node_index, task_index, start_abs, end_abs, duration in entries:
+                finish[job_id] = end_abs if job_id not in finish else max(finish[job_id], end_abs)
+        arrival_by_id = {j.job_id: j.arriving_time for j in jobs}
+        return {jid: finish[jid] - arrival_by_id[jid] for jid in finish if jid in arrival_by_id}
+
     def _flowTimeFromPlan(self, job, transfers_, works_):
         """Same as SchedulingUsingCSPAdaptive's: this job's own flow time (finish - arrival) from
         a plan's absolute times, or None if the job doesn't appear in the plan at all."""
@@ -1187,13 +1288,30 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
     # existed.
     parallel_warm_cold_escalation = False
 
-    # Labels for the concurrent escalation variants -- see _timedParallelEscalation. Four
-    # variants, crossing "which jobs get frozen" (below-median / above-median / none) with
+    # Labels for the concurrent escalation variants -- see _timedParallelEscalation. First four
+    # variants cross "which jobs get frozen" (below-mean / above-mean / none) with
     # "warm-started or not" (only the no-freeze case tries both, since the earlier warm-vs-cold
     # investigation already found no meaningful difference between them: 13/14 controlled
     # comparisons landed on the identical optimum) -- see _estimateJobFlowTime /
-    # _splitRunningJobsByMedianFlowTime for how the two groups are chosen each escalation.
-    _PARALLEL_ESCALATION_LABELS = ("freeze_below_median", "freeze_above_median", "nofreeze", "warm_nofreeze")
+    # _splitRunningJobsByMeanFlowTime for how the two groups are chosen each escalation. Split
+    # statistic is the MEAN of _estimateJobFlowTime (not the median -- switched 2026-10-01 at the
+    # user's request, to test whether a mean split gives a more balanced below/above group on the
+    # right-skewed flow-time distributions these workloads produce; a median always gives a 50/50
+    # job count split by construction, a mean does not). A 5th variant, restrict_powerful_nodes,
+    # explores a different axis entirely: instead of freezing WHICH JOBS get reconsidered, it
+    # restricts WHICH NODES already-running jobs may move to (the top fraction by bandwidth/
+    # compute_capacity, via reschedule_top_fraction -- see its own comment in modelCSP.py). A 6th,
+    # freeze_ongoing_transfer, freezes whichever not-finished jobs have a transfer in flight right
+    # now -- the one global config knob (freeze_jobs_with_ongoing_transfer) that frozen_job_ids_
+    # override has always silently bypassed in every OTHER variant (see modelCSP.py's own
+    # comment), so this is the only way to actually test that criterion's effect on the escalation
+    # search itself, not just on the cheap Incremental F1 probe outside it. A brand-new arrival is
+    # never restricted/frozen in any of the six variants.
+    _PARALLEL_ESCALATION_LABELS = ("freeze_below_mean", "freeze_above_mean", "nofreeze", "warm_nofreeze",
+                                   "restrict_powerful_nodes", "freeze_ongoing_transfer")
+    # Fraction of nodes (by bandwidth/compute_capacity) restrict_powerful_nodes confines already-
+    # running jobs to -- see reschedule_top_fraction's own comment in modelCSP.py.
+    _PARALLEL_ESCALATION_RESCHEDULE_TOP_FRACTION = 0.5
 
     def _ensureParallelRunDirs(self):
         """Lazily creates one isolated utils/model tree per concurrent escalation variant (own
@@ -1269,29 +1387,33 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
             next_free[n][0] += next_free[n][1]
         return max(state[0] for state in next_free.values())
 
-    def _splitRunningJobsByMedianFlowTime(self, jobs):
-        """(below, above): `jobs` split around the MEDIAN of their own _estimateJobFlowTime --
+    def _splitRunningJobsByMeanFlowTime(self, jobs):
+        """(below, above): `jobs` split around the MEAN of their own _estimateJobFlowTime --
         jobs with no estimate yet (no replicas, e.g. still mid-first-transfer-decision) are
         excluded from both groups entirely (left unfrozen either way, since there's nothing to
-        rank them by). Ties go to the below-median group (arbitrary but deterministic)."""
+        rank them by). Ties go to the below-mean group (arbitrary but deterministic). Unlike a
+        median split, the two groups are NOT necessarily balanced in job count -- on a
+        right-skewed distribution (a few jobs with a much larger flow-time estimate than the
+        rest), the mean sits above most jobs, so freeze_below_mean ends up freezing MORE jobs
+        and freeze_above_mean fewer."""
         estimates = [(job, self._estimateJobFlowTime(job)) for job in jobs]
         measurable = [(job, est) for job, est in estimates if est is not None]
         if not measurable:
             return [], []
-        measurable.sort(key=lambda pair: pair[1])
-        median = measurable[len(measurable) // 2][1]
-        below = [job for job, est in measurable if est <= median]
-        above = [job for job, est in measurable if est > median]
+        mean = sum(est for _, est in measurable) / len(measurable)
+        below = [job for job, est in measurable if est <= mean]
+        above = [job for job, est in measurable if est > mean]
         return below, above
 
     def _timedParallelEscalation(self, jobs_to_reschedule, not_finished_jobs, replicas_locations, nodes_free_time, now, budget):
-        """Runs the escalation as FOUR concurrent Java solves, crossing "which not-finished jobs
-        get frozen" with "warm-started or not":
-          - freeze_below_median: cold search, freeze whichever not-finished jobs have the SMALLER
-            half of _estimateJobFlowTime (i.e. the jobs closest to done / with the least to gain
-            from reconsideration -- see the whole freeze-criterion investigation this replaces).
-          - freeze_above_median: cold search, freeze the LARGER half instead -- included as the
-            direct comparison point, expected to reproduce the same regression the old
+        """Runs the escalation as FIVE concurrent Java solves. The first four cross "which
+        not-finished jobs get frozen" with "warm-started or not":
+          - freeze_below_mean: cold search, freeze whichever not-finished jobs have an
+            _estimateJobFlowTime at or below the MEAN (i.e. the jobs closest to done / with the
+            least to gain from reconsideration -- see the whole freeze-criterion investigation
+            this replaces). Not necessarily half the jobs -- see _splitRunningJobsByMeanFlowTime.
+          - freeze_above_mean: cold search, freeze the jobs ABOVE the mean instead -- included as
+            the direct comparison point, expected to reproduce the same regression the old
             large-dataset/ongoing-transfer freeze criteria caused (confining a job with lots of
             remaining work to a single node kills its own parallelism).
           - nofreeze: cold search, nothing frozen at all.
@@ -1299,9 +1421,21 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
             _writeWarmStart), nothing frozen -- kept only to double check warm-vs-cold still
             doesn't matter once freezing is out of the picture (the earlier warm-vs-cold
             investigation already found 13/14 controlled comparisons identical).
-        The new arriving job (jobs_to_reschedule[0]) is never frozen in any variant -- only
-        not_finished_jobs are eligible, and only those with an existing replica (median split
-        needs an estimate; see _splitRunningJobsByMedianFlowTime).
+        The fifth explores a different axis -- WHICH NODES are eligible, not which jobs:
+          - restrict_powerful_nodes: cold search, no job frozen, but every not-finished job's
+            reconsideration is confined to the top _PARALLEL_ESCALATION_RESCHEDULE_TOP_FRACTION of
+            nodes by bandwidth/compute_capacity (reschedule_top_fraction, see modelCSP.py) -- a
+            smaller search space without picking which jobs lose flexibility.
+          - freeze_ongoing_transfer: cold search, freeze whichever not-finished jobs have a
+            transfer currently IN FLIGHT (self.ongoing_transfers) -- the criterion
+            freeze_jobs_with_ongoing_transfer was meant to apply, but frozen_job_ids_override
+            bypasses it in every other variant (see modelCSP.py), so this is the only variant
+            where it actually reaches the escalation's own search instead of only the Incremental
+            F1 probe computed before escalation even starts.
+        The new arriving job (jobs_to_reschedule[0]) is never frozen or node-restricted in any
+        variant -- only not_finished_jobs are eligible, and for the freeze variants only those
+        with an existing replica (the mean split needs an estimate; see
+        _splitRunningJobsByMeanFlowTime) or an in-flight transfer (freeze_ongoing_transfer).
 
         Real OS-level parallelism: schedulingUsingJavaCSP blocks on a Java subprocess, which
         releases the GIL, so the threads' Java processes genuinely run side by side on separate
@@ -1313,21 +1447,67 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
         concurrently, not back to back) -- callers must use `yield from`."""
         run_cwds = self._ensureParallelRunDirs()
 
-        below_median_jobs, above_median_jobs = self._splitRunningJobsByMedianFlowTime(not_finished_jobs)
-        below_ids = [j.job_id for j in below_median_jobs]
-        above_ids = [j.job_id for j in above_median_jobs]
-        print(f"### PARALLEL ESCALATION median split -- below (frozen in freeze_below_median): "
-              f"{below_ids}, above (frozen in freeze_above_median): {above_ids} ###")
+        below_mean_jobs, above_mean_jobs = self._splitRunningJobsByMeanFlowTime(not_finished_jobs)
+        below_ids = [j.job_id for j in below_mean_jobs]
+        above_ids = [j.job_id for j in above_mean_jobs]
+        print(f"### PARALLEL ESCALATION mean split -- below (frozen in freeze_below_mean): "
+              f"{below_ids}, above (frozen in freeze_above_mean): {above_ids} ###")
 
-        def run_variant(label, java_main_class, write_warm_start, frozen_job_ids):
+        # Mirrors modelCSP.py's own ongoing_transfer_job_ids computation -- jobs with at least
+        # one transfer currently IN FLIGHT (can't be cancelled, so freezing avoids a replan
+        # abandoning it mid-transfer and leaking the eventual replica -- see
+        # freeze_jobs_with_ongoing_transfer's own comment there). Only not_finished_jobs are
+        # eligible, same as every other freeze variant.
+        ongoing_transfer_job_ids = {
+            ongoing[0] for ongoing in self.ongoing_transfers.values() if ongoing is not None
+        }
+        ongoing_transfer_ids = [j.job_id for j in not_finished_jobs if j.job_id in ongoing_transfer_job_ids]
+        print(f"### PARALLEL ESCALATION ongoing-transfer freeze (freeze_ongoing_transfer): {ongoing_transfer_ids} ###")
+
+        # "hybrid-n_j" (2026-10-05): every variant below minimizes ONLY the new job's own flow
+        # time (objective_choice=2) instead of the batch's max/sum, capped per-job so that can't
+        # come at an existing job's expense -- see adaptive_new_job_objective's own comment.
+        new_job_objective = self._config.get('adaptive_new_job_objective', self.adaptive_new_job_objective)
+        degradation_cap_pct = self._config.get('adaptive_degradation_cap_pct', self.adaptive_degradation_cap_pct)
+        bi_objective = self._config.get('adaptive_bi_objective', self.adaptive_bi_objective)
+        flow_time_caps = None
+        if new_job_objective and degradation_cap_pct is not None:
+            committed = self._currentCommittedBatchFlowTimes(not_finished_jobs)
+            flow_time_caps = {jid: int(round(flow * (1 + degradation_cap_pct))) for jid, flow in committed.items()}
+            print(f"### PARALLEL ESCALATION hybrid-n_j: objective=new_job_flow_time, "
+                  f"degradation_cap={degradation_cap_pct * 100:.0f}%, caps={flow_time_caps} ###")
+
+        def run_variant(label, java_main_class, write_warm_start, frozen_job_ids, reschedule_top_fraction=None):
             proxy = copy.copy(self)
             proxy._config = dict(self._config)
             proxy.java_main_class = java_main_class
             proxy._config['solver_time_limit_s'] = max(1, int(round(budget)))
+            if new_job_objective:
+                # Bi-objective (epsilon-constraint, 2 phases) stays ON -- 2026-10-05 revision:
+                # MainOnlineMultiObj(WarmStart)'s own phase-1 objective call now reads
+                # objective_choice itself (objectives[objectiveChoice], was hardcoded to
+                # objectives[1]/max flow time before this fix), so phase 1 genuinely minimizes
+                # the new job's own flow time, and phase 2 then minimizes energy under its usual
+                # per-job epsilon cap -- computed against phase 1's OWN result, which now reflects
+                # the new-job objective rather than max flow time. flow_time_caps (below) is
+                # POSTED BEFORE phase 1 even starts, so it bounds phase 1 unconditionally; phase
+                # 2's own epsilon_fraction cap then stacks on top of whatever phase 1 landed on --
+                # the two are independent mechanisms, not one replacing the other. Set
+                # adaptive_bi_objective=False to instead force multi_objective=0 -- routes
+                # MainOnlineMultiObj(WarmStart) into their plain single-objective branch (phase 1
+                # only, no energy term at all) -- see that flag's own comment for why this
+                # measurably recovers a much higher gate-acceptance rate.
+                proxy.objective_choice = 2
+                if not bi_objective:
+                    proxy.multi_objective = 0
+                if flow_time_caps:
+                    proxy.flow_time_caps = flow_time_caps
             # Bypasses the threshold-based freeze_large_jobs_threshold_mb/freeze_remaining_time_
             # threshold/freeze_jobs_with_ongoing_transfer criteria entirely: this experiment picks
-            # the exact frozen set itself (median-based), not via a fixed magic threshold.
+            # the exact frozen set itself (mean-based), not via a fixed magic threshold.
             proxy._config['frozen_job_ids_override'] = frozen_job_ids
+            if reschedule_top_fraction is not None:
+                proxy._config['reschedule_top_fraction'] = reschedule_top_fraction
             with run_cwd_override(run_cwds[label]):
                 if write_warm_start:
                     proxy._writeWarmStart(jobs_to_reschedule, replicas_locations, nodes_free_time)
@@ -1338,10 +1518,13 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
             return transfers_, works_, deletions_, elapsed
 
         variant_specs = {
-            "freeze_below_median": ("MainOnlineMultiObj", False, below_ids),
-            "freeze_above_median": ("MainOnlineMultiObj", False, above_ids),
-            "nofreeze": ("MainOnlineMultiObj", False, []),
-            "warm_nofreeze": (self.escalation_java_main_class, True, []),
+            "freeze_below_mean": ("MainOnlineMultiObj", False, below_ids, None),
+            "freeze_above_mean": ("MainOnlineMultiObj", False, above_ids, None),
+            "nofreeze": ("MainOnlineMultiObj", False, [], None),
+            "warm_nofreeze": (self.escalation_java_main_class, True, [], None),
+            "restrict_powerful_nodes": ("MainOnlineMultiObj", False, [],
+                                        self._PARALLEL_ESCALATION_RESCHEDULE_TOP_FRACTION),
+            "freeze_ongoing_transfer": ("MainOnlineMultiObj", False, ongoing_transfer_ids, None),
         }
         # Safety timeout, not just a nicety: with 3 concurrent variants, this was observed to
         # occasionally hang indefinitely on macOS (0 Java processes left running, one Python
@@ -1358,8 +1541,8 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
         print(f"### PARALLEL ESCALATION diag: submitting at {time.strftime('%H:%M:%S')}, "
               f"active_count={threading.active_count()} ###")
         futures = {
-            label: pool.submit(run_variant, label, java_main_class, write_warm_start, frozen_job_ids)
-            for label, (java_main_class, write_warm_start, frozen_job_ids) in variant_specs.items()
+            label: pool.submit(run_variant, label, java_main_class, write_warm_start, frozen_job_ids, reschedule_top_fraction)
+            for label, (java_main_class, write_warm_start, frozen_job_ids, reschedule_top_fraction) in variant_specs.items()
         }
         results = {}
         for label, future in futures.items():
@@ -1372,9 +1555,24 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
         print(f"### PARALLEL ESCALATION diag: all gathered at {time.strftime('%H:%M:%S')}, "
               f"active_count={threading.active_count()} ###")
 
-        def batch_quality(works_):
-            """(max flow time, total energy) for this candidate -- lower is better on both,
-            energy only breaks ties on max flow time. None (no solution) sorts last."""
+        selection_metric = self._config.get('adaptive_selection_metric', self.adaptive_selection_metric)
+
+        def batch_quality(transfers_, works_):
+            """Lower is better, None (no solution) sorts last. Two modes:
+              - 'max' (default, since 2026-10-02): max flow time across the WHOLE batch. Catches
+                a variant that helps the new job while silently hurting an already-running job --
+                confirmed on a real run where restrict_powerful_nodes won on a narrower metric by
+                finding a great flow time for the new job (369s vs 644s for every other variant)
+                while stacking two running jobs' tasks onto a handful of nodes, pushing their own
+                flow times from ~450s to 1126s/1392s.
+              - 'new_job': only the new arrival's own flow time -- reintroduces exactly that blind
+                spot, deliberately, to measure how much collateral damage it causes when combined
+                with the F1 relative-margin trigger and a new_job-metric post-escalation gate
+                (both already filter OUT most escalations entirely; this asks, for the ones that
+                still go through, whether selecting as aggressively as possible for the new job
+                makes the damage worse)."""
+            if selection_metric == 'new_job':
+                return self._flowTimeFromPlan(jobs_to_reschedule[0], transfers_, works_)
             if not works_:
                 return None
             finish = {}
@@ -1385,9 +1583,9 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
             flows = [finish[jid] - arrival_by_id[jid] for jid in finish if jid in arrival_by_id]
             if not flows:
                 return None
-            return (max(flows), 0.0)
+            return max(flows)
 
-        qualities = {label: batch_quality(works_) for label, (_, works_, _, _) in results.items()}
+        qualities = {label: batch_quality(transfers_, works_) for label, (transfers_, works_, _, _) in results.items()}
         print("### PARALLEL ESCALATION: " + ", ".join(
             f"{label}={qualities[label]} ({results[label][3]:.3f}s)" for label in variant_specs) + " ###")
 
@@ -1396,8 +1594,10 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
         if ranked:
             best = ranked[0]
             transfers_, works_, deletions_, _ = results[best]
+            print(f"### PARALLEL ESCALATION WINNER: {best} (new_job_flow_time={qualities[best]:.3f}) ###")
         else:
             transfers_, works_, deletions_ = {}, {}, {}
+            print("### PARALLEL ESCALATION WINNER: none (no variant found a solution) ###")
 
         charge_thinking_time = self._config.get('charge_thinking_time', self.charge_thinking_time)
         if charge_thinking_time:
@@ -1514,8 +1714,47 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
                     continue
 
                 alpha = self._config.get('adaptive_alpha', self.adaptive_alpha)
-                threshold = self._config.get('adaptive_f1_threshold', self.adaptive_f1_threshold)
-                should_escalate = threshold is None or f1 > threshold
+                relative_margin = self._config.get('adaptive_f1_relative_margin', self.adaptive_f1_relative_margin)
+                dynamic_margin = self._config.get('adaptive_f1_dynamic_margin', self.adaptive_f1_dynamic_margin)
+                if relative_margin is not None:
+                    running_estimates = [e for e in (self._estimateJobFlowTime(j) for j in self.getRunningJobs())
+                                          if e is not None]
+                    mean_running_flow = sum(running_estimates) / len(running_estimates) if running_estimates else None
+                    if mean_running_flow is None:
+                        should_escalate = True
+                        effective_margin = relative_margin
+                    elif dynamic_margin:
+                        # Shrinks the margin as F1 already exceeds the running mean: at f1==mean
+                        # it equals relative_margin (the base/strict case); the more F1 is already
+                        # above the mean, the lower the bar to also clear the (now smaller) margin
+                        # on top of that -- congestion makes escalation progressively easier to
+                        # trigger, instead of a single fixed bar that's too strict once the mean
+                        # itself is already inflated by congestion (see 2026-10-04 finding: a
+                        # fixed 25% margin almost never fired on these generated scenarios).
+                        excess_ratio = max(0.0, f1 / mean_running_flow - 1.0)
+                        effective_margin = relative_margin / (1.0 + excess_ratio)
+                        should_escalate = f1 > (1 + effective_margin) * mean_running_flow
+                    else:
+                        effective_margin = relative_margin
+                        should_escalate = f1 > (1 + effective_margin) * mean_running_flow
+                    logger.debug("[%s] Master: job %s F1=%.3f vs running mean=%s (margin=%.0f%%, dynamic=%s, effective=%.3f) -> escalate=%s",
+                                 self.env.now, job.job_id, f1, mean_running_flow, relative_margin * 100, dynamic_margin, effective_margin, should_escalate)
+                else:
+                    threshold = self._config.get('adaptive_f1_threshold', self.adaptive_f1_threshold)
+                    should_escalate = threshold is None or f1 > threshold
+
+                stability_cv_threshold = self._config.get('adaptive_f1_stability_cv_threshold', self.adaptive_f1_stability_cv_threshold)
+                if should_escalate and stability_cv_threshold is not None:
+                    stability_estimates = [e for e in (self._estimateJobFlowTime(j) for j in self.getRunningJobs())
+                                            if e is not None]
+                    if len(stability_estimates) >= 2:
+                        stability_mean = sum(stability_estimates) / len(stability_estimates)
+                        stability_std = (sum((e - stability_mean) ** 2 for e in stability_estimates) / len(stability_estimates)) ** 0.5
+                        cv = stability_std / stability_mean if stability_mean > 0 else 0.0
+                        if cv < stability_cv_threshold:
+                            logger.debug("[%s] Master: job %s running batch is stable (CV=%.3f < %.3f) -- vetoing escalation",
+                                         self.env.now, job.job_id, cv, stability_cv_threshold)
+                            should_escalate = False
 
                 if should_escalate:
                     max_budget = self._config.get('adaptive_max_budget_s', self.adaptive_max_budget_s)
@@ -1529,8 +1768,8 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
 
                     parallel_escalation = self._config.get('parallel_warm_cold_escalation', self.parallel_warm_cold_escalation)
                     if parallel_escalation:
-                        # Runs 4 candidate escalations CONCURRENTLY (freeze the below-median
-                        # group / freeze the above-median group / no freeze / no freeze but
+                        # Runs 4 candidate escalations CONCURRENTLY (freeze the below-mean
+                        # group / freeze the above-mean group / no freeze / no freeze but
                         # warm-started) and keeps the best -- see _timedParallelEscalation's own
                         # docstring. Handles its own java_main_class/_config/warm-start/freeze/
                         # timing via per-thread proxies, so nothing here needs mutating self.
@@ -1568,20 +1807,33 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
 
                     if len(transfers_.keys()) > 0 and len(works_.keys()) > 0:
                         # Quality gate: the escalation is a full joint replan under a TIGHT budget
-                        # (and, in the parallel case, split across freeze variants) -- nothing
-                        # about it guarantees the new job itself comes out ahead of what the cheap
-                        # Incremental probe already found (F1). Compare the two on THIS job's own
-                        # flow time (the only metric directly comparable between a single-job
-                        # placement and a joint replan) and keep whichever is actually better,
-                        # instead of accepting the escalation unconditionally just because it
-                        # found *a* solution. inc_transfers/inc_works/inc_deletions are the exact
-                        # placement the F1 probe already computed above -- reused here instead of
-                        # re-solving.
-                        escalation_flow = self._flowTimeFromPlan(job, transfers_, works_)
-                        if escalation_flow is not None and escalation_flow > f1:
-                            logger.debug("[%s] Master: job %s joint escalation (flow=%.3f) worse than "
-                                         "F1 (%.3f) -- keeping Incremental's placement instead",
-                                         self.env.now, job.job_id, escalation_flow, f1)
+                        # (and, in the parallel case, split across variants) -- nothing about it
+                        # guarantees the new job itself (let alone the batch as a whole) comes out
+                        # ahead of what the cheap Incremental probe already found (F1). Compare
+                        # the two and keep whichever is actually better, instead of accepting the
+                        # escalation unconditionally just because it found *a* solution.
+                        # inc_transfers/inc_works/inc_deletions are the exact placement the F1
+                        # probe already computed above -- reused here instead of re-solving.
+                        gate_metric = self._config.get('adaptive_gate_metric', self.adaptive_gate_metric)
+                        if gate_metric == 'new_job':
+                            escalation_stat = self._flowTimeFromPlan(job, transfers_, works_)
+                            incremental_stat = f1
+                        else:
+                            escalation_flows = {}
+                            for entries in works_.values():
+                                for jid, node_index, task_index, start_abs, end_abs, duration in entries:
+                                    escalation_flows[jid] = end_abs if jid not in escalation_flows else max(escalation_flows[jid], end_abs)
+                            arrival_by_id = {j.job_id: j.arriving_time for j in jobs_to_reschedule}
+                            escalation_flows = {jid: t - arrival_by_id[jid] for jid, t in escalation_flows.items() if jid in arrival_by_id}
+                            incremental_flows = dict(self._currentCommittedBatchFlowTimes(jobs_to_reschedule))
+                            incremental_flows[job.job_id] = f1
+                            agg = max if gate_metric == 'max' else (lambda v: sum(v) / len(v))
+                            escalation_stat = agg(list(escalation_flows.values())) if escalation_flows else None
+                            incremental_stat = agg(list(incremental_flows.values())) if incremental_flows else None
+                        if escalation_stat is not None and incremental_stat is not None and escalation_stat > incremental_stat:
+                            logger.debug("[%s] Master: job %s joint escalation (%s=%.3f) worse than "
+                                         "Incremental's (%s=%.3f) -- keeping Incremental's placement instead",
+                                         self.env.now, job.job_id, gate_metric, escalation_stat, gate_metric, incremental_stat)
                             self._commitSingleJobPlan(inc_transfers, inc_works, inc_deletions)
                         else:
                             logger.debug("[%s] Master: job %s joint escalation accepted (%s job(s) replanned)",

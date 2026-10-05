@@ -29,6 +29,7 @@ Example:
         --small-dataset-size 1024 --medium-dataset-size 5120 --large-dataset-size 20480
 """
 import os
+import time
 os.environ.setdefault("MPLBACKEND", "Agg")
 
 import argparse
@@ -93,6 +94,13 @@ def parse_args():
                          help="Full-range tier dataset_size range in MB, inclusive (default: 10240 102400, "
                               "i.e. 10-100GB) -- one single draw range spanning small through large, for a "
                               "run that doesn't split by tier.")
+    parser.add_argument("--new-job-dataset-size-range", type=int, nargs=2, metavar=("LOW", "HIGH"), default=None,
+                         help="Dataset size range (MB) for the NEW job's own draw ONLY -- defaults to unset, "
+                              "which keeps the original behavior (drawn from the same tier range as existing "
+                              "jobs, at line ~1194's `dataset_size = rng.randint(low, high)`). Existing jobs' "
+                              "own redraw at build_state_a's job_size_rng is untouched either way -- this lets "
+                              "a 'stress then arrival' scenario put a deliberately heavy tier range on existing "
+                              "jobs while keeping the new arrival itself an ordinary size.")
     parser.add_argument("--tiers", nargs="+", choices=["small", "medium", "large", "full"],
                          default=["small", "medium", "large"],
                          help="Which tier(s) to actually run (default: all three). E.g. "
@@ -163,6 +171,68 @@ def parse_args():
                               "F1 probe (_placeSingleJobIncremental). Independent of "
                               "--incremental-time-limit (which governs the standalone incremental "
                               "approach). Default: 15.")
+    parser.add_argument("--adaptive-gate-metric", choices=["new_job", "max", "mean"], default="new_job",
+                         help="hybrid approach only: metric the post-escalation quality gate uses "
+                              "to decide whether to keep the escalation or fall back to "
+                              "Incremental's own placement. 'new_job' (default): only the new "
+                              "arrival's own flow time. 'max'/'mean': flow time across the whole "
+                              "batch, with Incremental's side reconstructed as F1 for the new job "
+                              "+ every other job's state-A committed flow time (committed_finish_"
+                              "time) -- same semantics as the live class's own adaptive_gate_metric.")
+    parser.add_argument("--adaptive-f1-relative-margin", type=float, default=None,
+                         help="hybrid approach only: escalate only if F1 exceeds the MEAN "
+                              "committed flow time of the not-yet-finished existing jobs by more "
+                              "than this fraction (e.g. 0.25 = F1 must be at least 25%% worse). "
+                              "Default: unset (always escalate -- this function had no trigger at "
+                              "all before 2026-10-04). Same design as the live class's own "
+                              "adaptive_f1_relative_margin, ported here.")
+    parser.add_argument("--adaptive-f1-dynamic-margin", action="store_true",
+                         help="hybrid approach only: when set, --adaptive-f1-relative-margin is a "
+                              "BASE margin that SHRINKS as F1 already exceeds the running mean "
+                              "(effective_margin = base / (1 + max(0, f1/mean - 1))) instead of "
+                              "one fixed margin applied uniformly -- makes escalation "
+                              "progressively easier to trigger as congestion grows, rather than "
+                              "a bar that's too strict once the mean itself is already inflated.")
+    parser.add_argument("--adaptive-f1-stability-cv-threshold", type=float, default=None,
+                         help="hybrid approach only: vetoes escalation (regardless of what the "
+                              "margin check says) when the running jobs' own committed flow "
+                              "times are already 'stable' -- coefficient of variation (std/mean) "
+                              "below this threshold. Default: unset (no veto). Targets the case "
+                              "where escalation gets accepted by a batch-max gate yet just "
+                              "shuffles an already-small imbalance onto different jobs instead of "
+                              "removing a genuine one.")
+    parser.add_argument("--adaptive-new-job-objective", action="store_true",
+                         help="hybrid approach only ('hybrid-n_j' design, 2026-10-05): every one "
+                              "of the 6 parallel escalation variants solves to minimize ONLY the "
+                              "new job's own flow time (objective_choice=2) instead of the whole "
+                              "batch's max/sum, with --adaptive-degradation-cap-pct as the only "
+                              "thing stopping that from coming at an existing job's expense. "
+                              "Meant to be paired with --adaptive-selection-metric new_job and "
+                              "--adaptive-gate-metric new_job so objective, variant selection and "
+                              "the final gate all optimize the new arrival consistently.")
+    parser.add_argument("--adaptive-degradation-cap-pct", type=float, default=None,
+                         help="hybrid approach only, with --adaptive-new-job-objective: hard cap "
+                              "on an already-running job's flow time, as a fraction ABOVE its own "
+                              "pre-escalation committed flow time (e.g. 0.20 = may grow by at "
+                              "most 20%%). Unset = objective_choice=2 still applies but "
+                              "unconstrained (no per-job cap).")
+    parser.add_argument("--adaptive-no-bi-objective", action="store_true",
+                         help="hybrid approach only, with --adaptive-new-job-objective: forces "
+                              "multi_objective=0 (plain single-objective -- phase 1 only, no "
+                              "energy term at all) instead of the default bi-objective "
+                              "epsilon-constraint mode. 2026-10-05 finding: this measurably "
+                              "recovers a much higher gate-acceptance rate (bi-objective's own "
+                              "2-phase structure converges to a worse phase-1 result within the "
+                              "same wall-clock, regardless of degradation_cap_pct or budget) -- a "
+                              "genuine quality/energy-awareness trade-off, not a tunable bug.")
+    parser.add_argument("--adaptive-selection-metric", choices=["new_job", "max"], default="max",
+                         help="hybrid approach only: metric _timedParallelEscalation uses to pick "
+                              "the best of its 6 concurrent variants -- separate from "
+                              "--adaptive-gate-metric, which only judges the ALREADY-PICKED plan "
+                              "against Incremental. 'max' (default): batch-wide max flow time, "
+                              "the validated-safe choice. 'new_job': the new arrival's own flow "
+                              "time only -- see batch_quality's own docstring in "
+                              "master_node_with_heterogeneous_nodes_csp.py.")
     parser.add_argument("--state-a-time-limit", type=int, default=30,
                          help="CSP solver time budget for the ONE joint solve that builds state A over "
                               "all --n-existing jobs at once, per tier (default: 30s).")
@@ -963,31 +1033,55 @@ def run_epsilon_style(master, new_job, isolated_ids, nb_nodes, now, replicas_loc
 
 def run_hybrid_style(master, new_job, isolated_ids, nb_nodes, now, replicas_locations, not_finished_jobs,
                       hybrid_alpha, hybrid_max_budget, hybrid_incremental_time_limit,
-                      epsilon_fraction, epsilon_phase1_fraction):
-    """Mirrors SchedulingUsingCSPAdaptiveJoint.schedulingNewJob()'s escalation branch EXACTLY --
-    same code, not a reimplementation. Replaces this function's 2025-era single-warmstart-solve
-    version (which predates the live class's 4-way parallel escalation, and used the old
-    freeze_large_jobs_threshold/freeze_remaining_time_threshold/freeze_jobs_with_ongoing_transfer
-    pre-processing -- both since superseded by the median-split freeze_below_median/
-    freeze_above_median/nofreeze/warm_nofreeze design; see _timedParallelEscalation's own
-    docstring in master_node_with_heterogeneous_nodes_csp.py for why). Probes Incremental for F1
-    (bounded by hybrid_incremental_time_limit), then runs the real 4-way parallel escalation
-    budgeted at min(hybrid_alpha*F1, hybrid_max_budget) seconds. Reached by shallow-copying master
-    and reassigning its class to SchedulingUsingCSPAdaptiveJoint -- state A itself is always built
-    the plain Online/MainOnline way (see build_state_a), so this only ever affects how the new
-    job's own placement gets solved. charge_thinking_time is off: run_tier's own run_captured
-    already measures this whole call's wall-clock time (see finalize_run's scheduling_time_s), and
-    there is no live SimPy env.run() loop here for env.timeout() to advance anyway."""
+                      epsilon_fraction, epsilon_phase1_fraction, adaptive_gate_metric='new_job',
+                      adaptive_f1_relative_margin=None, adaptive_selection_metric='max',
+                      adaptive_f1_dynamic_margin=False, adaptive_f1_stability_cv_threshold=None,
+                      adaptive_new_job_objective=False, adaptive_degradation_cap_pct=None,
+                      adaptive_bi_objective=True):
+    """Calls the SAME _timedParallelEscalation as the live SchedulingUsingCSPAdaptiveJoint for the
+    escalation search itself (not a reimplementation of THAT part), budgeted at
+    min(hybrid_alpha*F1, hybrid_max_budget) seconds after probing Incremental for F1 (bounded by
+    hybrid_incremental_time_limit). Reached by shallow-copying master and reassigning its class --
+    state A itself is always built the plain Online/MainOnline way (see build_state_a), so this
+    only ever affects how the new job's own placement gets solved.
+
+    Unlike the live class's own schedulingNewJob(), the post-escalation quality gate IS
+    reimplemented here (not called) -- see the adaptive_gate_metric branch below -- because this
+    function also needs to report mean/max flow time across the batch regardless of which side
+    of the gate wins, which the live method's own early-return structure doesn't expose. Until
+    2026-10-03 this function had NO gate at all (always kept the escalation once any solution was
+    found) -- every state-A hybrid result produced before that date was computed under that
+    unconditional-accept semantics, not the live class's own F1-gated one.
+
+    charge_thinking_time is off: run_tier's own run_captured already measures this whole call's
+    wall-clock time (see finalize_run's scheduling_time_s), and there is no live SimPy env.run()
+    loop here for env.timeout() to advance anyway."""
     hybrid_master = copy.copy(master)
     hybrid_master.__class__ = SchedulingUsingCSPAdaptiveJoint
     hybrid_master._config = dict(master._config)
     hybrid_master._config['charge_thinking_time'] = False
     hybrid_master._config['epsilon_fraction'] = epsilon_fraction
     hybrid_master._config['epsilon_phase1_fraction'] = epsilon_phase1_fraction
+    # utils/modelCSP.py reads these three via getattr(master_node, ...) DIRECTLY, never through
+    # _config -- setting only the _config entries above (as this function did until 2026-10-05)
+    # silently falls back to the class's own defaults (epsilon_phase1_fraction=0.5,
+    # epsilon_max_cap=None) regardless of what's passed here. epsilon_fraction's own class
+    # default (0.1) happens to match what every call site here has passed so far, which is why
+    # this went unnoticed; epsilon_phase1_fraction's does NOT (class default 0.5 vs the 0.833...
+    # this script's own CLI default actually asks for), so every hybrid run through this
+    # function before this fix silently used a 50/50 phase1/phase2 time split instead of the
+    # requested one -- the phase-1 OBJECTIVE itself was unaffected (that's a separate value,
+    # objective_choice, which has its own getattr already).
+    hybrid_master.epsilon_fraction = epsilon_fraction
+    hybrid_master.epsilon_phase1_fraction = epsilon_phase1_fraction
     hybrid_master._config['parallel_warm_cold_escalation'] = True
     hybrid_master._config['incremental_time_limit_s'] = hybrid_incremental_time_limit
     hybrid_master._config['adaptive_alpha'] = hybrid_alpha
     hybrid_master._config['adaptive_max_budget_s'] = hybrid_max_budget
+    hybrid_master._config['adaptive_selection_metric'] = adaptive_selection_metric
+    hybrid_master._config['adaptive_new_job_objective'] = adaptive_new_job_objective
+    hybrid_master._config['adaptive_degradation_cap_pct'] = adaptive_degradation_cap_pct
+    hybrid_master._config['adaptive_bi_objective'] = adaptive_bi_objective
 
     def drive(gen):
         try:
@@ -996,7 +1090,10 @@ def run_hybrid_style(master, new_job, isolated_ids, nb_nodes, now, replicas_loca
             return e.value
         raise RuntimeError("hybrid: generator unexpectedly yielded -- charge_thinking_time should be False")
 
+    _hybrid_style_t0 = time.time()
     inc_transfers, inc_works, inc_deletions, f1 = drive(hybrid_master._placeSingleJobIncremental(new_job))
+    _f1_probe_elapsed = time.time() - _hybrid_style_t0
+    print(f"### HYBRID TIMING: F1 probe took {_f1_probe_elapsed:.3f}s ###", flush=True)
     if f1 is None:
         return None
 
@@ -1028,12 +1125,58 @@ def run_hybrid_style(master, new_job, isolated_ids, nb_nodes, now, replicas_loca
                   "nodes_free_time": dict(fallback_nodes_free_time), "flow_by_job": inc_flow_by_job},
     }
 
+    # Escalation trigger -- ported from the live class's schedulingNewJob() on 2026-10-04 (this
+    # function never had ANY trigger before: it always escalated once f1 was known). Only the
+    # relative-margin design is wired here (not the fixed adaptive_f1_threshold) since that's
+    # what was validated on the live protocol first. running_flows reuses inc_flow_by_job (already
+    # built from committed_finish_time) rather than re-deriving -- same quantity, no extra solve.
+    running_flows = [v for k, v in inc_flow_by_job.items() if k != new_job.job_id]
+    mean_running_flow = sum(running_flows) / len(running_flows) if running_flows else None
+    if adaptive_f1_relative_margin is not None:
+        if mean_running_flow is None:
+            should_escalate = True
+        elif adaptive_f1_dynamic_margin:
+            # Same dynamic-margin formula as the live class (ported 2026-10-04): shrinks the
+            # margin as F1 already exceeds the running mean, so congestion makes escalation
+            # progressively easier to trigger instead of one fixed bar that's too strict once
+            # the mean itself is already inflated.
+            excess_ratio = max(0.0, f1 / mean_running_flow - 1.0)
+            effective_margin = adaptive_f1_relative_margin / (1.0 + excess_ratio)
+            should_escalate = f1 > (1 + effective_margin) * mean_running_flow
+        else:
+            should_escalate = f1 > (1 + adaptive_f1_relative_margin) * mean_running_flow
+    else:
+        should_escalate = True
+
+    # Vetoes escalation when the running batch is already "stable" (coefficient of variation
+    # below threshold) regardless of the margin check above -- see the matching veto in the live
+    # class (master_node_with_heterogeneous_nodes_csp.py) for why: a low-CV batch has nothing in
+    # genuine distress to rescue, so escalation can only shuffle the (already small) imbalance
+    # onto different jobs, not remove it.
+    if should_escalate and adaptive_f1_stability_cv_threshold is not None and len(running_flows) >= 2:
+        stability_mean = sum(running_flows) / len(running_flows)
+        stability_std = (sum((v - stability_mean) ** 2 for v in running_flows) / len(running_flows)) ** 0.5
+        cv = stability_std / stability_mean if stability_mean > 0 else 0.0
+        if cv < adaptive_f1_stability_cv_threshold:
+            should_escalate = False
+
+    if not should_escalate:
+        return incremental_result
+
     budget = min(hybrid_alpha * f1, hybrid_max_budget)
     jobs_to_reschedule = [new_job] + not_finished_jobs
     nodes_free_time = hybrid_master.nodesFreeTime(hybrid_master.ongoing_transfers, hybrid_master.ongoing_works)
 
+    _pre_escalation_gap = time.time() - _hybrid_style_t0 - _f1_probe_elapsed
+    print(f"### HYBRID TIMING: gap between F1 probe end and escalation start = {_pre_escalation_gap:.3f}s "
+          f"(trigger/gate computation, _currentCommittedBatchFlowTimes, etc.) ###", flush=True)
+    _escalation_t0 = time.time()
     transfers_, works_, deletions_ = drive(hybrid_master._timedParallelEscalation(
         jobs_to_reschedule, not_finished_jobs, replicas_locations, nodes_free_time, now, budget))
+    _escalation_elapsed = time.time() - _escalation_t0
+    print(f"### HYBRID TIMING: escalation call took {_escalation_elapsed:.3f}s "
+          f"(F1={_f1_probe_elapsed:.3f}s + gap={_pre_escalation_gap:.3f}s + escalation={_escalation_elapsed:.3f}s "
+          f"= {_f1_probe_elapsed + _pre_escalation_gap + _escalation_elapsed:.3f}s so far) ###", flush=True)
 
     if not transfers_ or not works_:
         # 4-way escalation found no solution -- fall back to the Incremental placement already
@@ -1058,6 +1201,30 @@ def run_hybrid_style(master, new_job, isolated_ids, nb_nodes, now, replicas_loca
     flow_times = list(flow_by_job.values())
     isolated_flow_times = [ft for jid, ft in flow_by_job.items() if jid in isolated_ids]
 
+    # Quality gate -- see this function's own docstring: ported from the live class's
+    # schedulingNewJob() on 2026-10-03, reimplemented rather than called so this function can
+    # still report mean/max flow time for whichever side wins.
+    if adaptive_gate_metric == 'new_job':
+        escalation_stat = flow_by_job.get(new_job.job_id)
+        incremental_stat = f1
+    else:
+        incremental_flow_by_job = {new_job.job_id: f1}
+        for j in not_finished_jobs:
+            cf = committed_finish_time(master, nb_nodes, j.job_id)
+            if cf is not None:
+                incremental_flow_by_job[j.job_id] = cf - j.arriving_time
+        agg = max if adaptive_gate_metric == 'max' else (lambda v: sum(v) / len(v))
+        escalation_stat = agg(flow_times) if flow_times else None
+        incremental_stat = agg(list(incremental_flow_by_job.values())) if incremental_flow_by_job else None
+
+    if escalation_stat is not None and incremental_stat is not None and escalation_stat > incremental_stat:
+        _total_elapsed = time.time() - _hybrid_style_t0
+        print(f"### HYBRID TIMING: gate REJECTED -- TOTAL run_hybrid_style wall time = {_total_elapsed:.3f}s "
+              f"(F1={_f1_probe_elapsed:.3f}s, gap={_pre_escalation_gap:.3f}s, escalation={_escalation_elapsed:.3f}s, "
+              f"post-reject={_total_elapsed - _f1_probe_elapsed - _pre_escalation_gap - _escalation_elapsed:.3f}s) ###",
+              flush=True)
+        return incremental_result
+
     new_job_start = None
     for key in [f'node_{i}' for i in range(nb_nodes)]:
         for w in works_.get(key, []):
@@ -1065,6 +1232,13 @@ def run_hybrid_style(master, new_job, isolated_ids, nb_nodes, now, replicas_loca
             if job_id == new_job.job_id:
                 new_job_start = start_abs if new_job_start is None else min(new_job_start, start_abs)
     wait_time = (new_job_start - new_job.arriving_time) if new_job_start is not None else None
+
+    _post_escalation_elapsed = time.time() - _escalation_t0 - _escalation_elapsed
+    _total_elapsed = time.time() - _hybrid_style_t0
+    print(f"### HYBRID TIMING: post-escalation gate+result-building took {_post_escalation_elapsed:.3f}s -- "
+          f"TOTAL run_hybrid_style wall time = {_total_elapsed:.3f}s "
+          f"(F1={_f1_probe_elapsed:.3f}s, gap={_pre_escalation_gap:.3f}s, escalation={_escalation_elapsed:.3f}s, "
+          f"post={_post_escalation_elapsed:.3f}s) ###", flush=True)
 
     return {
         "wait_time_new_job": wait_time,
@@ -1108,7 +1282,7 @@ def run_tier(config, args, results_dir, tier_name, size_range, tier_index):
                 for i, cfg in enumerate(master._nodes_config)])
 
     rng = random.Random(args.seed * 1000 + tier_index)
-    low, high = size_range
+    low, high = args.new_job_dataset_size_range if args.new_job_dataset_size_range else size_range
 
     trials, details = [], {}
     for r in range(args.repeats):
@@ -1163,7 +1337,11 @@ def run_tier(config, args, results_dir, tier_name, size_range, tier_index):
                   lambda nj: run_hybrid_style(master, nj, isolated_ids, args.nb_nodes, now, replicas_locations,
                                               not_finished_jobs, args.hybrid_alpha, args.hybrid_max_budget,
                                               hybrid_incremental_limit, args.epsilon_fraction,
-                                              args.epsilon_phase1_fraction))
+                                              args.epsilon_phase1_fraction, args.adaptive_gate_metric,
+                                              args.adaptive_f1_relative_margin, args.adaptive_selection_metric,
+                                              args.adaptive_f1_dynamic_margin, args.adaptive_f1_stability_cv_threshold,
+                                              args.adaptive_new_job_objective, args.adaptive_degradation_cap_pct,
+                                              not args.adaptive_no_bi_objective))
 
         trials.append({
             "repeat": r,

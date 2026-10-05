@@ -1025,6 +1025,30 @@ public class MainOnline {
 
                     all_flow_time[i] = flow;
                 }
+
+                // Optional per-job upper bound on all_flow_time[i] -- "hybrid-n_j" design
+                // (2026-10-05): lets a caller pair objectiveChoice=2 (minimize ONLY the new
+                // job's own flow time) with a hard cap on every OTHER job's flow time (e.g.
+                // 1.2x its own pre-escalation committed value), so a narrow objective can't buy
+                // the new job a win by silently wrecking an already-running job. One value per
+                // jobs_data row (same sorted-by-job_id order as jobs.get(i) everywhere else in
+                // this file), -1 = no cap for that job. File missing/empty = no caps at all,
+                // every existing caller unaffected.
+                try {
+                    String capsText = readFile(MODEL_INPUTS_DIR + "/flow_time_caps.txt").trim();
+                    if (!capsText.isEmpty()) {
+                        String[] capsParts = capsText.split(",");
+                        for (int i = 0; i < nb_data && i < capsParts.length; i++) {
+                            int cap = Integer.parseInt(capsParts[i].trim());
+                            if (cap >= 0) {
+                                model.arithm(all_flow_time[i], "<=", cap).post();
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    // File missing/unreadable: no caps, unchanged behavior.
+                }
+
                 IntVar maxFlowTime = model.intVar("max_flow_time", 0, 999_999);
                 model.max(maxFlowTime, all_flow_time).post();
                 IntVar sumFlowTime = model.intVar("sum_flow_time", 0, 999_999);

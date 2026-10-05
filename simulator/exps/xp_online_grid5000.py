@@ -135,6 +135,59 @@ def parse_args():
                               "all. Default: unset (always try escalating -- the budget already "
                               "scales with F1, so a small job gets a proportionally cheap attempt "
                               "rather than being blocked from one entirely).")
+    parser.add_argument("--adaptive-f1-relative-margin", type=float, default=None,
+                         help="hybrid only: alternative to --adaptive-f1-threshold's fixed cutoff "
+                              "-- escalate only if F1 exceeds the MEAN estimated flow time of "
+                              "currently-running jobs by more than this fraction (e.g. 0.25 = F1 "
+                              "must be at least 25%% worse than the running jobs' own average). "
+                              "Context-sensitive: the same F1 triggers escalation when the system "
+                              "is lightly loaded but not when it's already congested. Takes "
+                              "precedence over --adaptive-f1-threshold when both are set. Default: "
+                              "unset (disabled).")
+    parser.add_argument("--adaptive-f1-dynamic-margin", action="store_true",
+                         help="hybrid only: when set, --adaptive-f1-relative-margin is a BASE "
+                              "margin that SHRINKS as F1 already exceeds the running mean "
+                              "(effective_margin = base / (1 + max(0, f1/mean - 1))) instead of "
+                              "one fixed margin applied uniformly -- makes escalation "
+                              "progressively easier to trigger as congestion grows, rather than "
+                              "a bar that's too strict once the mean itself is already inflated "
+                              "by congestion (observed with a fixed 25%% margin on the generated-"
+                              "scenarios state-A tests).")
+    parser.add_argument("--adaptive-f1-stability-cv-threshold", type=float, default=None,
+                         help="hybrid only: vetoes escalation (regardless of what the margin "
+                              "check says) when the running jobs' own committed/estimated flow "
+                              "times are already 'stable' -- coefficient of variation (std/mean) "
+                              "below this threshold. Default: unset (no veto).")
+    parser.add_argument("--adaptive-new-job-objective", action="store_true",
+                         help="hybrid only ('hybrid-n_j' design, 2026-10-05): every one of the 6 "
+                              "parallel escalation variants solves to minimize ONLY the new "
+                              "job's own flow time instead of the whole batch's max/sum, with "
+                              "--adaptive-degradation-cap-pct as the only thing stopping that "
+                              "from coming at an existing job's expense.")
+    parser.add_argument("--adaptive-degradation-cap-pct", type=float, default=None,
+                         help="hybrid only, with --adaptive-new-job-objective: hard cap on an "
+                              "already-running job's flow time, as a fraction ABOVE its own "
+                              "pre-escalation committed flow time (e.g. 0.20 = may grow by at "
+                              "most 20%%).")
+    parser.add_argument("--adaptive-gate-metric", choices=["new_job", "max", "mean"], default="new_job",
+                         help="hybrid only: metric the post-escalation quality gate uses to decide "
+                              "whether to keep the escalation or fall back to Incremental's own "
+                              "placement. 'new_job' (default): only the new arrival's own flow "
+                              "time -- can accept an escalation that helps the new job while "
+                              "quietly making an already-running job worse. 'max'/'mean': flow "
+                              "time across the WHOLE batch instead, reconstructing Incremental's "
+                              "side as F1 for the new job + every other job's currently committed "
+                              "flow time (since Incremental never touches them).")
+    parser.add_argument("--adaptive-selection-metric", choices=["new_job", "max"], default="max",
+                         help="hybrid only: metric _timedParallelEscalation uses to pick the best "
+                              "of its 6 concurrent variants -- separate from --adaptive-gate-"
+                              "metric, which only judges the ALREADY-PICKED plan against "
+                              "Incremental. 'max' (default): batch-wide max flow time, the "
+                              "validated-safe choice. 'new_job': the new arrival's own flow time "
+                              "only -- deliberately reintroduces a known blind spot (a variant can "
+                              "win by helping the new job while hurting an already-running job) "
+                              "to measure it alongside --adaptive-f1-relative-margin and "
+                              "--adaptive-gate-metric new_job.")
     parser.add_argument("--no-charge-thinking-time", action="store_true",
                          help="ALL approaches: DON'T charge each CSP solve's own real wall-clock "
                               "time as simulated wait (yield env.timeout(elapsed)) against the "
@@ -222,6 +275,13 @@ def run(args):
         master_class.adaptive_max_budget_s = args.adaptive_max_budget
     if args.approach == "hybrid":
         master_class.adaptive_f1_threshold = args.adaptive_f1_threshold
+        master_class.adaptive_f1_relative_margin = args.adaptive_f1_relative_margin
+        master_class.adaptive_f1_dynamic_margin = args.adaptive_f1_dynamic_margin
+        master_class.adaptive_f1_stability_cv_threshold = args.adaptive_f1_stability_cv_threshold
+        master_class.adaptive_new_job_objective = args.adaptive_new_job_objective
+        master_class.adaptive_degradation_cap_pct = args.adaptive_degradation_cap_pct
+        master_class.adaptive_gate_metric = args.adaptive_gate_metric
+        master_class.adaptive_selection_metric = args.adaptive_selection_metric
         master_class.incremental_time_limit_s = args.hybrid_incremental_time_limit
         master_class.parallel_warm_cold_escalation = args.parallel_warm_cold_escalation
 
@@ -235,6 +295,13 @@ def run(args):
     config["adaptive_alpha"] = args.adaptive_alpha
     config["adaptive_max_budget_s"] = args.adaptive_max_budget
     config["adaptive_f1_threshold"] = args.adaptive_f1_threshold
+    config["adaptive_f1_relative_margin"] = args.adaptive_f1_relative_margin
+    config["adaptive_f1_dynamic_margin"] = args.adaptive_f1_dynamic_margin
+    config["adaptive_f1_stability_cv_threshold"] = args.adaptive_f1_stability_cv_threshold
+    config["adaptive_new_job_objective"] = args.adaptive_new_job_objective
+    config["adaptive_degradation_cap_pct"] = args.adaptive_degradation_cap_pct
+    config["adaptive_gate_metric"] = args.adaptive_gate_metric
+    config["adaptive_selection_metric"] = args.adaptive_selection_metric
     config["parallel_warm_cold_escalation"] = args.parallel_warm_cold_escalation
     config["charge_thinking_time"] = not args.no_charge_thinking_time
     config["incremental_time_limit_s"] = args.hybrid_incremental_time_limit

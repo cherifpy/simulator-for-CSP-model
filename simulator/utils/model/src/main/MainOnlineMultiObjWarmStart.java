@@ -1071,6 +1071,28 @@ public class MainOnlineMultiObjWarmStart {
 
                     all_flow_time[i] = flow;
                 }
+
+                // Optional per-job upper bound on all_flow_time[i] -- "hybrid-n_j" design
+                // (2026-10-05), mirrors MainOnline.java's own copy of this block: pairs with
+                // multi_objective.txt=0 (forcing the objectiveChoice-respecting single-objective
+                // path below) and objective_choice.txt=2 to minimize ONLY the new job's own flow
+                // time while every OTHER job is capped (e.g. 1.2x its pre-escalation committed
+                // flow time). -1 = no cap for that job; file missing/empty = no caps at all.
+                try {
+                    String capsText = readFile(MODEL_INPUTS_DIR + "/flow_time_caps.txt").trim();
+                    if (!capsText.isEmpty()) {
+                        String[] capsParts = capsText.split(",");
+                        for (int i = 0; i < nb_data && i < capsParts.length; i++) {
+                            int cap = Integer.parseInt(capsParts[i].trim());
+                            if (cap >= 0) {
+                                model.arithm(all_flow_time[i], "<=", cap).post();
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    // File missing/unreadable: no caps, unchanged behavior.
+                }
+
                 IntVar maxFlowTime = model.intVar("max_flow_time", 0, 999_999);
                 model.max(maxFlowTime, all_flow_time).post();
                 IntVar sumFlowTime = model.intVar("sum_flow_time", 0, 999_999);
@@ -1530,12 +1552,17 @@ public class MainOnlineMultiObjWarmStart {
 
                 int phase1Seconds = Math.max(1, (int) Math.round(timeLimitSeconds * phase1Fraction));
                 int phase2Seconds = Math.max(1, timeLimitSeconds - phase1Seconds);
-                System.out.println("### EPSILON-CONSTRAINT mode: phase1 (minimize max flow time) budget="
-                        + phase1Seconds + "s, phase2 (minimize energy under flow-time cap) budget="
-                        + phase2Seconds + "s, epsilon fraction=" + epsilonFraction + " ###");
+                // Phase 1's own objective now respects objective_choice.txt (0=sum/mean, 1=max,
+                // 2=new job's own flow time) instead of always hardcoding max flow time --
+                // 2026-10-05, "hybrid-n_j" design, mirrors MainOnlineMultiObj.java's own copy of
+                // this fix.
+                System.out.println("### EPSILON-CONSTRAINT mode: phase1 (minimize objective_choice="
+                        + objectiveChoice + ") budget=" + phase1Seconds + "s, phase2 (minimize energy "
+                        + "under flow-time cap) budget=" + phase2Seconds + "s, epsilon fraction="
+                        + epsilonFraction + " ###");
 
                 solver.limitTime(phase1Seconds + "s");
-                solver.findOptimalSolution(objectives[1], false);
+                solver.findOptimalSolution(objectives[objectiveChoice], false);
                 if (!found[0]) {
                     System.out.println("No solution found (phase 1)");
                 } else {
