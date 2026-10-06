@@ -1305,10 +1305,13 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
     # now -- the one global config knob (freeze_jobs_with_ongoing_transfer) that frozen_job_ids_
     # override has always silently bypassed in every OTHER variant (see modelCSP.py's own
     # comment), so this is the only way to actually test that criterion's effect on the escalation
-    # search itself, not just on the cheap Incremental F1 probe outside it. A brand-new arrival is
-    # never restricted/frozen in any of the six variants.
+    # search itself, not just on the cheap Incremental F1 probe outside it. A 7th, freeze_
+    # random_half, freezes a fresh random ~50% of not_finished_jobs on every call (2026-10-06,
+    # requested as a baseline to compare the mean/transfer-based freeze criteria against: if a
+    # criterion-free random split does just as well, the specific criterion isn't doing real
+    # work). A brand-new arrival is never restricted/frozen in any of the seven variants.
     _PARALLEL_ESCALATION_LABELS = ("freeze_below_mean", "freeze_above_mean", "nofreeze", "warm_nofreeze",
-                                   "restrict_powerful_nodes", "freeze_ongoing_transfer")
+                                   "restrict_powerful_nodes", "freeze_ongoing_transfer", "freeze_random_half")
     # Fraction of nodes (by bandwidth/compute_capacity) restrict_powerful_nodes confines already-
     # running jobs to -- see reschedule_top_fraction's own comment in modelCSP.py.
     _PARALLEL_ESCALATION_RESCHEDULE_TOP_FRACTION = 0.5
@@ -1464,6 +1467,13 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
         ongoing_transfer_ids = [j.job_id for j in not_finished_jobs if j.job_id in ongoing_transfer_job_ids]
         print(f"### PARALLEL ESCALATION ongoing-transfer freeze (freeze_ongoing_transfer): {ongoing_transfer_ids} ###")
 
+        # freeze_random_half: no ranking criterion at all, just a fresh coin flip per job (~50%
+        # frozen) -- a criterion-free baseline. If this does as well as the mean/transfer-based
+        # variants on average, those criteria aren't earning their own complexity.
+        random_half_jobs = random.sample(not_finished_jobs, k=len(not_finished_jobs) // 2)
+        random_half_ids = [j.job_id for j in random_half_jobs]
+        print(f"### PARALLEL ESCALATION random half freeze (freeze_random_half): {random_half_ids} ###")
+
         # "hybrid-n_j" (2026-10-05): every variant below minimizes ONLY the new job's own flow
         # time (objective_choice=2) instead of the batch's max/sum, capped per-job so that can't
         # come at an existing job's expense -- see adaptive_new_job_objective's own comment.
@@ -1525,6 +1535,7 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
             "restrict_powerful_nodes": ("MainOnlineMultiObj", False, [],
                                         self._PARALLEL_ESCALATION_RESCHEDULE_TOP_FRACTION),
             "freeze_ongoing_transfer": ("MainOnlineMultiObj", False, ongoing_transfer_ids, None),
+            "freeze_random_half": ("MainOnlineMultiObj", False, random_half_ids, None),
         }
         # Safety timeout, not just a nicety: with 3 concurrent variants, this was observed to
         # occasionally hang indefinitely on macOS (0 Java processes left running, one Python

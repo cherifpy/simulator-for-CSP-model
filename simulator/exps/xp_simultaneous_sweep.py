@@ -141,6 +141,8 @@ def main():
     p.add_argument("--hybrid-incremental-time-limit", type=float, default=300)
     p.add_argument("--hybrid-alpha", type=float, default=0.25)
     p.add_argument("--hybrid-max-budget", type=float, default=600)
+    p.add_argument("--solver-time-limit", type=int, default=500,
+                   help="online_newjob approach's own single-solve budget (seconds).")
     p.add_argument("--adaptive-gate-metric", choices=["new_job", "max", "mean"], default="max")
     p.add_argument("--adaptive-selection-metric", choices=["new_job", "max"], default="max")
     p.add_argument("--adaptive-f1-relative-margin", type=float, default=None)
@@ -202,9 +204,9 @@ def main():
     state_a_tasks = probe_tasks[probe_tasks.approach == "state_A"]
     finish_by_job = state_a_tasks.groupby("job_id")["end"].max()
     max_flow = float(finish_by_job.max())
-    new_arrival = max_flow / 2.0
-    print(f"### iter {i}: State A max flow time = {max_flow:.1f}s -> new job arrives at t={new_arrival:.1f}s ###",
-          flush=True)
+    new_arrival = max_flow / 2.0 + 200.0
+    print(f"### iter {i}: State A max flow time = {max_flow:.1f}s -> new job arrives at "
+          f"t=max_flow/2+200={new_arrival:.1f}s ###", flush=True)
 
     # --- Phase 2: rewrite the new job's arrival time, then run the real incremental+hybrid comparison. ---
     real_new_job = make_new_job_raw(n_existing, new_nb_tasks, new_task_duration,
@@ -218,11 +220,12 @@ def main():
         "--n-existing", str(n_existing), "--new-job-index", str(n_existing),
         "--tiers", "full", "--full-range", str(args.dataset_size_range[0]), str(args.dataset_size_range[1]),
         "--new-job-dataset-size-range", str(new_dataset_size), str(new_dataset_size),
-        "--repeats", "1", "--approaches", "incremental", "hybrid",
+        "--repeats", "1", "--approaches", "incremental", "hybrid", "online_newjob",
         "--incremental-time-limit", str(args.incremental_time_limit),
         "--hybrid-incremental-time-limit", str(args.hybrid_incremental_time_limit),
         "--hybrid-alpha", str(args.hybrid_alpha),
         "--hybrid-max-budget", str(args.hybrid_max_budget),
+        "--solver-time-limit", str(args.solver_time_limit),
         "--adaptive-gate-metric", args.adaptive_gate_metric,
         "--adaptive-selection-metric", args.adaptive_selection_metric,
         "--state-a-time-limit", str(args.state_a_time_limit),
@@ -238,6 +241,9 @@ def main():
         real_cmd += ["--adaptive-new-job-objective"]
     if args.adaptive_degradation_cap_pct is not None:
         real_cmd += ["--adaptive-degradation-cap-pct", str(args.adaptive_degradation_cap_pct)]
+        # online_newjob uses the SAME cap value, by request: hybrid-n_j and online_newjob should
+        # be compared under an identical degradation constraint, not two independently-tuned ones.
+        real_cmd += ["--online-newjob-degradation-cap-pct", str(args.adaptive_degradation_cap_pct)]
     if args.adaptive_no_bi_objective:
         real_cmd += ["--adaptive-no-bi-objective"]
 

@@ -122,7 +122,7 @@ def parse_args():
                               "separately when Online needs a much larger budget than Incremental "
                               "(e.g. --solver-time-limit 7200 --incremental-time-limit 60).")
     parser.add_argument("--approaches", nargs="+",
-                         choices=["online", "online_warmstart", "online_biobj_warmstart", "incremental", "epsilon", "hybrid"],
+                         choices=["online", "online_warmstart", "online_biobj_warmstart", "online_newjob", "incremental", "epsilon", "hybrid"],
                          default=["online", "incremental"],
                          help="Which approach(es) to actually run per tier (default: online + "
                               "incremental). Use --approaches epsilon alone to run ONLY the "
@@ -225,6 +225,12 @@ def parse_args():
                               "2-phase structure converges to a worse phase-1 result within the "
                               "same wall-clock, regardless of degradation_cap_pct or budget) -- a "
                               "genuine quality/energy-awareness trade-off, not a tunable bug.")
+    parser.add_argument("--online-newjob-degradation-cap-pct", type=float, default=None,
+                         help="online_newjob approach only: same degradation-cap mechanism as "
+                              "--adaptive-degradation-cap-pct, applied to a SINGLE plain joint "
+                              "solve (objective_choice=2, no escalation, no gate against an "
+                              "Incremental probe) instead of hybrid's 6-variant race. Unset = "
+                              "objective_choice=2 still applies but unconstrained.")
     parser.add_argument("--adaptive-selection-metric", choices=["new_job", "max"], default="max",
                          help="hybrid approach only: metric _timedParallelEscalation uses to pick "
                               "the best of its 6 concurrent variants -- separate from "
@@ -653,6 +659,80 @@ def run_online_style(master, new_job, isolated_ids, nb_nodes, now, replicas_loca
     master.java_main_class = 'MainOnline'
     master.objective_choice = 1  # max flow time (all jobs in this batch) -- explicit, not relied on as a default
     transfers_, works_, deletions_ = schedulingUsingJavaCSP(master, jobs_to_reschedule, replicas_locations, nodes_free_time, now)
+
+    if not transfers_ or not works_:
+        return None
+
+    finish = {j.job_id: None for j in jobs_to_reschedule}
+    for key in [f'node_{i}' for i in range(nb_nodes)]:
+        for w in works_.get(key, []):
+            job_id, node_index, task_index, start_abs, end_abs, duration = w
+            if job_id in finish:
+                finish[job_id] = end_abs if finish[job_id] is None else max(finish[job_id], end_abs)
+
+    flow_by_job = {}
+    for j in master.jobs + [new_job]:
+        if j.job_id in finish and finish[j.job_id] is not None:
+            flow_by_job[j.job_id] = finish[j.job_id] - j.arriving_time
+        else:
+            cf = committed_finish_time(master, nb_nodes, j.job_id)
+            if cf is not None:
+                flow_by_job[j.job_id] = cf - j.arriving_time
+    flow_times = list(flow_by_job.values())
+    isolated_flow_times = [ft for jid, ft in flow_by_job.items() if jid in isolated_ids]
+
+    new_job_start = None
+    for key in [f'node_{i}' for i in range(nb_nodes)]:
+        for w in works_.get(key, []):
+            job_id, node_index, task_index, start_abs, end_abs, duration = w
+            if job_id == new_job.job_id:
+                new_job_start = start_abs if new_job_start is None else min(new_job_start, start_abs)
+    wait_time = (new_job_start - new_job.arriving_time) if new_job_start is not None else None
+
+    return {
+        "wait_time_new_job": wait_time,
+        "flow_time_new_job": (finish.get(new_job.job_id) - new_job.arriving_time) if finish.get(new_job.job_id) is not None else None,
+        "mean_flow_time_all": sum(flow_times) / len(flow_times) if flow_times else None,
+        "max_flow_time_all": max(flow_times) if flow_times else None,
+        "mean_flow_time_isolated": sum(isolated_flow_times) / len(isolated_flow_times) if isolated_flow_times else None,
+        "max_flow_time_isolated": max(isolated_flow_times) if isolated_flow_times else None,
+        "n_jobs_isolated": len(isolated_flow_times),
+        "jobs_to_reschedule": [j.job_id for j in jobs_to_reschedule],
+        "transfer_energy_total": compute_transfer_energy(transfers_, master),
+        "_plan": {"transfers": transfers_, "works": works_, "deletions": deletions_,
+                  "nodes_free_time": dict(nodes_free_time), "flow_by_job": flow_by_job},
+    }
+
+
+def run_online_newjob_style(master, new_job, isolated_ids, nb_nodes, now, replicas_locations, not_finished_jobs,
+                             degradation_cap_pct, solver_time_limit):
+    """Online with objective_choice=2 (minimize ONLY the new job's own flow time, see
+    MainOnline.java's objectives[2]) plus a per-existing-job degradation cap (same mechanism as
+    SchedulingUsingCSPAdaptiveJoint's hybrid-n_j escalation: cap = that job's CURRENTLY COMMITTED
+    flow time * (1 + degradation_cap_pct), written to flow_time_caps.txt and enforced
+    unconditionally in Java) -- but as a SINGLE plain joint solve, not hybrid's F1-gated 6-variant
+    race. Always returns whatever this one solve finds (or None if infeasible); unlike hybrid
+    there is no Incremental probe to gate against here.
+
+    Reuses SchedulingUsingCSPAdaptiveJoint._currentCommittedBatchFlowTimes via the same
+    shallow-copy-and-reassign-__class__ trick run_hybrid_style uses, purely to access that one
+    method -- this function otherwise mirrors run_online_style's own plan-reading logic exactly."""
+    jobs_to_reschedule = [new_job] + not_finished_jobs
+    nodes_free_time = master.nodesFreeTime(master.ongoing_transfers, master.ongoing_works)
+
+    newjob_master = copy.copy(master)
+    newjob_master.__class__ = SchedulingUsingCSPAdaptiveJoint
+    newjob_master._config = dict(master._config)
+    newjob_master.java_main_class = 'MainOnline'
+    newjob_master.objective_choice = 2
+
+    if degradation_cap_pct is not None:
+        committed = newjob_master._currentCommittedBatchFlowTimes(not_finished_jobs)
+        newjob_master.flow_time_caps = {jid: int(round(flow * (1 + degradation_cap_pct))) for jid, flow in committed.items()}
+        print(f"### ONLINE-NEWJOB: objective=new_job_flow_time, degradation_cap={degradation_cap_pct * 100:.0f}%, "
+              f"caps={newjob_master.flow_time_caps} ###", flush=True)
+
+    transfers_, works_, deletions_ = schedulingUsingJavaCSP(newjob_master, jobs_to_reschedule, replicas_locations, nodes_free_time, now)
 
     if not transfers_ or not works_:
         return None
@@ -1310,6 +1390,12 @@ def run_tier(config, args, results_dir, tier_name, size_range, tier_index):
         if "online" in args.approaches:
             solve("online", "ONLINE style", args.solver_time_limit,
                   lambda nj: run_online_style(master, nj, isolated_ids, args.nb_nodes, now, replicas_locations, not_finished_jobs))
+        if "online_newjob" in args.approaches:
+            solve("online_newjob", "ONLINE new-job-objective style (single solve, degradation cap)",
+                  args.solver_time_limit,
+                  lambda nj: run_online_newjob_style(master, nj, isolated_ids, args.nb_nodes, now, replicas_locations,
+                                                      not_finished_jobs, args.online_newjob_degradation_cap_pct,
+                                                      args.solver_time_limit))
         if "online_warmstart" in args.approaches:
             solve("online_warmstart", "ONLINE style (warm-started from Incremental + state A)", args.solver_time_limit,
                   lambda nj: run_online_warmstart_style(master, nj, isolated_ids, args.nb_nodes, now, replicas_locations, not_finished_jobs))

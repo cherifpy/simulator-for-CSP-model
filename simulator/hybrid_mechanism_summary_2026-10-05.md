@@ -369,3 +369,57 @@ Bilan final : 2 acceptés sur 5 (dont un quasi nul, +0.43%), aucun lien visible 
 restriction de ressources — même signature de bruit d'instance que les sections 10 et 11.
 
 Tous les runs ci-dessus : `walltime=00:30:00`, un seul `host=1` par `oarsub`, cluster `lille.g5k`.
+
+## 13. Retour au mode N-existing (2026-10-06)
+
+Problème méthodologique identifié sur le test de seuil de ressources (section 12) : chaque niveau
+de `nb_nodes` tire une infrastructure **entièrement nouvelle et aléatoire** (bande passante/
+stockage par nœud), pas un sous-ensemble d'un même pool fixe — donc le test ne mesure pas
+vraiment "plus ou moins de ressources", mais "un tirage CSP différent à chaque fois". Décision :
+revenir au protocole N-existing original (celui utilisé en tout début de session) plutôt que de
+corriger ce protocole dans l'immédiat.
+
+**Changements apportés à `exps/xp_simultaneous_sweep.py`** :
+- Formule d'arrivée du nouveau job changée de `max_flow/2` à **`max_flow/2 + 200`**.
+- Les 3 approches (`incremental`, `hybrid`, `online_newjob` — voir plus bas) sont désormais
+  lancées ensemble par défaut, plutôt que seulement `incremental`+`hybrid`.
+
+**Nouvelle approche `online_newjob`** (ajoutée à `exps/xp_dataset_size_sweep.py`, fonction
+`run_online_newjob_style`) : réutilise le mécanisme de plafond de dégradation + objectif ciblé
+nouveau-job d'hybrid-n_j (`objective_choice=2`, `flow_time_caps.txt`), mais en **un seul solve
+joint classique** (comme `online`, pas d'escalade à 6-7 variantes, pas de sonde F1, pas de porte
+d'acceptation) — renvoie toujours ce qu'il trouve, même si c'est moins bon qu'Incremental.
+`MainOnline.java` supportait déjà `objective_choice`/`flow_time_caps` nativement (vérifié avant
+implémentation), donc aucun changement Java nécessaire.
+
+**Résultats du balayage N-existing** (`n_existing` ∈ {2,5,8,10,12,15}, `nb_nodes=50` fixe,
+`new-job-mode=upper-quarter` — le mode par défaut d'origine, pas `same-tier`, config hybrid-n_j
+habituelle : mono-objectif, plafond 25%, F1=100s, budget=500s) :
+
+| n_existing | Incremental | Hybrid-n_j | accepté | Online_newjob | sched inc/hyb/online (s) |
+| --- | --- | --- | --- | --- | --- |
+| 2 | 3372.0 | 3372.0 | Non (repli) | 3373.0 (légèrement pire) | 302.0 / 604.8 / 502.1 |
+| 5 | 4909.0 | 4618.0 | Oui | 4618.0 (= hybrid) | 302.0 / 707.2 / 502.1 |
+| 8 | 3680.0 | 3680.0 | Non (repli) | **3722.0 (pire qu'Incremental)** | 301.2 / 703.9 / 501.3 |
+| 10 | 2204.0 | 1917.0 | Oui | 1917.0 (= hybrid) | 302.0 / 605.0 / 502.2 |
+| 12 | 4293.0 | 3673.0 | Oui | 3673.0 (= hybrid) | 301.2 / 602.8 / 501.3 |
+| 15 | 4565.0 | 4461.0 | Oui | 4461.0 (= hybrid) | 301.2 / 703.9 / 501.3 |
+
+**Conclusion sur `online_newjob`** : il n'apporte jamais de gain qu'hybrid-n_j n'avait pas déjà —
+sur les 4 cas où hybrid accepte, il tombe exactement sur la même solution (même problème sous-
+jacent, juste résolu en un coup au lieu de 6 variantes concurrentes). Sur les 2 cas où hybrid
+rejette et se replie sur Incremental, `online_newjob` n'a aucun filet de sécurité : il reste à
+égalité sur `n_existing=2` mais devient **pire qu'Incremental sur `n_existing=8`** (3722.0 vs
+3680.0), seul vrai risque net observé avec cette approche. Son seul avantage concret est la
+vitesse (~500s contre ~600-710s pour hybrid), au prix de ce risque de dégradation silencieuse.
+
+**Nouvelle 7e variante d'escalade `freeze_random_half`** (ajoutée à
+`master_node_with_heterogeneous_nodes_csp.py`, `_timedParallelEscalation`) : gèle un tirage
+aléatoire frais de ~50% des jobs existants à chaque appel (`random.sample`, aucun critère de
+rang), ajoutée comme référence "sans critère" pour voir si les critères déjà en place (scission
+par moyenne, transfert en cours) font réellement mieux qu'un tirage au hasard équivalent. Validée
+sans erreur de syntaxe/déploiement ; test de validation sur `n_existing=12` en cours au moment de
+la rédaction (résultat à ajouter une fois disponible).
+
+Runs de cette section : `walltime=01:00:00` (le pipeline à 3 approches dépasse 30 min — 5 jobs sur
+6 ont été tués par un mur de temps trop court lors du premier essai et relancés avec 1h).
