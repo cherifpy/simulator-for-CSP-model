@@ -421,6 +421,18 @@ def build_state_a(config, args, results_dir, tier_name, size_range, tier_index):
         key = f'node_{node_id}'
         master.transfers[key] = list((transfers_ or {}).get(key, []))
         master.works[key] = list((works_ or {}).get(key, []))
+        # 2026-10-06 fix: state A's own joint solve also scheduled a deletion time for every
+        # job's data at every node, exactly like a normal schedulingNewJob() solve does (see its
+        # own `self.deletions[key].append(deletion)` loop) -- missing here meant NONE of state
+        # A's existing jobs ever had a scheduled deletion, so scheduling()'s own deletion-enactment
+        # loop (the `while self.deletions[...]` block) had nothing to pop, and every resident
+        # replica looked permanently stuck. Downstream, ghost_storage.txt's writer falls back to
+        # deletion_time=-1 for any (job, node) pair it can't find here, which MainIncremental.java/
+        # MainOnline.java then treat as "occupies the node for the entire solve horizon"
+        # (`gDeletion < 0 ? makespan : gDeletion`) -- i.e. every existing job's storage looked
+        # permanently unavailable to a later solve, instead of freeing up once that job's last
+        # task on that node actually finishes.
+        master.deletions[key] = list((deletions_ or {}).get(key, []))
 
     env.process(master.scheduling())
     env.process(master.checkOnJobs())
