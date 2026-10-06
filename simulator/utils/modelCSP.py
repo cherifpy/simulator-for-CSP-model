@@ -500,6 +500,65 @@ def _schedulingUsingJavaCSP_impl(master_node, jobs: list, replicas_locations: di
     with open(os.path.join(model_dir, "inputs", "freeze_blocks_node_until_done.txt"), "w") as f:
         f.write("1" if freeze_blocks_node_until_done else "0")
 
+    # Opt-in (2026-10-06): re-enables the pre-existing greedy hints() helper in
+    # MainOnline(MultiObj)(WarmStart).java -- biggest-data-first / fastest-node-first
+    # solver.addHint() nudges -- which was left disabled project-wide (see each file's own "TEMP:
+    # hints disabled" comment) after an earlier, never-conclusively-resolved regression
+    # investigation. Unset (the default): hints() stays uncalled, identical to before this
+    # existed.
+    greedy_size_hints = master_node._config.get('greedy_size_hints', False)
+    with open(os.path.join(model_dir, "inputs", "greedy_size_hints.txt"), "w") as f:
+        f.write("1" if greedy_size_hints else "0")
+
+    # Opt-in (2026-10-06): lets MainOnline.java/MainOnlineMultiObj.java (the COLD, non-warm-start
+    # classes) read warm_start.json and apply its entries as lightweight solver.addHint() nudges
+    # instead of leaving the search to start from scratch -- a softer alternative to
+    # MainOnlineWarmStart's full IntDomainLast-seeded value selector (a hint can be ignored by
+    # the search the moment it looks unprofitable; IntDomainLast keeps retrying the warm-started
+    # value first on every single decision for that variable). Caller is responsible for having
+    # written warm_start.json itself (e.g. via _writeWarmStart) before this solve runs. Unset
+    # (the default): warm_start.json is not read by the cold classes at all, identical to before
+    # this existed.
+    warmstart_as_hints = master_node._config.get('warmstart_as_hints', False)
+    with open(os.path.join(model_dir, "inputs", "warmstart_as_hints.txt"), "w") as f:
+        f.write("1" if warmstart_as_hints else "0")
+
+    # Opt-in (2026-10-06, MainIncremental.java only so far): switches the greedy value-selector's
+    # fixed node-try-order from cpus[]-ascending (compute_capacity, task-execution speed) to
+    # bandwidths[]-descending (transfer speed) -- see that file's own comment on sort_by_bandwidth.
+    # Unset (the default): cpus-based ranking, identical to before this existed.
+    sort_by_bandwidth = master_node._config.get('sort_by_bandwidth', False)
+    with open(os.path.join(model_dir, "inputs", "sort_by_bandwidth.txt"), "w") as f:
+        f.write("1" if sort_by_bandwidth else "0")
+
+    # Opt-in (2026-10-06, MainIncremental.java only so far): skips setLNS entirely, plain tree
+    # search instead -- see that file's own comment on disable_lns. Unset (the default): LNS
+    # stays on, identical to before this existed.
+    disable_lns = master_node._config.get('disable_lns', False)
+    with open(os.path.join(model_dir, "inputs", "disable_lns.txt"), "w") as f:
+        f.write("1" if disable_lns else "0")
+
+    # Nodes excluded from NEW placements entirely, for every job including a brand-new arrival
+    # (unlike frozen_jobs.txt/powerful_nodes.txt, which only ever restrict specific JOBS) -- see
+    # MainOnline.java/MainOnlineMultiObj.java's own comment on excludedNodes. Opt-in via
+    # master_node._config['excluded_node_ids'] (a list of node indices, computed by the caller --
+    # e.g. _timedParallelEscalation's avoid_empty_slow_nodes variant). Unset (the default): no
+    # file written with content, no node excluded, identical to before this existed.
+    excluded_node_ids = master_node._config.get('excluded_node_ids', [])
+    with open(os.path.join(model_dir, "inputs", "excluded_nodes.txt"), "w") as f:
+        f.write(",".join(str(n) for n in excluded_node_ids))
+
+    # Per-job solver.addHint() target node (local job index -> node index), e.g. pairing the
+    # worst-estimated-flow-time job with the fastest node -- see
+    # _timedParallelEscalation's hint_slow_to_fast variant for how this dict is built. Opt-in via
+    # master_node._config['job_node_hints'] ({job_id: node_id}); unset/empty (the default): no
+    # file written with content, no hint applied, identical to before this existed.
+    job_node_hints = master_node._config.get('job_node_hints', {})
+    job_node_hint_pairs = [f"{idx}:{job_node_hints[jd['job_id']]}"
+                           for idx, jd in enumerate(jobs_data) if jd['job_id'] in job_node_hints]
+    with open(os.path.join(model_dir, "inputs", "job_node_hints.txt"), "w") as f:
+        f.write(",".join(job_node_hint_pairs))
+
     # Confines already-running jobs' reconsideration to a "powerful" subset of nodes (by
     # bandwidth/compute_capacity -- NOTE compute_capacity is a DURATION MULTIPLIER, so lower is
     # actually faster/more powerful, hence the division rather than a product) so a full replan

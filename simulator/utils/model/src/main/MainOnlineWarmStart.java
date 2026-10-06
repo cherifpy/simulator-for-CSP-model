@@ -1119,8 +1119,18 @@ public class MainOnlineWarmStart {
             //model.displayVariableOccurrences();
             //model.displayPropagatorOccurrences();
 
-            // TEMP: hints disabled to check whether they're locking in the job11-style idle gaps
-            // hints(nb_nodes, nb_data, data_sizes, works, cpus, solver, jobNodes);
+            // Left disabled by default (see greedy_size_hints.txt's own comment in modelCSP.py)
+            // after an earlier regression investigation ("job11-style idle gaps") never
+            // conclusively resolved whether hints() itself was the cause. Opt back in per-solve
+            // via master_node._config['greedy_size_hints'].
+            try {
+                String greedyHintsText = readFile(MODEL_INPUTS_DIR + "/greedy_size_hints.txt").trim();
+                if (greedyHintsText.equals("1")) {
+                    hints(nb_nodes, nb_data, data_sizes, works, cpus, solver, jobNodes);
+                }
+            } catch (Exception e) {
+                // File missing/unreadable: hints stay off (matches prior default behavior).
+            }
 
             //solver.setNoGoodRecordingFromRestarts();
             ArraySort<?> sorter = new ArraySort<>(nb_nodes, false, true);

@@ -1311,7 +1311,8 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
     # criterion-free random split does just as well, the specific criterion isn't doing real
     # work). A brand-new arrival is never restricted/frozen in any of the seven variants.
     _PARALLEL_ESCALATION_LABELS = ("freeze_below_mean", "freeze_above_mean", "nofreeze", "warm_nofreeze",
-                                   "restrict_powerful_nodes", "freeze_ongoing_transfer", "freeze_random_half")
+                                   "restrict_powerful_nodes", "freeze_ongoing_transfer", "freeze_random_half",
+                                   "greedy_hints", "hint_from_f1", "avoid_empty_slow_nodes", "hint_slow_to_fast")
     # Fraction of nodes (by bandwidth/compute_capacity) restrict_powerful_nodes confines already-
     # running jobs to -- see reschedule_top_fraction's own comment in modelCSP.py.
     _PARALLEL_ESCALATION_RESCHEDULE_TOP_FRACTION = 0.5
@@ -1474,6 +1475,41 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
         random_half_ids = [j.job_id for j in random_half_jobs]
         print(f"### PARALLEL ESCALATION random half freeze (freeze_random_half): {random_half_ids} ###")
 
+        # avoid_empty_slow_nodes: a node with NO data resident on it right now AND in the slower
+        # half by bandwidth/compute_capacity (same scoring as reschedule_top_fraction, see
+        # modelCSP.py) is a "bad bet" -- no locality advantage, and slow once used -- so exclude
+        # it from every job's candidacy entirely (new arrival included, unlike every freeze
+        # variant above, which only ever restricts specific not_finished jobs).
+        occupied_node_ids = {n for locs in self.replicas_locations.values() for n in locs}
+        power_scored = sorted(
+            range(len(self.compute_nodes)),
+            key=lambda n: self.compute_nodes[n].bandwidth / self.compute_nodes[n].compute_capacity,
+        )
+        slow_node_ids = set(power_scored[:len(power_scored) // 2])
+        empty_and_slow_ids = [n for n in range(len(self.compute_nodes))
+                               if n not in occupied_node_ids and n in slow_node_ids]
+        print(f"### PARALLEL ESCALATION empty+slow node exclusion (avoid_empty_slow_nodes): "
+              f"{empty_and_slow_ids} ###")
+
+        # hint_slow_to_fast: pairs the not_finished job with the WORST _estimateJobFlowTime
+        # (slowest) with the FASTEST node (by compute_capacity -- a duration multiplier, so
+        # lowest = fastest), 2nd-worst with 2nd-fastest, etc (cycling if more jobs than nodes) --
+        # a lightweight solver.addHint() nudge per job, not a hard assignment. This is the fix
+        # for the pre-existing hints() helper's own didx (its size-based job ranking is computed
+        # but never actually used in its assignment loop -- see that function's own comment) --
+        # here the ranking (by flow-time ESTIMATE, not raw data size) is the one actually applied.
+        # Jobs with no estimate yet (no replicas) are left unhinted.
+        estimated_jobs = [(j, self._estimateJobFlowTime(j)) for j in not_finished_jobs]
+        estimated_jobs = [(j, est) for j, est in estimated_jobs if est is not None]
+        estimated_jobs.sort(key=lambda t: t[1], reverse=True)
+        nodes_by_speed = sorted(range(len(self.compute_nodes)), key=lambda n: self.compute_nodes[n].compute_capacity)
+        slow_to_fast_hints = {}
+        if nodes_by_speed:
+            slow_to_fast_hints = {j.job_id: nodes_by_speed[idx % len(nodes_by_speed)]
+                                   for idx, (j, est) in enumerate(estimated_jobs)}
+        print(f"### PARALLEL ESCALATION slow-job-to-fast-node hints (hint_slow_to_fast): "
+              f"{slow_to_fast_hints} ###")
+
         # "hybrid-n_j" (2026-10-05): every variant below minimizes ONLY the new job's own flow
         # time (objective_choice=2) instead of the batch's max/sum, capped per-job so that can't
         # come at an existing job's expense -- see adaptive_new_job_objective's own comment.
@@ -1487,11 +1523,17 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
             print(f"### PARALLEL ESCALATION hybrid-n_j: objective=new_job_flow_time, "
                   f"degradation_cap={degradation_cap_pct * 100:.0f}%, caps={flow_time_caps} ###")
 
-        def run_variant(label, java_main_class, write_warm_start, frozen_job_ids, reschedule_top_fraction=None):
+        def run_variant(label, java_main_class, write_warm_start, frozen_job_ids, reschedule_top_fraction=None,
+                        greedy_hints=False, warmstart_as_hints=False, excluded_node_ids=None,
+                        job_node_hints=None):
             proxy = copy.copy(self)
             proxy._config = dict(self._config)
             proxy.java_main_class = java_main_class
             proxy._config['solver_time_limit_s'] = max(1, int(round(budget)))
+            proxy._config['greedy_size_hints'] = greedy_hints
+            proxy._config['warmstart_as_hints'] = warmstart_as_hints
+            proxy._config['excluded_node_ids'] = excluded_node_ids or []
+            proxy._config['job_node_hints'] = job_node_hints or {}
             if new_job_objective:
                 # Bi-objective (epsilon-constraint, 2 phases) stays ON -- 2026-10-05 revision:
                 # MainOnlineMultiObj(WarmStart)'s own phase-1 objective call now reads
@@ -1528,14 +1570,34 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
             return transfers_, works_, deletions_, elapsed
 
         variant_specs = {
-            "freeze_below_mean": ("MainOnlineMultiObj", False, below_ids, None),
-            "freeze_above_mean": ("MainOnlineMultiObj", False, above_ids, None),
-            "nofreeze": ("MainOnlineMultiObj", False, [], None),
-            "warm_nofreeze": (self.escalation_java_main_class, True, [], None),
+            "freeze_below_mean": ("MainOnlineMultiObj", False, below_ids, None, False, False, None, None),
+            "freeze_above_mean": ("MainOnlineMultiObj", False, above_ids, None, False, False, None, None),
+            "nofreeze": ("MainOnlineMultiObj", False, [], None, False, False, None, None),
+            "warm_nofreeze": (self.escalation_java_main_class, True, [], None, False, False, None, None),
             "restrict_powerful_nodes": ("MainOnlineMultiObj", False, [],
-                                        self._PARALLEL_ESCALATION_RESCHEDULE_TOP_FRACTION),
-            "freeze_ongoing_transfer": ("MainOnlineMultiObj", False, ongoing_transfer_ids, None),
-            "freeze_random_half": ("MainOnlineMultiObj", False, random_half_ids, None),
+                                        self._PARALLEL_ESCALATION_RESCHEDULE_TOP_FRACTION, False, False, None, None),
+            "freeze_ongoing_transfer": ("MainOnlineMultiObj", False, ongoing_transfer_ids, None, False, False, None, None),
+            "freeze_random_half": ("MainOnlineMultiObj", False, random_half_ids, None, False, False, None, None),
+            # greedy_hints (2026-10-06): re-enables MainOnlineMultiObj.java's pre-existing
+            # size/cpu greedy hints() helper (biggest job -> fastest node), left disabled
+            # project-wide since an earlier, never-conclusively-resolved regression
+            # investigation -- see greedy_size_hints.txt's own comment in modelCSP.py.
+            "greedy_hints": ("MainOnlineMultiObj", False, [], None, True, False, None, None),
+            # hint_from_f1 (2026-10-06): reuses _writeWarmStart's own output (this scheduler's
+            # last-known plan for already-known jobs + a throwaway Incremental solve for the new
+            # arrival) as LIGHTWEIGHT solver.addHint() nudges in a COLD search, instead of
+            # warm_nofreeze's full IntDomainLast-seeded value selector for the exact same data --
+            # a hint the search can abandon the moment it looks unprofitable.
+            "hint_from_f1": ("MainOnlineMultiObj", True, [], None, False, True, None, None),
+            # avoid_empty_slow_nodes (2026-10-06): excludes nodes with no data resident on them
+            # AND in the slower half by bandwidth/compute_capacity from every job's candidacy
+            # (new arrival included) -- see empty_and_slow_ids above.
+            "avoid_empty_slow_nodes": ("MainOnlineMultiObj", False, [], None, False, False, empty_and_slow_ids, None),
+            # hint_slow_to_fast (2026-10-06): per-job solver.addHint() pairing the worst
+            # _estimateJobFlowTime with the fastest node (see slow_to_fast_hints above) -- the
+            # fix for greedy_hints' own dead size-based ranking (hints()'s didx is computed but
+            # never applied), using a real flow-time estimate instead of raw data size.
+            "hint_slow_to_fast": ("MainOnlineMultiObj", False, [], None, False, False, None, slow_to_fast_hints),
         }
         # Safety timeout, not just a nicety: with 3 concurrent variants, this was observed to
         # occasionally hang indefinitely on macOS (0 Java processes left running, one Python
@@ -1552,8 +1614,11 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
         print(f"### PARALLEL ESCALATION diag: submitting at {time.strftime('%H:%M:%S')}, "
               f"active_count={threading.active_count()} ###")
         futures = {
-            label: pool.submit(run_variant, label, java_main_class, write_warm_start, frozen_job_ids, reschedule_top_fraction)
-            for label, (java_main_class, write_warm_start, frozen_job_ids, reschedule_top_fraction) in variant_specs.items()
+            label: pool.submit(run_variant, label, java_main_class, write_warm_start, frozen_job_ids,
+                                reschedule_top_fraction, greedy_hints, warmstart_as_hints, excluded_node_ids,
+                                job_node_hints)
+            for label, (java_main_class, write_warm_start, frozen_job_ids, reschedule_top_fraction,
+                        greedy_hints, warmstart_as_hints, excluded_node_ids, job_node_hints) in variant_specs.items()
         }
         results = {}
         for label, future in futures.items():

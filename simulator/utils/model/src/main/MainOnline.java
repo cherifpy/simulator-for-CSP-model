@@ -658,6 +658,25 @@ public class MainOnline {
                 // File missing/unreadable: no job power-restricted (matches prior behavior).
             }
 
+            // Nodes to exclude from NEW placements entirely, for EVERY job including a brand-new
+            // arrival (unlike frozen_jobs.txt, which only ever restricts specific JOBS, never the
+            // new one) -- e.g. a node with no data resident on it right now AND slow by bandwidth/
+            // compute_capacity, a "bad bet" combination with no locality advantage and no speed
+            // advantage either. Comma-separated node indices, written by
+            // _timedParallelEscalation's avoid_empty_slow_nodes variant. Already-resident data on
+            // an excluded node stays valid (same isResident carve-out as isFrozen below) -- this
+            // only ever forbids reaching a node that nothing is on yet. File missing/empty (the
+            // default): no exclusion, identical to before this existed.
+            Set<Integer> excludedNodes = new HashSet<>();
+            try {
+                String excludedText = readFile(MODEL_INPUTS_DIR + "/excluded_nodes.txt").trim();
+                if (!excludedText.isEmpty()) {
+                    for (String tok : excludedText.split(",")) excludedNodes.add(Integer.parseInt(tok.trim()));
+                }
+            } catch (Exception e) {
+                // File missing/unreadable: no node excluded (matches prior behavior).
+            }
+
             // ----- MODEL -----
             Model model = new Model("Bag of Tasks Scheduling (Java)");
             /*Settings.dev()
@@ -706,6 +725,12 @@ public class MainOnline {
                         // (the else branch) lets the normal mechanism decide which of them still
                         // keep a task this round, exactly like any non-frozen job's unused
                         // replicas -- freezing only ever forbids reaching a NEW node.
+                        h = model.boolVar("height_transfer_d" + i + "_n" + j, false);
+                    } else if (excludedNodes.contains(j) && !isResident) {
+                        // Excluded (empty+slow) and NOT already here: same carve-out as isFrozen
+                        // above, applied per-NODE instead of per-job -- blocks every job
+                        // (including a brand-new arrival) from reaching this node for the first
+                        // time, but never forces away data already resident there.
                         h = model.boolVar("height_transfer_d" + i + "_n" + j, false);
                     } else {
                         h = model.boolVar("height_transfer_d" + i + "_n" + j);
@@ -1080,8 +1105,100 @@ public class MainOnline {
             //model.displayPropagatorOccurrences();
 
             IntVar[] decisionVars = decisionVariables(nb_nodes, nb_data, works, jobNodes, jobStarts, transferHeights, transferTasks);
-            // TEMP: hints disabled to check whether they're locking in the job11-style idle gaps
-            // hints(nb_nodes, nb_data, data_sizes, works, cpus, solver, jobNodes);
+            // Left disabled by default (see greedy_size_hints.txt's own comment in modelCSP.py)
+            // after an earlier regression investigation ("job11-style idle gaps") never
+            // conclusively resolved whether hints() itself was the cause. Opt back in per-solve
+            // via master_node._config['greedy_size_hints'].
+            try {
+                String greedyHintsText = readFile(MODEL_INPUTS_DIR + "/greedy_size_hints.txt").trim();
+                if (greedyHintsText.equals("1")) {
+                    hints(nb_nodes, nb_data, data_sizes, works, cpus, solver, jobNodes);
+                }
+            } catch (Exception e) {
+                // File missing/unreadable: hints stay off (matches prior default behavior).
+            }
+
+            // Opt-in (see warmstart_as_hints.txt's own comment in modelCSP.py): applies
+            // warm_start.json's entries as solver.addHint() nudges instead of the heavier
+            // IntDomainLast-seeded value selector MainOnlineWarmStart.java uses for the same
+            // data -- a hint the search can abandon the moment it looks unprofitable, rather
+            // than one re-tried on every single decision for that variable. This class (the
+            // cold, non-warm-start one) never read warm_start.json before this existed; the
+            // caller is responsible for having written it (e.g. via _writeWarmStart) beforehand.
+            try {
+                String warmstartAsHintsText = readFile(MODEL_INPUTS_DIR + "/warmstart_as_hints.txt").trim();
+                if (warmstartAsHintsText.equals("1")) {
+                    String warmStartText = readFile(MODEL_INPUTS_DIR + "/warm_start.json").trim();
+                    if (!warmStartText.isEmpty()) {
+                        JSONObject warmStart = new JSONObject(warmStartText);
+                        int hinted = 0;
+                        if (warmStart.has("job_placements")) {
+                            JSONArray placements = warmStart.getJSONArray("job_placements");
+                            for (int p = 0; p < placements.length(); p++) {
+                                JSONObject entry = placements.getJSONObject(p);
+                                int i = entry.getInt("job_index");
+                                int k = entry.getInt("task_index");
+                                int node = entry.getInt("node");
+                                if (i < 0 || i >= nb_data || k < 0 || k >= works[i].length) continue;
+                                try {
+                                    if (jobNodes[i][k].contains(node)) {
+                                        solver.addHint(jobNodes[i][k], node);
+                                        hinted++;
+                                    }
+                                } catch (Exception e) { /* skip this one entry */ }
+                            }
+                        }
+                        if (warmStart.has("transfers")) {
+                            JSONArray transfersWs = warmStart.getJSONArray("transfers");
+                            for (int t = 0; t < transfersWs.length(); t++) {
+                                JSONObject entry = transfersWs.getJSONObject(t);
+                                int i = entry.getInt("job_index");
+                                int node = entry.getInt("node");
+                                if (i < 0 || i >= nb_data || node < 0 || node >= nb_nodes) continue;
+                                try {
+                                    if (transferHeights[node][i].contains(1)) {
+                                        solver.addHint(transferHeights[node][i], 1);
+                                        hinted++;
+                                    }
+                                } catch (Exception e) { /* skip this one entry */ }
+                            }
+                        }
+                        System.out.println("### warmstart_as_hints: " + hinted + " hint(s) applied ###");
+                    }
+                }
+            } catch (Exception e) {
+                // File missing/unreadable/malformed: proceed without these hints.
+            }
+
+            // Per-job solver.addHint() target node (e.g. the worst-estimated-flow-time job
+            // paired with the fastest node -- see job_node_hints.txt's own comment in
+            // modelCSP.py). Comma-separated "job_index:node_index" pairs; every one of that
+            // job's tasks gets the same node hint, same granularity as the pre-existing (and
+            // currently dead-ranking) hints() helper. File missing/empty (the default): no hint
+            // applied, identical to before this existed.
+            try {
+                String jobNodeHintsText = readFile(MODEL_INPUTS_DIR + "/job_node_hints.txt").trim();
+                if (!jobNodeHintsText.isEmpty()) {
+                    int hinted = 0;
+                    for (String pair : jobNodeHintsText.split(",")) {
+                        String[] parts = pair.split(":");
+                        int i = Integer.parseInt(parts[0].trim());
+                        int node = Integer.parseInt(parts[1].trim());
+                        if (i < 0 || i >= nb_data || node < 0 || node >= nb_nodes) continue;
+                        for (int k = 0; k < works[i].length; k++) {
+                            try {
+                                if (jobNodes[i][k].contains(node)) {
+                                    solver.addHint(jobNodes[i][k], node);
+                                    hinted++;
+                                }
+                            } catch (Exception e) { /* skip this one entry */ }
+                        }
+                    }
+                    System.out.println("### job_node_hints: " + hinted + " hint(s) applied ###");
+                }
+            } catch (Exception e) {
+                // File missing/unreadable/malformed: proceed without these hints.
+            }
 
             //solver.setNoGoodRecordingFromRestarts();
             ArraySort<?> sorter = new ArraySort<>(nb_nodes, false, true);

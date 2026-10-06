@@ -622,7 +622,7 @@ public class MainIncremental {
                     IntVar end = model.intVar("end_transfer_d" + i + "_n" + j, (int) starting_times[j] + d, makespan,true);
                     
                     BoolVar h;
-                    if (data_sizes[i] > storage_capacity[j] || !nodeFree[j]) {
+                    if (data_sizes[i] > storage_capacity[j] ) { //|| !nodeFree[j]
                         h = model.boolVar("height_transfer_d" + i + "_n" + j, false);
                         //model.arithm(h, "=", 0).post();
                     }else{
@@ -910,9 +910,33 @@ public class MainIncremental {
             // hints(nb_nodes, nb_data, data_sizes, works, cpus, solver, jobNodes);
 
             //solver.setNoGoodRecordingFromRestarts();
+            // Opt-in (2026-10-06): the greedy value-selector below always tries nodes in a FIXED
+            // order (cidx) for every "node_work_d*" decision -- by default sorted by cpus[]
+            // (compute_capacity, ascending -- lower is faster), which only ever reflects TASK
+            // EXECUTION speed, never bandwidth/TRANSFER speed. On a transfer-dominated job (a
+            // large dataset, where the transfer itself is the bulk of the flow time), this can
+            // greedily commit to a node that's fast to COMPUTE on but slow to TRANSFER to,
+            // and -- because LNS's own neighborhoods (getNeighbor1..4bis) only ever explore local
+            // perturbations around whatever incumbent this greedy first choice already locked in
+            // -- more search time alone does not necessarily escape that choice (confirmed
+            // 2026-10-06: 300s and 1800s converged to the IDENTICAL result on the same instance).
+            // sort_by_bandwidth.txt = "1" switches cidx to rank by bandwidths[] descending
+            // instead, so the greedy value-selector tries high-bandwidth nodes first. Unset (the
+            // default): ranks by cpus[] ascending, identical to before this existed.
+            boolean sortByBandwidth = false;
+            try {
+                String sortByBandwidthText = readFile(MODEL_INPUTS_DIR + "/sort_by_bandwidth.txt").trim();
+                sortByBandwidth = sortByBandwidthText.equals("1");
+            } catch (Exception e) {
+                // File missing/unreadable: keep the cpus-based default.
+            }
             ArraySort<?> sorter = new ArraySort<>(nb_nodes, false, true);
             int[] cidx = ArrayUtils.array(0, nb_nodes - 1);
-            sorter.sort(cidx, nb_nodes, (i, j) -> (int) ((cpus[i] - cpus[j]) * 1000));
+            if (sortByBandwidth) {
+                sorter.sort(cidx, nb_nodes, (i, j) -> (bandwidths[j] - bandwidths[i]));
+            } else {
+                sorter.sort(cidx, nb_nodes, (i, j) -> (int) ((cpus[i] - cpus[j]) * 1000));
+            }
             solver.setSearch(
                     Search.lastConflict(
                             Search.intVarSearch(new InputOrder<>(model),
@@ -935,34 +959,56 @@ public class MainIncremental {
                                             }, (i, j) -> true),
                                     decisionVars), 2)
             );
-            if (solve || pos == 1) {
-                setLNS(solver,
-                        //new AdaptiveNeighborhood(42,
-                        new SequenceNeighborhood(
-                                getNeighbor1(nb_data, works, jobNodes, jobStarts, jobEnds),
-                                getNeighbor2(nb_data, works,  jobNodes, jobStarts, jobEnds),
-                                getNeighbor3(nb_data, works,  jobNodes, jobStarts, jobEnds),
-                                getNeighbor1bis(nb_data, works,  jobNodes, jobStarts, jobEnds),
-                                getNeighbor2bis(nb_data, works,  jobNodes, jobStarts, jobEnds),
-                                getNeighbor3bis(nb_data, works,  jobNodes, jobStarts, jobEnds),
-                                getNeighbor4bis(nb_data, works,  jobNodes, jobStarts, jobEnds)
-                        ),
-                        new FailCounter(model, nb_data * nb_nodes * 100));
-            } else if (pos == 2) {
-                setLNS(solver,
-                        new SequenceNeighborhood(
-                                getNeighbor1bis(nb_data, works,  jobNodes, jobStarts, jobEnds),
-                                getNeighbor3bis(nb_data, works,  jobNodes, jobStarts, jobEnds)
-                        ),
-                        new FailCounter(model, nb_data * nb_nodes * 50));
-            } else if (pos == 3) {
-                setLNS(solver,
-                        new SequenceNeighborhood(
-                                getNeighbor1(nb_data, works, jobNodes, jobStarts, jobEnds),
-                                getNeighbor2bis(nb_data, works,  jobNodes, jobStarts, jobEnds),
-                                getNeighbor3bis(nb_data, works,  jobNodes, jobStarts, jobEnds)
-                        ),
-                        new FailCounter(model, nb_data * nb_nodes * 100));
+            // Opt-in (2026-10-06): skips setLNS entirely -- plain tree search (lastConflict +
+            // the greedy value-selector above) instead of Large Neighborhood Search. Suspected
+            // cause of a repeatedly observed pattern on THIS class: Incremental converges to a
+            // solution in well under 2 seconds, then finds NOTHING better for the rest of a long
+            // budget (confirmed identical at 300s and 1800s on the seed=46/n_existing=12 storage-
+            // squeeze scenario, nodes 26/32, flow_time=22183 both times -- and unaffected by
+            // switching the greedy value-selector's node order from cpus-based to bandwidth-
+            // based). LNS only ever explores local perturbations around its current incumbent
+            // (getNeighbor1..4bis), so if none of those neighborhoods happen to generate the
+            // move that would reach an objectively better node choice, more time alone never
+            // finds it. Plain tree search explores differently (no incumbent-local bias) and may
+            // escape that trap, at the cost of usually converging slower to its first solution.
+            // Unset (the default): LNS stays on, identical to before this existed.
+            boolean disableLns = false;
+            try {
+                String disableLnsText = readFile(MODEL_INPUTS_DIR + "/disable_lns.txt").trim();
+                disableLns = disableLnsText.equals("1");
+            } catch (Exception e) {
+                // File missing/unreadable: keep LNS on (the default).
+            }
+            if (!disableLns) {
+                if (solve || pos == 1) {
+                    setLNS(solver,
+                            //new AdaptiveNeighborhood(42,
+                            new SequenceNeighborhood(
+                                    getNeighbor1(nb_data, works, jobNodes, jobStarts, jobEnds),
+                                    getNeighbor2(nb_data, works,  jobNodes, jobStarts, jobEnds),
+                                    getNeighbor3(nb_data, works,  jobNodes, jobStarts, jobEnds),
+                                    getNeighbor1bis(nb_data, works,  jobNodes, jobStarts, jobEnds),
+                                    getNeighbor2bis(nb_data, works,  jobNodes, jobStarts, jobEnds),
+                                    getNeighbor3bis(nb_data, works,  jobNodes, jobStarts, jobEnds),
+                                    getNeighbor4bis(nb_data, works,  jobNodes, jobStarts, jobEnds)
+                            ),
+                            new FailCounter(model, nb_data * nb_nodes * 100));
+                } else if (pos == 2) {
+                    setLNS(solver,
+                            new SequenceNeighborhood(
+                                    getNeighbor1bis(nb_data, works,  jobNodes, jobStarts, jobEnds),
+                                    getNeighbor3bis(nb_data, works,  jobNodes, jobStarts, jobEnds)
+                            ),
+                            new FailCounter(model, nb_data * nb_nodes * 50));
+                } else if (pos == 3) {
+                    setLNS(solver,
+                            new SequenceNeighborhood(
+                                    getNeighbor1(nb_data, works, jobNodes, jobStarts, jobEnds),
+                                    getNeighbor2bis(nb_data, works,  jobNodes, jobStarts, jobEnds),
+                                    getNeighbor3bis(nb_data, works,  jobNodes, jobStarts, jobEnds)
+                            ),
+                            new FailCounter(model, nb_data * nb_nodes * 100));
+                }
             }
 
             int timeLimitSeconds = 120;

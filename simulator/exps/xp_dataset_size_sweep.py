@@ -231,6 +231,15 @@ def parse_args():
                               "solve (objective_choice=2, no escalation, no gate against an "
                               "Incremental probe) instead of hybrid's 6-variant race. Unset = "
                               "objective_choice=2 still applies but unconstrained.")
+    parser.add_argument("--sort-by-bandwidth", action="store_true",
+                         help="incremental approach only (MainIncremental.java): switches the "
+                              "greedy value-selector's fixed node-try-order from cpus[]-ascending "
+                              "(task-execution speed) to bandwidths[]-descending (transfer "
+                              "speed) -- see sort_by_bandwidth.txt's own comment in modelCSP.py.")
+    parser.add_argument("--disable-lns", action="store_true",
+                         help="incremental approach only (MainIncremental.java): skips setLNS "
+                              "entirely, plain tree search instead of Large Neighborhood Search "
+                              "-- see disable_lns.txt's own comment in modelCSP.py.")
     parser.add_argument("--adaptive-selection-metric", choices=["new_job", "max"], default="max",
                          help="hybrid approach only: metric _timedParallelEscalation uses to pick "
                               "the best of its 6 concurrent variants -- separate from "
@@ -391,58 +400,43 @@ def build_state_a(config, args, results_dir, tier_name, size_range, tier_index):
               f"{args.n_existing} jobs -- possibly infeasible or cut short within the time budget ###",
               flush=True)
 
-    # A job is "finished by T" iff its own committed schedule has it fully done at or before the
-    # freeze point -- computed from state A's OWN decided timeline, not a live status flag
-    # (nothing here ever actually executes through SimPy's event loop).
-    not_finished_ids = {j.job_id for j in existing_jobs
-                         if state_a_finish.get(j.job_id) is None or state_a_finish[j.job_id] > freeze_at}
-    not_finished_jobs = [j for j in existing_jobs if j.job_id in not_finished_ids]
-    print(f"### [{tier_name}] At freeze point T={freeze_at:.2f}: {args.n_existing - len(not_finished_ids)} "
-          f"of {args.n_existing} existing jobs already finished; {len(not_finished_ids)} still running "
-          f"(job_ids={sorted(not_finished_ids)}) ###", flush=True)
+    # Dispatch state A's own plan through the REAL SimPy event loop (master.scheduling() +
+    # checkOnJobs() + every node's processTasks(), the exact same processes simulator.py's own
+    # live run registers) up to the freeze point, instead of manually reflecting the plan's
+    # IDEALIZED end times onto Task status/node occupancy. This is what actually populates
+    # job.replicas and master.replicas_locations (2026-10-06 fix -- only ever set by
+    # startTransfer/transferData, both only reachable from a genuinely running scheduling()
+    # process; nothing before this point in this script ever called them, so every not_finished
+    # job looked like it had no data anywhere, and _estimateJobFlowTime -- which needs
+    # job.replicas -- always returned None here, silently defeating every mean-split/replica-
+    # based escalation criterion whenever tested through this harness).
+    #
+    # Side effect, and the more representative behavior: real dispatch can only ever be SLOWER
+    # than the CSP's own idealized plan (bandwidth_lock contention, scheduling()'s own 0.1-tick
+    # polling granularity), never faster -- so a job the idealized plan (state_a_finish above)
+    # said would finish by T can still genuinely be "not finished" here. not_finished_ids is
+    # therefore computed from each job's REAL post-dispatch status, not state_a_finish (which
+    # stays as the idealized per-job projection used for reporting/degradation-cap purposes).
+    for node_id in range(len(compute_nodes)):
+        key = f'node_{node_id}'
+        master.transfers[key] = list((transfers_ or {}).get(key, []))
+        master.works[key] = list((works_ or {}).get(key, []))
 
-    # Reflect state A's own per-TASK schedule onto each not-yet-finished job's actual Task
-    # objects: anything already committed by T becomes "Finished" or "Started", leaving only
-    # genuinely not-yet-started tasks as "NotStarted". schedulingUsingJavaCSP only ever batches a
-    # job's "NotStarted" tasks into the CSP, so this is what makes an online replan reconsider
-    # just the REMAINING work -- without it, every task here is still "NotStarted" (the Task
-    # class default, since these Job/Task objects never run through SimPy's live event loop), so
-    # a replan would silently re-decide the ENTIRE job's placement from scratch at T, discarding
-    # whatever state A had already committed before T. See xp_single_decision_grid5000.py's
-    # matching fix/comment.
-    job_by_id = {j.job_id: j for j in existing_jobs}
-    for key, entries in (works_ or {}).items():
-        for job_id, node_index, task_index, start_abs, end_abs, duration in entries:
-            if job_id not in not_finished_ids:
-                continue
-            task_obj = job_by_id[job_id].tasks[task_index]
-            if end_abs <= freeze_at:
-                task_obj.status = "Finished"
-            elif start_abs <= freeze_at < end_abs:
-                task_obj.status = "Started"
-            # else: stays "NotStarted" (default) -- genuinely still reschedulable
-
-    # Reflect state A's own decisions for the not-yet-finished jobs as REAL node occupancy at the
-    # freeze point, so nodesFreeTime()/nodesFreeTimeIncremental() correctly see which nodes are
-    # busy (and until when) instead of treating every node as free.
-    for key, entries in (works_ or {}).items():
-        for job_id, node_index, task_index, start_abs, end_abs, duration in entries:
-            if job_id not in not_finished_ids or end_abs <= freeze_at:
-                continue
-            if start_abs <= freeze_at < end_abs:
-                master.ongoing_works[f'node_{node_index}'] = (job_id, node_index, task_index, start_abs, end_abs, duration)
-            else:
-                master.works[f'node_{node_index}'].append((job_id, node_index, task_index, start_abs, end_abs, duration))
-    for key, entries in (transfers_ or {}).items():
-        for job_id, node_index, start_abs, end_abs, duration in entries:
-            if job_id not in not_finished_ids or end_abs <= freeze_at:
-                continue
-            if start_abs <= freeze_at < end_abs:
-                master.ongoing_transfers[f'node_{node_index}'] = (job_id, node_index, start_abs, end_abs, duration)
-            else:
-                master.transfers[f'node_{node_index}'].append((job_id, node_index, start_abs, end_abs, duration))
+    env.process(master.scheduling())
+    env.process(master.checkOnJobs())
+    for node in compute_nodes:
+        env.process(node.processTasks())
 
     env.run(until=freeze_at)
+
+    not_finished_jobs = [j for j in existing_jobs if j.status != "Finished"]
+    not_finished_ids = {j.job_id for j in not_finished_jobs}
+    print(f"### [{tier_name}] At freeze point T={freeze_at:.2f} (live dispatch): "
+          f"{args.n_existing - len(not_finished_ids)} of {args.n_existing} existing jobs already "
+          f"finished; {len(not_finished_ids)} still running (job_ids={sorted(not_finished_ids)}) ###",
+          flush=True)
+    print(f"### [{tier_name}] replicas_locations after live dispatch: "
+          f"{dict(master.replicas_locations)} ###", flush=True)
     print(f"### [{tier_name}] State A built. env.now={env.now:.2f}, "
           f"jobs placed={len(state_a_finish)}/{args.n_existing} ###", flush=True)
 
@@ -993,10 +987,18 @@ def run_online_biobj_warmstart_style(master, new_job, isolated_ids, nb_nodes, no
     }
 
 
-def run_incremental_style(master, new_job, isolated_ids, nb_nodes, now, replicas_locations, not_finished_jobs=None):
+def run_incremental_style(master, new_job, isolated_ids, nb_nodes, now, replicas_locations, not_finished_jobs=None,
+                           sort_by_bandwidth=False, disable_lns=False):
     """Mirrors SchedulingUsingCSPIncremental.schedulingNewJob(): place the new job alone; every
     existing job keeps whatever it was already committed to in state A, untouched. not_finished_jobs
-    is accepted (and ignored) purely so this shares a call signature with run_online_style."""
+    is accepted (and ignored) purely so this shares a call signature with run_online_style.
+
+    sort_by_bandwidth: see sort_by_bandwidth.txt's own comment in modelCSP.py -- switches
+    MainIncremental.java's greedy value-selector from cpus[]-ascending to bandwidths[]-descending.
+    disable_lns: see disable_lns.txt's own comment in modelCSP.py -- skips setLNS, plain tree
+    search instead of Large Neighborhood Search."""
+    master._config['sort_by_bandwidth'] = sort_by_bandwidth
+    master._config['disable_lns'] = disable_lns
     jobs_to_reschedule = [new_job]
     # master is a SchedulingUsingCSPOnline instance (state A is always built via Online now);
     # nodesFreeTimeIncremental is only DEFINED on the Incremental subclass, but only ever
@@ -1401,7 +1403,9 @@ def run_tier(config, args, results_dir, tier_name, size_range, tier_index):
                   lambda nj: run_online_warmstart_style(master, nj, isolated_ids, args.nb_nodes, now, replicas_locations, not_finished_jobs))
         if "incremental" in args.approaches:
             solve("incremental", "INCREMENTAL style", args.incremental_time_limit,
-                  lambda nj: run_incremental_style(master, nj, isolated_ids, args.nb_nodes, now, replicas_locations))
+                  lambda nj: run_incremental_style(master, nj, isolated_ids, args.nb_nodes, now, replicas_locations,
+                                                    sort_by_bandwidth=args.sort_by_bandwidth,
+                                                    disable_lns=args.disable_lns))
         if "epsilon" in args.approaches:
             solve("epsilon", f"EPSILON-CONSTRAINT style ({args.epsilon_fraction * 100:.0f}% max-flow slack)",
                   args.epsilon_time_limit,
