@@ -6,7 +6,10 @@ transferees, energie, temps de scheduling, variantes gagnantes d'Hybrid, violati
 evolution de la complexite du probleme)."""
 import nbformat as nbf
 
-CSV_PATH = "/Users/cherif/.claude/jobs/352e4073/tmp/phaseABC_full_metrics.csv"
+# Relative to simulator/ (where this notebook lives and is meant to be opened/run from) -- the
+# raw collection script still writes its working copy to the scratchpad; this is the in-repo,
+# durable copy committed alongside the notebook.
+CSV_PATH = "results-validation-2026-10-07/phaseABC_full_metrics.csv"
 OUT_PATH = "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/phaseABC_full_analysis.ipynb"
 
 nb = nbf.v4.new_notebook()
