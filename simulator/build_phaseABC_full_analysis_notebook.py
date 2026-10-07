@@ -10,6 +10,7 @@ import nbformat as nbf
 # raw collection script still writes its working copy to the scratchpad; this is the in-repo,
 # durable copy committed alongside the notebook.
 CSV_PATH = "results-validation-2026-10-07/phaseABC_full_metrics.csv"
+CSV_PATH_MAX = "results-validation-2026-10-07/phaseABC_full_metrics_max.csv"
 OUT_PATH = "/Users/cherif/Documents/Traveaux/simulator-for-CSP-model/simulator/phaseABC_full_analysis.ipynb"
 
 nb = nbf.v4.new_notebook()
@@ -245,6 +246,56 @@ cells.append(nbf.v4.new_markdown_cell("""### Points clés
 - Aucune violation de stockage détectée pour aucune des 3 approches dans ce protocole figé
   (single-decision-point) — à l'inverse du protocole live (simulation continue Poisson), où Hybrid
   seul en a montré (voir note séparée sur l'expérience Poisson du 2026-10-07)."""))
+
+# --- Section 11: objective comparison (new_job vs max) ---
+cells.append(nbf.v4.new_markdown_cell("""## 11. Comparaison d'objectif — `new_job` vs `max` (2026-10-07)
+
+Mêmes 16 scénarios, mêmes graines, rejoués avec `exps/xp_validation_comparison.py --objective max`
+(fichier configurable, autonome) : Online et Hybrid minimisent maintenant le **flow time max de
+tout le batch** (`objective_choice=1`, sans plafond de dégradation — plus besoin, puisque rien
+n'est ciblé spécifiquement) au lieu du flow time du nouveau job seul sous plafond de 25%.
+Incremental est inchangé (solve à un seul job, aucune notion de "batch" à optimiser)."""))
+cells.append(nbf.v4.new_code_cell("""df_newjob = df.copy()
+df_newjob["objective"] = "new_job"
+
+df_max = pd.read_csv("%s")
+df_max = df_max[df_max.no_solution != True].copy()
+df_max["approach_disp"] = df_max["approach"].map({"incremental": "Incremental", "online": "Online", "hybrid": "Hybrid-n_j"})
+df_max["scenario"] = df_max.apply(scenario_label, axis=1)
+
+both = pd.concat([df_newjob, df_max], ignore_index=True, sort=False)
+both.groupby(["objective", "approach_disp"]).agg(
+    flow_time_new_job_mean=("flow_time_new_job", "mean"),
+    max_flow_time_all_mean=("max_flow_time_all", "mean"),
+    scheduling_time_s_mean=("scheduling_time_s", "mean"),
+    storage_violations_sum=("storage_violations", "sum"),
+).round(1)""" % CSV_PATH_MAX))
+cells.append(nbf.v4.new_code_cell("""fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+pivot_nj = df_newjob.pivot_table(index="scenario", columns="approach_disp", values="flow_time_new_job")
+pivot_mx = df_max.pivot_table(index="scenario", columns="approach_disp", values="flow_time_new_job").reindex(pivot_nj.index)
+x = np.arange(len(pivot_nj.index))
+width = 0.2
+for i, appr in enumerate(["Incremental", "Online", "Hybrid-n_j"]):
+    col_nj = "Online_newjob" if appr == "Online" else appr
+    axes[0].bar(x + (i - 1) * width, pivot_nj.get(col_nj, pd.Series(index=pivot_nj.index)).values, width, label=f"{appr} (new_job)")
+axes[0].set_xticks(x); axes[0].set_xticklabels(pivot_nj.index, rotation=45, ha="right", fontsize=7)
+axes[0].set_title("Objectif new_job"); axes[0].set_ylabel("flow time nouveau job"); axes[0].legend(fontsize=7)
+for i, appr in enumerate(["Incremental", "Online", "Hybrid-n_j"]):
+    axes[1].bar(x + (i - 1) * width, pivot_mx.get(appr, pd.Series(index=pivot_mx.index)).values, width, label=f"{appr} (max)")
+axes[1].set_xticks(x); axes[1].set_xticklabels(pivot_mx.index, rotation=45, ha="right", fontsize=7)
+axes[1].set_title("Objectif max (flow time max du batch)"); axes[1].set_ylabel("flow time nouveau job"); axes[1].legend(fontsize=7)
+plt.tight_layout()
+plt.show()"""))
+cells.append(nbf.v4.new_markdown_cell("""### Points clés — objectif `max`
+
+- **"Online" (solve conjoint simple, objectif max) peut être nettement pire qu'Incremental** —
+  même sur sa propre métrique (le flow time max du batch), pas seulement sur le nouveau job. Ex :
+  Phase B n=15, online=22731 vs incremental=12693 ; Phase C s4, online=22336 vs incremental=12468.
+  Le problème conjoint devient trop dur pour le budget de 30s dès que le batch grossit.
+- **Hybrid, avec son filet de sécurité (maintenant basé sur la métrique `max`), ne fait jamais
+  pire qu'Incremental** — mêmes garanties que pour l'objectif `new_job`, juste rebasées sur une
+  métrique différente.
+- 0 violation de stockage avec l'objectif `max` aussi, sur les 48 nouvelles vérifications."""))
 
 nb["cells"] = cells
 with open(OUT_PATH, "w") as f:
