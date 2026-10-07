@@ -48,6 +48,7 @@ from master_node_with_heterogeneous_nodes_csp import (
     SchedulingUsingCSPIncrementalFreeNodesOnly,
     SchedulingUsingCSPAdaptive,
     SchedulingUsingCSPAdaptiveJoint,
+    SchedulingUsingCSPOnlineNewJob,
 )
 from utils.plots import plot_gantt_chart
 from utils.run_export import start_recording
@@ -90,6 +91,11 @@ APPROACHES = {
     # just the new job if the joint solve finds no solution. See
     # SchedulingUsingCSPAdaptiveJoint's docstring for the full flow.
     "hybrid": SchedulingUsingCSPAdaptiveJoint,
+    # Live, continuous version of "online_newjob" (2026-10-07): for each arriving job, a SINGLE
+    # joint solve over it + every currently-running job, under objective_choice=2 (minimize ONLY
+    # the new job's own flow time) plus --adaptive-degradation-cap-pct -- no F1 probe, no
+    # escalation variants, no gate. See SchedulingUsingCSPOnlineNewJob's own docstring.
+    "online_newjob": SchedulingUsingCSPOnlineNewJob,
 }
 
 
@@ -169,6 +175,13 @@ def parse_args():
                               "already-running job's flow time, as a fraction ABOVE its own "
                               "pre-escalation committed flow time (e.g. 0.20 = may grow by at "
                               "most 20%%).")
+    parser.add_argument("--no-adaptive-bi-objective", action="store_true",
+                         help="hybrid only: the 'hybrid-n_j' design (2026-10-05) runs every "
+                              "escalation variant single-objective (phase 1 only, no transfer-"
+                              "energy phase 2) instead of the class default's bi-objective "
+                              "epsilon-constraint search. Pass this to match that design; omit "
+                              "it to keep the class default (bi-objective, "
+                              "adaptive_bi_objective=True).")
     parser.add_argument("--adaptive-gate-metric", choices=["new_job", "max", "mean"], default="new_job",
                          help="hybrid only: metric the post-escalation quality gate uses to decide "
                               "whether to keep the escalation or fall back to Incremental's own "
@@ -284,6 +297,7 @@ def run(args):
         master_class.adaptive_selection_metric = args.adaptive_selection_metric
         master_class.incremental_time_limit_s = args.hybrid_incremental_time_limit
         master_class.parallel_warm_cold_escalation = args.parallel_warm_cold_escalation
+        master_class.adaptive_bi_objective = not args.no_adaptive_bi_objective
 
     with open(args.config, "r", encoding="utf-8") as f:
         config = json.load(f)
@@ -302,6 +316,7 @@ def run(args):
     config["adaptive_degradation_cap_pct"] = args.adaptive_degradation_cap_pct
     config["adaptive_gate_metric"] = args.adaptive_gate_metric
     config["adaptive_selection_metric"] = args.adaptive_selection_metric
+    config["adaptive_bi_objective"] = not args.no_adaptive_bi_objective
     config["parallel_warm_cold_escalation"] = args.parallel_warm_cold_escalation
     config["charge_thinking_time"] = not args.no_charge_thinking_time
     config["incremental_time_limit_s"] = args.hybrid_incremental_time_limit

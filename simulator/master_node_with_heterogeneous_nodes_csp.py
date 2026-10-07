@@ -1932,6 +1932,53 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
                 break
 
 
+class SchedulingUsingCSPOnlineNewJob(SchedulingUsingCSPAdaptiveJoint):
+    """Live, continuous version of 'online_newjob' (previously only a one-shot test-harness
+    function, run_online_newjob_style in exps/xp_dataset_size_sweep.py): for each arriving job,
+    jointly reconsiders it together with every currently-running job under objective_choice=2
+    (minimize ONLY the new job's own flow time, see MainOnline.java's objectives[2]) plus a
+    per-running-job degradation cap (same mechanism/formula as hybrid-n_j's own escalation:
+    cap = that job's CURRENTLY COMMITTED flow time * (1 + adaptive_degradation_cap_pct)) -- a
+    SINGLE joint solve, no F1/Incremental probe, no escalation variants, no post-hoc gate.
+    Always commits whatever this one solve finds (or keeps retrying on no solution, same as
+    every other policy's own fallback-free branches)."""
+
+    def schedulingNewJob(self):
+        while True:
+            yield self.env.timeout(0.1)
+
+            if len(self.waiting_jobs) >= 1:
+                job = self.waiting_jobs[0]
+                running_jobs = self.getRunningJobs()
+                jobs_to_reschedule = [job] + running_jobs
+                nodes_free_time = self.nodesFreeTime(self.ongoing_transfers, self.ongoing_works)
+                replicas_locations = self.replicas_locations
+
+                cap_pct = self._config.get('adaptive_degradation_cap_pct')
+                if cap_pct is not None:
+                    committed = self._currentCommittedBatchFlowTimes(running_jobs)
+                    self.flow_time_caps = {jid: int(round(flow * (1 + cap_pct))) for jid, flow in committed.items()}
+
+                orig_java_main_class = self.java_main_class
+                try:
+                    self.java_main_class = 'MainOnline'
+                    self.objective_choice = 2
+                    transfers_, works_, deletions_ = yield from self._timedSchedulingUsingJavaCSP(
+                        jobs_to_reschedule, replicas_locations, nodes_free_time, self.env.now)
+                finally:
+                    self.java_main_class = orig_java_main_class
+
+                if len(transfers_.keys()) > 0 and len(works_.keys()) > 0:
+                    self._commitJointPlan(transfers_, works_, deletions_)
+                    self.waiting_jobs.pop(0)
+                else:
+                    logger.warning("[%s] Master: no CSP solution found for job %s (online-newjob), will retry",
+                                    self.env.now, job.job_id)
+
+            if self._allJobsCompleted():
+                break
+
+
 class SchedulingUsingCSPSemiOnline:
     
     """Master node handles job submissions."""
