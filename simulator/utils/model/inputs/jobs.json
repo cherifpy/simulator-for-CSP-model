@@ -1,9 +1,9 @@
 [
     {
         "job_id":10,
-        "dataset_size":36647,
-        "nb_tasks":4,
-        "task_duration":140,
+        "dataset_size":698804,
+        "nb_tasks":18,
+        "task_duration":1168,
         "timelasped":1,
         "job_arriving_time":0
     }
