@@ -234,11 +234,13 @@ def generateHeterogeneousInfrastructure(config, node_homogeneous = True):
 def save_results_to_csv(logger, results, file_name, exp_name, prefex=""):
     logger.info("total wall time: %s", str(results.total_wall_time))
     logger.info("total transferred bytes: %s", str(results.total_nb_transferred_bytes))
+    logger.info("total transfer energy consumed: %s", str(results.total_energy_consumed))
     mean_job_processing_time = get_jobs_mean_processing_time(results)
     logger.info("mean job processing time (end_time - submission_time): %s", str(mean_job_processing_time))
     df = pd.DataFrame(results.stats_on_tasks).to_csv(f"{file_name}/{exp_name}/infos_on_tasks{prefex}.csv")
     df = pd.DataFrame(results.stats_on_jobs).to_csv(f"{file_name}/{exp_name}/infos_on_jobs{prefex}.csv")
     df = pd.DataFrame(results.stats_on_replicas).to_csv(f"{file_name}/{exp_name}/infos_on_replicas{prefex}.csv")
+    df = pd.DataFrame(results.stats_on_transfers_energy).to_csv(f"{file_name}/{exp_name}/infos_on_transfers_energy{prefex}.csv")
     if len(results.threshold_history) > 0: df = pd.DataFrame(results.threshold_history).to_csv(f"{file_name}/{exp_name}/threshold_history{prefex}.csv")
 
 # Example on how to extract basic statistics about simulation results

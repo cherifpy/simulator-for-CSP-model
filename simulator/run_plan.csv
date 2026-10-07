@@ -1,0 +1,2 @@
+label,approach,instance_name,nb_jobs,nb_nodes,lambda_rate,solver_time_limit,adaptive_max_budget,adaptive_alpha,adaptive_f1_relative_margin,adaptive_gate_metric,hybrid_incremental_time_limit,parallel_warm_cold_escalation,freeze_jobs_with_ongoing_transfer,no_charge_thinking_time,epsilon_fraction,epsilon_phase1_fraction,seed,walltime,results_subdir
+F relativemargin25,hybrid,inst-10J-20N-small,10,20,200,300,600,0.5,0.25,max,30,TRUE,TRUE,TRUE,0.1,0.833333333333,42,01:30:00,param_study_small_F_relativemargin25

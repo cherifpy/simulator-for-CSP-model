@@ -31,6 +31,9 @@
     "max_theta_user_preferences": 1,
     "adapting_theta": false,
 
-    "use_minizinc_model": false
-    
+    "use_minizinc_model": false,
+
+    "master_energy_consumption": 1.0,
+    "network_energy_per_transfer": 0.5
+
 }

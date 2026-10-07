@@ -1,0 +1,73 @@
+{
+  "n_existing": 5,
+  "new_job_index": 5,
+  "nb_nodes": 50,
+  "instance_dir": "/home/csimohammed/simulator-for-CSP-model/simulator/workloads/workloads-100-for_storage_constraintes/inst-50J-50N",
+  "solver_time_limit_s": 7200,
+  "incremental_time_limit_s": 600,
+  "state_a_time_limit_s": 60,
+  "repeats": 1,
+  "tiers": [
+    {
+      "tier": "medium",
+      "range": [
+        15360,
+        40960
+      ],
+      "trials": [
+        {
+          "repeat": 0,
+          "dataset_size": 29565,
+          "n_jobs_isolated": 6,
+          "online": {
+            "wait_time_new_job": 1357.0,
+            "flow_time_new_job": 1521.0,
+            "mean_flow_time_all": 1436.4428543238052,
+            "max_flow_time_all": 1603.2765681606675,
+            "mean_flow_time_isolated": 1436.4428543238052,
+            "max_flow_time_isolated": 1603.2765681606675,
+            "n_jobs_isolated": 6,
+            "jobs_to_reschedule": [
+              5,
+              0,
+              1,
+              2,
+              3,
+              4
+            ],
+            "transfer_energy_total": 3946.5012121749733
+          },
+          "incremental": {
+            "wait_time_new_job": 492.99999999999994,
+            "flow_time_new_job": 1593.0,
+            "mean_flow_time_all": 1466.9124328513637,
+            "max_flow_time_all": 1649.040062393738,
+            "mean_flow_time_isolated": 1466.9124328513637,
+            "max_flow_time_isolated": 1649.040062393738,
+            "n_jobs_isolated": 6,
+            "jobs_to_reschedule": [
+              5
+            ],
+            "transfer_energy_total": 666.9999103290352
+          }
+        }
+      ]
+    }
+  ],
+  "aggregates": [
+    {
+      "tier": "medium",
+      "range": [
+        15360,
+        40960
+      ],
+      "n": 1,
+      "online_mean": 1436.4428543238052,
+      "online_std": 0.0,
+      "incremental_mean": 1466.9124328513637,
+      "incremental_std": 0.0,
+      "cost": -30.469578527558497,
+      "cost_pct": -2.0771232041664653
+    }
+  ]
+}

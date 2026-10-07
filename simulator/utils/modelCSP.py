@@ -1,5 +1,8 @@
 import re
 import os
+import csv
+import threading
+import contextlib
 from pychoco import *
 import pandas as pd
 import random as rnd
@@ -14,6 +17,37 @@ UTILS_DIR = os.path.dirname(os.path.abspath(__file__))
 SIMULATOR_DIR = os.path.dirname(UTILS_DIR)
 MODEL_DIR = os.path.join(UTILS_DIR, "model")
 MINIZINC_DIR = os.path.join(UTILS_DIR, "minizincModel")
+
+# Per-THREAD override of SIMULATOR_RUN_CWD (the env var normally used to isolate concurrent
+# solves -- see _schedulingUsingJavaCSP_impl's own comment), for when isolation is needed BETWEEN
+# THREADS of the SAME process rather than between separate process invocations. os.environ is
+# process-wide, so two threads can't each set it without racing each other; this thread-local
+# takes precedence over the env var when set, letting each thread point at its own private
+# utils/model/{inputs,outputs,bin} tree. Used by SchedulingUsingCSPAdaptiveJoint's parallel
+# warm-vs-cold escalation search (master_node_with_heterogeneous_nodes_csp.py).
+_run_cwd_local = threading.local()
+
+
+@contextlib.contextmanager
+def run_cwd_override(path):
+    """Context manager: within this THREAD only, _schedulingUsingJavaCSP_impl resolves its
+    model_dir from `path` instead of the SIMULATOR_RUN_CWD env var (or the global default)."""
+    previous = getattr(_run_cwd_local, "run_cwd", None)
+    _run_cwd_local.run_cwd = path
+    try:
+        yield
+    finally:
+        if previous is None:
+            del _run_cwd_local.run_cwd
+        else:
+            _run_cwd_local.run_cwd = previous
+
+
+def get_run_cwd_override():
+    """This thread's run_cwd_override value, or None if unset -- used by both
+    _schedulingUsingJavaCSP_impl (below) and utils.run_export.solver_model_dir() so every path
+    that needs to agree on "where is this solve's utils/model" resolves it the same way."""
+    return getattr(_run_cwd_local, "run_cwd", None)
 
 CPU_UNIT = 1  # defines one unit of work per second
 #rnd.seed(42)
@@ -240,17 +274,84 @@ def evaluateUtility(master_node, jobs,transfers:dict, works:dict):
 
 
 def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, nodes_free_time: list, scheduling_start_time=None):
+    """Single entry point to the Java CSP model. Behaves exactly like _schedulingUsingJavaCSP_impl
+    (below) unless a run recording is active (utils.run_export.start_recording sets
+    SOLVER_ARCHIVE_DIR), in which case every solve is also archived -- decisions, solver log, raw
+    Java input/output files -- so any statistic can be computed later without re-running."""
+    archive_dir = os.environ.get("SOLVER_ARCHIVE_DIR")
+    if not archive_dir:
+        return _schedulingUsingJavaCSP_impl(master_node, jobs, replicas_locations, nodes_free_time, scheduling_start_time)
+    from utils.run_export import archive_solve
+    return archive_solve(_schedulingUsingJavaCSP_impl, master_node, jobs, replicas_locations, nodes_free_time,
+                         scheduling_start_time, archive_dir)
+
+
+def log_phase1_vs_final_flow_times(env_now, jobs, phase1_works, final_works, model_dir):
+    """Diagnostic-only, never read back by the solver: for every job in this solve's batch, its
+    own flow time under phase 1 ALONE (epsilon-constraint's minimize-max-flow-time-only phase, see
+    MainOnlineMultiObj*.java's phase1_works.csv export) vs the FINAL result (phase 2's energy-
+    minimized plan, or phase 1's own if phase 2 found nothing) -- appended (one row per job per
+    qualifying solve) to phase1_vs_final_flow_times.csv under this solve's own outputs/ dir, so a
+    later analysis can see exactly how much energy-driven consolidation costs each INDIVIDUAL job,
+    not just the batch-wide max flow time the epsilon cap already bounds (that cap only protects
+    the single worst job in the batch -- see the hybrid-vs-online_biobj investigation this was
+    added for)."""
+    def finish_time(works_dict, job_id):
+        end = None
+        for entries in works_dict.values():
+            for e_job_id, e_node, e_task_id, e_start, e_end, e_dur in entries:
+                if e_job_id == job_id:
+                    end = e_end if end is None else max(end, e_end)
+        return end
+
+    arriving_time_by_id = {j.job_id: j.arriving_time for j in jobs}
+    log_path = os.path.join(model_dir, "outputs", "phase1_vs_final_flow_times.csv")
+    is_new = not os.path.exists(log_path)
+    with open(log_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        if is_new:
+            writer.writerow(["sim_time", "job_id", "arriving_time", "phase1_flow_time", "final_flow_time", "degradation"])
+        for job_id, arriving_time in arriving_time_by_id.items():
+            p1_end = finish_time(phase1_works, job_id)
+            fin_end = finish_time(final_works, job_id)
+            if p1_end is None or fin_end is None:
+                continue
+            p1_flow = p1_end - arriving_time
+            fin_flow = fin_end - arriving_time
+            writer.writerow([env_now, job_id, arriving_time, round(p1_flow, 3), round(fin_flow, 3), round(fin_flow - p1_flow, 3)])
+
+
+def _schedulingUsingJavaCSP_impl(master_node, jobs: list, replicas_locations: dict, nodes_free_time: list, scheduling_start_time=None):
     """
     Wrapper to call the Java CSP solver via command line.
     """
     import json
 
+    # All exchange files (utils/model/inputs/*, outputs/*) and the compiled .class output
+    # (utils/model/bin) live at fixed paths under SIMULATOR_DIR by default -- fine for one
+    # solve at a time, but TWO solves running concurrently on the SAME machine (e.g. two
+    # separate n_existing scenarios launched in parallel) clobber each other's inputs mid-solve
+    # and read back garbage or crash outright. Setting SIMULATOR_RUN_CWD in the environment
+    # (e.g. from a launcher script that gave each concurrent run its own private copy of
+    # utils/model/{inputs,outputs,bin}, with lib/src symlinked back to the canonical copy since
+    # those are read-only) redirects both Python's own reads/writes AND Java's (which resolves
+    # its paths from its own cwd, i.e. this same directory) to that private location instead.
+    # Unset (the default): behavior is byte-identical to before this existed. A per-thread
+    # override (run_cwd_override above) takes precedence over the env var for isolating
+    # concurrent solves WITHIN the same process (env vars are process-wide, not thread-local).
+    run_cwd = get_run_cwd_override() or os.environ.get("SIMULATOR_RUN_CWD", SIMULATOR_DIR)
+    model_dir = os.path.join(run_cwd, "utils", "model") if run_cwd != SIMULATOR_DIR else MODEL_DIR
+
     matrix = []
-    print(jobs)
-    print("replicas_locations:", replicas_locations)
-    print('jobs:', jobs)
-    print("replicas_locations keys:", replicas_locations)
     jobs = sorted(jobs, key=lambda x: x.job_id)
+    print(f"\n### schedulingUsingJavaCSP: {len(jobs)} job(s) to (re)schedule ###")
+    print(f"{'job_id':>8}{'nb_tasks':>10}{'task_duration':>15}{'dataset_size':>14}{'arriving_time':>15}")
+    for job in jobs:
+        task_duration = job.tasks[0].duration if job.tasks else None
+        print(f"{job.job_id:>8}{job.nb_tasks:>10}{task_duration!s:>15}{job.dataset_size:>14}{job.arriving_time:>15.2f}")
+    print("replicas_locations:")
+    for job_id, nodes in sorted(replicas_locations.items()):
+        print(f"  job {job_id}: nodes {nodes}")
     # A transfer that has started but not yet completed doesn't appear in replicas_locations
     # yet (that's only updated on completion), so without this a job's data mid-flight to a
     # node looks like a brand-new, freely re-plannable candidate to the CSP -- letting a later
@@ -270,7 +371,7 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
                 resident_nodes.append(node_id)
         matrix.append(resident_nodes)
     print("matrix:", matrix)
-    with open(os.path.join(MODEL_DIR, "inputs", "replicas_locations.json"), "w") as f:
+    with open(os.path.join(model_dir, "inputs", "replicas_locations.json"), "w") as f:
         json.dump(matrix, f)
 
     # Optional hard node filter: only written when the caller opts in (restrict_to_free_nodes),
@@ -284,7 +385,7 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     # on one node can occupy it, as far as this filter is concerned, for the job's entire
     # remaining lifetime, so the pool of "free" nodes could shrink toward zero and never recover
     # under sustained load, starving whichever job is waiting.
-    free_nodes_path = os.path.join(MODEL_DIR, "inputs", "free_nodes.txt")
+    free_nodes_path = os.path.join(model_dir, "inputs", "free_nodes.txt")
     if getattr(master_node, 'restrict_to_free_nodes', False):
         free_node_ids = []
         for node_id in range(len(master_node.compute_nodes)):
@@ -302,32 +403,236 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
         with open(free_nodes_path, "w") as f:
             f.write("")
 
+    # Java only ever receives a job's NotStarted tasks, and numbers them 0..nb_tasks-1 in its own
+    # output (works.csv's task_index) -- a LOCAL renumbering with no relation to that task's TRUE
+    # index in job.tasks (e.g. a job with tasks 0-1 already Finished/Started and 2-5 NotStarted
+    # gets nb_tasks=4, and Java's task_index 0 means job.tasks[2], not job.tasks[0]). Recorded here,
+    # in the same NotStarted order Java receives them, so toDict() can translate its output back to
+    # the job's real task_id -- without this, a not-finished job's freshly-decided tasks can
+    # collide (by raw index) with its own already-committed Finished/Started tasks and silently
+    # evict them when a caller later merges the two (e.g. xp_dataset_size_sweep.py's merge_plans).
+    task_id_by_job = {}
     jobs_data = []
     for job in jobs:
-        if len([task.duration for task in job.tasks if task.status == "NotStarted"])> 0:
+        not_started_ids = [t.task_id for t in job.tasks if t.status == "NotStarted"]
+        if len(not_started_ids) > 0:
+            task_id_by_job[job.job_id] = not_started_ids
             jobs_data.append({
                 "job_id": job.job_id,
                 "dataset_size": job.dataset_size,
                 "nb_tasks": len([task.duration for task in job.tasks if task.status == "NotStarted"]),
                 "task_duration": job.tasks[0].duration ,
                 "timelasped": int(master_node.env.now - job.arriving_time)+1,
-                "job_arriving_time": job.arriving_time,
+                # LOCAL-frame lower bound on this job's first transfer start (0 = "now" for this
+                # solve, same frame as every "start"/"end" the solver outputs). Always 0 for any
+                # job that's genuinely already arrived (job.arriving_time <= env.now, the normal
+                # live-replanning case) -- only nonzero when a batch jointly solves jobs with
+                # staggered real arrival times relative to this solve's own env.now (e.g. state
+                # A's one-shot joint solve at env.now=0 over jobs that "arrive" at different real
+                # times), where it's exactly job.arriving_time itself. Without this, nothing in
+                # the CSP stops a job's data transfer from starting before the job has arrived.
+                "job_arriving_time": max(0, job.arriving_time - master_node.env.now),
             })
     jobs_data = sorted(jobs_data, key=lambda x: x['job_id'])
-    
 
-    pd.DataFrame(jobs_data).to_json(os.path.join(MODEL_DIR, "inputs", "jobs.json"), orient="records", indent=4)
+
+    pd.DataFrame(jobs_data).to_json(os.path.join(model_dir, "inputs", "jobs.json"), orient="records", indent=4)
+
+    # Jobs too costly to move, left fully untouched by this solve (see frozen_jobs.txt in
+    # MainOnline.java/MainOnlineMultiObj.java: no new replica, no move, existing replica(s) kept
+    # exactly as-is). A job gets frozen if ANY opt-in criterion below is configured and satisfied:
+    #   - freeze_large_jobs_threshold_mb: already fully resident somewhere, dataset_size at or
+    #     above this threshold -- too costly (network-wise) to move.
+    #   - freeze_remaining_time_threshold: already fully resident somewhere, its own remaining
+    #     NotStarted work (nb_tasks * task_duration, i.e. ignoring node speed since that's not
+    #     decided until placement) at or below this threshold -- close enough to finishing that
+    #     reconsidering it has almost nothing left to gain.
+    #   - freeze_jobs_with_ongoing_transfer (bool): has at least one transfer currently IN FLIGHT
+    #     (master_node.ongoing_transfers) -- always on when true, no threshold to tune. An
+    #     in-flight transfer can never be cancelled (see startTransfer/the "never touch already-
+    #     started work" invariant), so a later replan "reconsidering" this job away from that
+    #     node can't actually stop it either: the transfer lands regardless, but nothing then
+    #     schedules its deletion once the plan has moved on -- a real, observed leak (confirmed
+    #     via events_history.json: a job's data landing on a node no task of it ever used, kept
+    #     forever). Freezing it here means the solver doesn't bother "changing its mind" mid-
+    #     transfer in the first place. Unlike the other two, this doesn't require prior COMPLETED
+    #     residency -- replicas_location[i] on the Java side already folds in in-flight nodes
+    #     (see the ongoing_nodes_by_job fold above), so validNodes correctly includes the pending
+    #     node once frozen.
+    # All unset (the default): no job is frozen, identical to behavior before any of this existed.
+    # Local indices here match jobs_data's own order, the same indexing data_sizes/nb_data use on
+    # the Java side.
+    freeze_threshold = master_node._config.get('freeze_large_jobs_threshold_mb')
+    freeze_remaining_time_threshold = master_node._config.get('freeze_remaining_time_threshold')
+    freeze_ongoing_transfer = master_node._config.get('freeze_jobs_with_ongoing_transfer', False)
+    ongoing_transfer_job_ids = {
+        ongoing[0] for ongoing in master_node.ongoing_transfers.values() if ongoing is not None
+    }
+    # Explicit override: bypasses every threshold-based criterion above entirely and freezes
+    # EXACTLY these job_ids (e.g. a median-based split computed by the caller itself -- see
+    # SchedulingUsingCSPAdaptiveJoint._timedParallelEscalation). None (the default): fall back to
+    # the threshold-based criteria; [] (empty list, distinct from None): explicitly freeze
+    # nothing, also bypassing the thresholds -- lets a caller force "no freeze at all" even if
+    # freeze_large_jobs_threshold_mb/etc. happen to be set in the same config.
+    frozen_job_ids_override = master_node._config.get('frozen_job_ids_override')
+    frozen_indices = []
+    if frozen_job_ids_override is not None:
+        frozen_job_ids_set = set(frozen_job_ids_override)
+        frozen_indices = [idx for idx, jd in enumerate(jobs_data) if jd['job_id'] in frozen_job_ids_set]
+    elif freeze_threshold is not None or freeze_remaining_time_threshold is not None or freeze_ongoing_transfer:
+        for idx, jd in enumerate(jobs_data):
+            has_ongoing_transfer = freeze_ongoing_transfer and jd['job_id'] in ongoing_transfer_job_ids
+            already_resident = bool(replicas_locations.get(jd['job_id']))
+            large_enough = already_resident and freeze_threshold is not None and jd['dataset_size'] >= freeze_threshold
+            almost_done = (already_resident and freeze_remaining_time_threshold is not None
+                           and jd['nb_tasks'] * jd['task_duration'] <= freeze_remaining_time_threshold)
+            if large_enough or almost_done or has_ongoing_transfer:
+                frozen_indices.append(idx)
+    with open(os.path.join(model_dir, "inputs", "frozen_jobs.txt"), "w") as f:
+        f.write(",".join(str(i) for i in frozen_indices))
+
+    # Opt-in (see MainOnlineMultiObjWarmStart.java's own comment on freezeBlocksNodeUntilDone):
+    # when on, a frozen job's resident node(s) are reserved for it until its own last task ends,
+    # instead of leaving its task timing free to be pushed later to accommodate other jobs
+    # sharing that node (the collateral-damage mechanism confirmed responsible for freeze's own
+    # quality regression). Unset (the default): off, identical to before this existed.
+    freeze_blocks_node_until_done = master_node._config.get('freeze_blocks_node_until_done', False)
+    with open(os.path.join(model_dir, "inputs", "freeze_blocks_node_until_done.txt"), "w") as f:
+        f.write("1" if freeze_blocks_node_until_done else "0")
+
+    # Opt-in (2026-10-06): re-enables the pre-existing greedy hints() helper in
+    # MainOnline(MultiObj)(WarmStart).java -- biggest-data-first / fastest-node-first
+    # solver.addHint() nudges -- which was left disabled project-wide (see each file's own "TEMP:
+    # hints disabled" comment) after an earlier, never-conclusively-resolved regression
+    # investigation. Unset (the default): hints() stays uncalled, identical to before this
+    # existed.
+    greedy_size_hints = master_node._config.get('greedy_size_hints', False)
+    with open(os.path.join(model_dir, "inputs", "greedy_size_hints.txt"), "w") as f:
+        f.write("1" if greedy_size_hints else "0")
+
+    # Opt-in (2026-10-06): lets MainOnline.java/MainOnlineMultiObj.java (the COLD, non-warm-start
+    # classes) read warm_start.json and apply its entries as lightweight solver.addHint() nudges
+    # instead of leaving the search to start from scratch -- a softer alternative to
+    # MainOnlineWarmStart's full IntDomainLast-seeded value selector (a hint can be ignored by
+    # the search the moment it looks unprofitable; IntDomainLast keeps retrying the warm-started
+    # value first on every single decision for that variable). Caller is responsible for having
+    # written warm_start.json itself (e.g. via _writeWarmStart) before this solve runs. Unset
+    # (the default): warm_start.json is not read by the cold classes at all, identical to before
+    # this existed.
+    warmstart_as_hints = master_node._config.get('warmstart_as_hints', False)
+    with open(os.path.join(model_dir, "inputs", "warmstart_as_hints.txt"), "w") as f:
+        f.write("1" if warmstart_as_hints else "0")
+
+    # Opt-in (2026-10-06, MainIncremental.java only so far): switches the greedy value-selector's
+    # fixed node-try-order from cpus[]-ascending (compute_capacity, task-execution speed) to
+    # bandwidths[]-descending (transfer speed) -- see that file's own comment on sort_by_bandwidth.
+    # Unset (the default): cpus-based ranking, identical to before this existed.
+    sort_by_bandwidth = master_node._config.get('sort_by_bandwidth', False)
+    with open(os.path.join(model_dir, "inputs", "sort_by_bandwidth.txt"), "w") as f:
+        f.write("1" if sort_by_bandwidth else "0")
+
+    # Opt-in (2026-10-06, MainIncremental.java only so far): skips setLNS entirely, plain tree
+    # search instead -- see that file's own comment on disable_lns. Unset (the default): LNS
+    # stays on, identical to before this existed.
+    disable_lns = master_node._config.get('disable_lns', False)
+    with open(os.path.join(model_dir, "inputs", "disable_lns.txt"), "w") as f:
+        f.write("1" if disable_lns else "0")
+
+    # Nodes excluded from NEW placements entirely, for every job including a brand-new arrival
+    # (unlike frozen_jobs.txt/powerful_nodes.txt, which only ever restrict specific JOBS) -- see
+    # MainOnline.java/MainOnlineMultiObj.java's own comment on excludedNodes. Opt-in via
+    # master_node._config['excluded_node_ids'] (a list of node indices, computed by the caller --
+    # e.g. _timedParallelEscalation's avoid_empty_slow_nodes variant). Unset (the default): no
+    # file written with content, no node excluded, identical to before this existed.
+    excluded_node_ids = master_node._config.get('excluded_node_ids', [])
+    with open(os.path.join(model_dir, "inputs", "excluded_nodes.txt"), "w") as f:
+        f.write(",".join(str(n) for n in excluded_node_ids))
+
+    # Per-job solver.addHint() target node (local job index -> node index), e.g. pairing the
+    # worst-estimated-flow-time job with the fastest node -- see
+    # _timedParallelEscalation's hint_slow_to_fast variant for how this dict is built. Opt-in via
+    # master_node._config['job_node_hints'] ({job_id: node_id}); unset/empty (the default): no
+    # file written with content, no hint applied, identical to before this existed.
+    job_node_hints = master_node._config.get('job_node_hints', {})
+    job_node_hint_pairs = [f"{idx}:{job_node_hints[jd['job_id']]}"
+                           for idx, jd in enumerate(jobs_data) if jd['job_id'] in job_node_hints]
+    with open(os.path.join(model_dir, "inputs", "job_node_hints.txt"), "w") as f:
+        f.write(",".join(job_node_hint_pairs))
+
+    # Confines already-running jobs' reconsideration to a "powerful" subset of nodes (by
+    # bandwidth/compute_capacity -- NOTE compute_capacity is a DURATION MULTIPLIER, so lower is
+    # actually faster/more powerful, hence the division rather than a product) so a full replan
+    # touches less of the infra and solves faster -- without ever blocking a brand-new arrival,
+    # which must stay free to land anywhere: only jobs NOT in master_node.waiting_jobs are
+    # restricted. Opt-in via master_node._config['reschedule_top_fraction'] (0-1); unset (the
+    # default): no node list written, no job restricted, identical to before this existed.
+    # Java falls back to the full storage-eligible node set per-job if intersecting with the
+    # powerful subset would otherwise leave that job with nowhere feasible to go -- this is a
+    # speed heuristic, never allowed to manufacture a "no solution" that isn't real.
+    reschedule_top_fraction = master_node._config.get('reschedule_top_fraction')
+    powerful_node_ids = []
+    if reschedule_top_fraction is not None:
+        scored = sorted(
+            range(len(master_node.compute_nodes)),
+            key=lambda n: master_node.compute_nodes[n].bandwidth / master_node.compute_nodes[n].compute_capacity,
+            reverse=True,
+        )
+        k = max(1, int(round(reschedule_top_fraction * len(scored))))
+        powerful_node_ids = scored[:k]
+    with open(os.path.join(model_dir, "inputs", "powerful_nodes.txt"), "w") as f:
+        f.write(",".join(str(n) for n in powerful_node_ids))
+
+    waiting_job_ids = {j.job_id for j in getattr(master_node, 'waiting_jobs', [])}
+    power_restricted_indices = []
+    if reschedule_top_fraction is not None:
+        for idx, jd in enumerate(jobs_data):
+            if jd['job_id'] not in waiting_job_ids:
+                power_restricted_indices.append(idx)
+    with open(os.path.join(model_dir, "inputs", "power_restricted_jobs.txt"), "w") as f:
+        f.write(",".join(str(i) for i in power_restricted_indices))
 
     # Per-scheduler-class solver time budget (e.g. Online vs Incremental can be compared at
     # different budgets); Main.java falls back to 120s if this file is missing/unreadable.
     solver_time_limit_s = master_node._config.get('solver_time_limit_s', 120)
-    with open(os.path.join(MODEL_DIR, "inputs", "solver_time_limit.txt"), "w") as f:
+    with open(os.path.join(model_dir, "inputs", "solver_time_limit.txt"), "w") as f:
         f.write(str(int(solver_time_limit_s)))
+
+    # Optional: which objectives[] entry MainOnline/MainOnlineWarmStart should actually optimize
+    # (0=sum flow time, 1=max flow time, 2=one specific job's own flow time -- see those files'
+    # own comments). Only written when a caller explicitly opts in via master_node.objective_choice
+    # (e.g. xp_online_warmstart_test.py); absent otherwise, so every existing caller keeps its
+    # current default untouched (MainOnline.java: 1: MainOnlineWarmStart.java: 0).
+    objective_choice = getattr(master_node, 'objective_choice', None)
+    objective_choice_path = os.path.join(model_dir, "inputs", "objective_choice.txt")
+    if objective_choice is not None:
+        with open(objective_choice_path, "w") as f:
+            f.write(str(int(objective_choice)))
+    else:
+        with open(objective_choice_path, "w") as f:
+            f.write("")
+
+    # Optional: per-job upper bound on this solve's own flow_time variable (objectives[]'s own
+    # all_flow_time[i], one entry per jobs_data row in the SAME sorted-by-job_id order as
+    # power_restricted_jobs.txt's indices above) -- lets a caller ask "minimize the new job's
+    # flow time (objective_choice=2) but never let any OTHER job's flow time exceed X" (the
+    # "hybrid-n_j" design, 2026-10-05: escalate purely for the new arrival, with a hard cap --
+    # e.g. 1.2x its own pre-escalation committed flow time -- on every already-running job, so a
+    # narrow objective can't buy the new job a win by silently wrecking an existing one). Only
+    # written when a caller opts in via master_node.flow_time_caps (dict job_id -> cap, any job
+    # absent from the dict gets no cap); absent otherwise, so every existing caller is unaffected.
+    flow_time_caps = getattr(master_node, 'flow_time_caps', None)
+    flow_time_caps_path = os.path.join(model_dir, "inputs", "flow_time_caps.txt")
+    with open(flow_time_caps_path, "w") as f:
+        if flow_time_caps:
+            f.write(",".join(str(int(flow_time_caps[jd['job_id']])) if jd['job_id'] in flow_time_caps else "-1"
+                              for jd in jobs_data))
+        else:
+            f.write("")
 
     # Java only ever works in a LOCAL frame (0 = "now" for this solve) -- it has no idea what
     # the simulator's absolute clock reads. Pass it along purely so debug prints can show
     # absolute times directly comparable to the final solution's "start:"/"end:" values.
-    with open(os.path.join(MODEL_DIR, "inputs", "current_sim_time.txt"), "w") as f:
+    with open(os.path.join(model_dir, "inputs", "current_sim_time.txt"), "w") as f:
         f.write(str(master_node.env.now))
 
     # Ghost storage: jobs NOT part of this solve's batch (e.g. a job that already had every
@@ -349,7 +654,7 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
                     deletion_time = max(0, int(pending_time - master_node.env.now))
                     break
             ghost_lines.append(f"{node_id},{int(size)},{deletion_time}")
-    with open(os.path.join(MODEL_DIR, "inputs", "ghost_storage.txt"), "w") as f:
+    with open(os.path.join(model_dir, "inputs", "ghost_storage.txt"), "w") as f:
         f.write("\n".join(ghost_lines))
 
     nodes_list = []
@@ -361,9 +666,49 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
             "compute_capacity": node.compute_capacity,
             "free_time": nodes_free_time[node_id],
             # JSON/Java have no "infinity": cap at a value the CSP treats as effectively unlimited.
-            "storage_capacity": int(storage_capacity) if storage_capacity != float('inf') else 2**30
+            "storage_capacity": int(storage_capacity) if storage_capacity != float('inf') else 2**30,
+            # Only consumed by MainOnlineMultiObj.java (energy as a genuine second objective,
+            # not just a post-hoc Python-side computation) -- harmless additive field for every
+            # other Java entry point, which never reads it.
+            "energy_consumption": getattr(node, 'energy_consumption', 0.0),
         })
-    pd.DataFrame(nodes_list).to_json(os.path.join(MODEL_DIR, "inputs", "nodes.json"), orient="records", indent=4)
+    pd.DataFrame(nodes_list).to_json(os.path.join(model_dir, "inputs", "nodes.json"), orient="records", indent=4)
+
+    # Only consumed by MainOnlineMultiObj.java, to price each candidate transfer's energy
+    # exactly the way Tracker.log_transfer / compute_transfer_energy already do on the Python
+    # side. Written unconditionally (cheap) so it's always in sync with config.json; every other
+    # Java entry point never reads this file.
+    with open(os.path.join(model_dir, "inputs", "energy_config.txt"), "w") as f:
+        f.write(f"{master_node._config.get('master_energy_consumption', 0.0)}\n")
+        f.write(f"{master_node._config.get('network_energy_per_transfer', 0.0)}\n")
+
+    # Optional: opt into MainOnlineMultiObj.java's multi-objective modes instead of a plain
+    # single-objective findOptimalSolution. master_node.multi_objective: 1 (or True) = raw
+    # Pareto-front search over {max flow time, energy} (found to perform far worse than
+    # single-objective within the same budget on real scenarios -- kept for reference/further
+    # investigation, not recommended); 2 = epsilon-constraint (recommended): phase 1 minimizes
+    # max flow time via the SAME well-tuned single-objective search, phase 2 then minimizes
+    # energy subject to max flow time staying within master_node.epsilon_fraction (default 10%,
+    # see MainOnlineMultiObj.java) of phase 1's result. Absent/falsy -> ordinary single-objective
+    # search, every existing caller unaffected.
+    multi_objective = getattr(master_node, 'multi_objective', None)
+    with open(os.path.join(model_dir, "inputs", "multi_objective.txt"), "w") as f:
+        f.write(str(int(multi_objective)) if multi_objective else "")
+
+    epsilon_fraction = getattr(master_node, 'epsilon_fraction', None)
+    with open(os.path.join(model_dir, "inputs", "epsilon_fraction.txt"), "w") as f:
+        f.write(str(epsilon_fraction) if epsilon_fraction is not None else "")
+
+    epsilon_phase1_fraction = getattr(master_node, 'epsilon_phase1_fraction', None)
+    with open(os.path.join(model_dir, "inputs", "epsilon_phase1_fraction.txt"), "w") as f:
+        f.write(str(epsilon_phase1_fraction) if epsilon_phase1_fraction is not None else "")
+
+    # Optional absolute ceiling on phase 2's cap (e.g. a baseline approach's own max flow time
+    # from a prior run) -- never let epsilon_fraction's relative slack push phase 2 to accept
+    # worse flow time than that baseline already achieves for free. Absent -> no ceiling.
+    epsilon_max_cap = getattr(master_node, 'epsilon_max_cap', None)
+    with open(os.path.join(model_dir, "inputs", "epsilon_max_cap.txt"), "w") as f:
+        f.write(str(epsilon_max_cap) if epsilon_max_cap is not None else "")
 
     import subprocess
 
@@ -381,21 +726,22 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
         [
             "javac",
             "-cp",
-            os.path.join(MODEL_DIR, "lib", "*"),
+            os.path.join(model_dir, "lib", "*"),
             "-d",
-            os.path.join(MODEL_DIR, "bin"),
-            os.path.join(MODEL_DIR, "src", "main", f"{java_main_class}.java")
+            os.path.join(model_dir, "bin"),
+            os.path.join(model_dir, "src", "main", f"{java_main_class}.java")
         ],
         capture_output=True,
         text=True,
         # The Java side resolves its input/output file paths relative to its own working
         # directory (System.getProperty("user.dir")), on the assumption that it's launched
-        # with SIMULATOR_DIR as cwd. That's only true by accident when a human runs `cd
-        # simulator && python3 ...` -- e.g. under `oarsub "python3 ~/.../launcher.py ..."` the
-        # process inherits oarsub's own cwd (the submitter's home dir) instead, and Java then
-        # looks for jobs.json etc. under the wrong directory entirely. Pin it explicitly so it
-        # doesn't depend on how/where the caller happened to be when this got invoked.
-        cwd=SIMULATOR_DIR,
+        # with run_cwd (SIMULATOR_DIR unless SIMULATOR_RUN_CWD overrides it) as cwd. That's
+        # only true by accident when a human runs `cd simulator && python3 ...` -- e.g. under
+        # `oarsub "python3 ~/.../launcher.py ..."` the process inherits oarsub's own cwd (the
+        # submitter's home dir) instead, and Java then looks for jobs.json etc. under the wrong
+        # directory entirely. Pin it explicitly so it doesn't depend on how/where the caller
+        # happened to be when this got invoked.
+        cwd=run_cwd,
     )
     print("Compilation Error")
     print(str(result.stderr))
@@ -417,12 +763,12 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
             "-XX:+UnlockExperimentalVMOptions",
             "-XX:-UseJVMCICompiler",
             "-cp",
-            os.path.join(MODEL_DIR, "bin") + ":" + os.path.join(MODEL_DIR, "lib", "*"),
+            os.path.join(model_dir, "bin") + ":" + os.path.join(model_dir, "lib", "*"),
             f"main.{java_main_class}"
         ],
         capture_output=True,
         text=True,
-        cwd=SIMULATOR_DIR,  # see the javac call above -- Java resolves paths relative to this.
+        cwd=run_cwd,  # see the javac call above -- Java resolves paths relative to this.
     )
 
     print("results")
@@ -443,14 +789,31 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     transfers = {}
     works = {}
 
-    model_output_path = os.path.join(MODEL_DIR, "outputs")
+    model_output_path = os.path.join(model_dir, "outputs")
 
     #df_transfers = pd.read_csv(f"{model_output_path}/transfers.csv")
     #df_works = pd.read_csv(f"{model_output_path}/works.csv")
     job_ids = [job['job_id'] for job in jobs_data]
-    works = toDict(f"{model_output_path}/works.csv", job_list=job_ids, master_node=master_node )
+    # Parallel to job_ids: task_id_maps[job_index][local_task_index] -> that job's TRUE task_id
+    # (see the note where task_id_by_job is built above).
+    task_id_maps = [task_id_by_job[jid] for jid in job_ids]
+    works = toDict(f"{model_output_path}/works.csv", job_list=job_ids, master_node=master_node, task_id_maps=task_id_maps)
     transfers = toDict(f"{model_output_path}/transfers.csv", job_list=job_ids, master_node=master_node)
     deletions = loadDeletions(f"{model_output_path}/deletions.csv", job_list=job_ids, master_node=master_node)
+
+    # Diagnostic-only: only these two classes ever write phase1_works.csv/phase1_transfers.csv
+    # (see MainOnlineMultiObjWarmStart.java's own comment); gated on java_main_class rather than
+    # just the files' existence, since a STALE pair left over from an earlier solve in this same
+    # model_dir would otherwise get silently misattributed to a later, unrelated solve (e.g. a
+    # plain Incremental probe right after an escalation).
+    if java_main_class in ('MainOnlineMultiObj', 'MainOnlineMultiObjWarmStart'):
+        phase1_works_path = f"{model_output_path}/phase1_works.csv"
+        if os.path.exists(phase1_works_path):
+            try:
+                phase1_works = toDict(phase1_works_path, job_list=job_ids, master_node=master_node, task_id_maps=task_id_maps)
+                log_phase1_vs_final_flow_times(master_node.env.now, jobs, phase1_works, works, model_dir)
+            except Exception as e:
+                print(f"### WARNING: failed to log phase1-vs-final flow times: {e} ###")
 
     # toDict()/loadDeletions() always pre-populate one key per node (even with an empty CSV), so
     # their dicts are never actually empty -- callers can't tell "no solution" apart from "solved"
@@ -464,7 +827,7 @@ def schedulingUsingJavaCSP(master_node, jobs: list, replicas_locations: dict, no
     return transfers, works, deletions
 
 
-def toDict(path_to_csv, nb_nodes=None, job_list=None, time=None,master_node=None):
+def toDict(path_to_csv, nb_nodes=None, job_list=None, time=None, master_node=None, task_id_maps=None):
     import csv
     # Création du dictionnaire
     dict_info = {}
@@ -482,12 +845,17 @@ def toDict(path_to_csv, nb_nodes=None, job_list=None, time=None,master_node=None
             start_time = int(row["start_time"])
             end_time = int(row["end_time"])
             node_index = int(row["node_index"])
-            
+
             # On remplit la structure works_exec
             now = master_node.env.now
             if 'task_index' in row.keys():
-                dict_info[f"node_{node_index}"].append((job_list[job_index], node_index, task_index, now+start_time, now+end_time, end_time - start_time))
-                print(f"node_{node_index} - job {job_list[job_index]} - task {task_index} - start: {now+start_time} - end: {now+end_time}")
+                # task_index as Java returns it is LOCAL to the NotStarted-only subset it was
+                # given (see task_id_by_job in _schedulingUsingJavaCSP_impl) -- translate it back
+                # to the job's TRUE task_id, or every caller matching on (job_id, task_id) against
+                # this job's OTHER (already-committed) tasks silently collides with the wrong one.
+                true_task_index = task_id_maps[job_index][task_index] if task_id_maps is not None else task_index
+                dict_info[f"node_{node_index}"].append((job_list[job_index], node_index, true_task_index, now+start_time, now+end_time, end_time - start_time))
+                print(f"node_{node_index} - job {job_list[job_index]} - task {true_task_index} - start: {now+start_time} - end: {now+end_time}")
             else:
                 dict_info[f"node_{node_index}"].append((job_list[job_index], node_index, now+start_time, now+end_time, end_time - start_time))
                 print(f"node_{node_index} - transfer {job_list[job_index]} - start: {now+start_time} - end: {now+end_time}")

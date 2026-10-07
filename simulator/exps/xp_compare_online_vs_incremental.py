@@ -17,6 +17,7 @@ from simulator import (
 )
 from master_node_with_heterogeneous_nodes_csp import SchedulingUsingCSPOnline, SchedulingUsingCSPIncremental, SchedulingUsingCSPIncrementalFreeNodesOnly
 from utils.plots import plot_gantt_chart
+from utils.run_export import start_recording
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,8 @@ def run_one(name, master_class, config_template, nb_jobs, nb_nodes, instance_dir
 
     random.seed(42)
     nodes_config = generateHeterogeneousInfrastructureEquilibre(config, path=f"{instance_dir}/infrastructure.csv")
+    start_recording(results_destination, params={"name": name, "master_class": master_class.__name__, "nb_jobs": nb_jobs,
+                                                 "nb_nodes": nb_nodes, "instance_dir": instance_dir}, config=config, nodes_config=nodes_config)
 
     random.seed(42)
     results, _ = simulatorForOptimalPerfsUsingCSPOnline(

@@ -528,12 +528,22 @@ public class MainOnline {
             double maxStartingTime = 0;
             for (double s : starting_times) if (s > maxStartingTime) maxStartingTime = s;
 
-            makespanLong += 0;
+            // maxStartingTime was computed above but never folded in here (silently added as 0) --
+            // with enough existing/queued work, a node's own starting_times[j] can already exceed
+            // whatever this bound would otherwise be, so every "start_transfer_d..._n..." IntVar
+            // built as [starting_times[j], makespan] below ends up with lower > upper -- a Choco
+            // SolverException, not a graceful infeasible-result return. Folding it in first
+            // guarantees makespan is always at least as large as the latest node/job starting
+            // point before the data/compute-volume margin is added on top.
+            makespanLong += (long) Math.ceil(maxStartingTime) + 1;
             makespanLong += totalWork * CPU_UNIT * Math.max(1, maxCpu);
             makespanLong *= 2;
 
-
-            int makespan = 10_000; //(int) Math.min(makespanLong, Integer.MAX_VALUE);
+            // Was hardcoded to a fixed 10_000s horizon -- fine for light workloads, but silently
+            // wrong (not just suboptimal: an outright SolverException, since node/job starting
+            // times can then exceed this fixed ceiling) once enough existing jobs/data volume
+            // push the real horizon past it. Use the dynamically-computed bound instead.
+            int makespan = (int) Math.min(makespanLong, Integer.MAX_VALUE);
 
             // Optional hard node filter: when present, a node NOT listed is completely excluded
             // from this solve's candidates -- no notion of "will be free in X time units", just
@@ -596,6 +606,77 @@ public class MainOnline {
                 // File missing/unreadable: debug prints just show 0 for "now" instead of crashing.
             }
 
+            // Jobs the Python side decided are too costly to move (e.g. a large dataset already
+            // resident somewhere): comma-separated job indices (same nb_data indexing as
+            // data_sizes/replicas_location), written to frozen_jobs.txt by
+            // _schedulingUsingJavaCSP_impl. A frozen job's tasks stay confined to nodes it's
+            // ALREADY resident on (no new node, so no new transfer -- see validNodes below), and
+            // its transferHeights are fixed to its current residency instead of left free (see
+            // the transfer-task loop below) -- both trims real search space AND guarantees no
+            // network cost from moving it. File missing/empty (the default): no job is frozen,
+            // identical to behavior before this existed.
+            boolean[] isFrozen = new boolean[nb_data];
+            try {
+                String frozenText = readFile(MODEL_INPUTS_DIR + "/frozen_jobs.txt").trim();
+                if (!frozenText.isEmpty()) {
+                    for (String tok : frozenText.split(",")) {
+                        int idx = Integer.parseInt(tok.trim());
+                        if (idx >= 0 && idx < nb_data) isFrozen[idx] = true;
+                    }
+                }
+            } catch (Exception e) {
+                // File missing/unreadable: no job frozen (matches behavior before this existed).
+            }
+
+            // Confines an already-running job's task placement to a "powerful" subset of nodes
+            // (by bandwidth/compute_capacity) so a full replan solves faster -- powerfulNodes is
+            // the allowed set, powerRestricted marks which jobs (never a brand-new arrival) it
+            // applies to. Both written by _schedulingUsingJavaCSP_impl. Applied per-job below
+            // (validNodes) with a fallback to the full storage-eligible set if the intersection
+            // would otherwise be empty -- this is a speed heuristic and must never manufacture an
+            // infeasibility that wasn't real. Either file missing/empty (the default): no
+            // restriction, identical to before this existed.
+            Set<Integer> powerfulNodes = new HashSet<>();
+            try {
+                String powerfulText = readFile(MODEL_INPUTS_DIR + "/powerful_nodes.txt").trim();
+                if (!powerfulText.isEmpty()) {
+                    for (String tok : powerfulText.split(",")) powerfulNodes.add(Integer.parseInt(tok.trim()));
+                }
+            } catch (Exception e) {
+                // File missing/unreadable: no powerful-node restriction (matches prior behavior).
+            }
+            boolean[] isPowerRestricted = new boolean[nb_data];
+            try {
+                String restrictedText = readFile(MODEL_INPUTS_DIR + "/power_restricted_jobs.txt").trim();
+                if (!restrictedText.isEmpty()) {
+                    for (String tok : restrictedText.split(",")) {
+                        int idx = Integer.parseInt(tok.trim());
+                        if (idx >= 0 && idx < nb_data) isPowerRestricted[idx] = true;
+                    }
+                }
+            } catch (Exception e) {
+                // File missing/unreadable: no job power-restricted (matches prior behavior).
+            }
+
+            // Nodes to exclude from NEW placements entirely, for EVERY job including a brand-new
+            // arrival (unlike frozen_jobs.txt, which only ever restricts specific JOBS, never the
+            // new one) -- e.g. a node with no data resident on it right now AND slow by bandwidth/
+            // compute_capacity, a "bad bet" combination with no locality advantage and no speed
+            // advantage either. Comma-separated node indices, written by
+            // _timedParallelEscalation's avoid_empty_slow_nodes variant. Already-resident data on
+            // an excluded node stays valid (same isResident carve-out as isFrozen below) -- this
+            // only ever forbids reaching a node that nothing is on yet. File missing/empty (the
+            // default): no exclusion, identical to before this existed.
+            Set<Integer> excludedNodes = new HashSet<>();
+            try {
+                String excludedText = readFile(MODEL_INPUTS_DIR + "/excluded_nodes.txt").trim();
+                if (!excludedText.isEmpty()) {
+                    for (String tok : excludedText.split(",")) excludedNodes.add(Integer.parseInt(tok.trim()));
+                }
+            } catch (Exception e) {
+                // File missing/unreadable: no node excluded (matches prior behavior).
+            }
+
             // ----- MODEL -----
             Model model = new Model("Bag of Tasks Scheduling (Java)");
             /*Settings.dev()
@@ -622,18 +703,38 @@ public class MainOnline {
                     //IntVar durationVar = model.intVar(d);
                     IntVar end;// = model.intVar("end_transfer_d" + i + "_n" + j, (int) starting_times[j] + d, makespan,true);
                     
-                    BoolVar h;
-                    if (data_sizes[i] > storage_capacity[j]) {
-                        h = model.boolVar("height_transfer_d" + i + "_n" + j, false);
-                    }else{
-                        h = model.boolVar("height_transfer_d" + i + "_n" + j);
-                    }
                     // s/end must stay internally consistent (s + d = end) regardless of which
                     // branch set h, or the Task below is contradictory and the WHOLE model
                     // becomes infeasible the moment any single node is too small for any single
                     // job -- even though h=false already means this pair can never be selected.
                     final int jForResidentCheck = j;
                     boolean isResident = Arrays.stream(replicas_location[i]).anyMatch(n -> n == jForResidentCheck);
+
+                    BoolVar h;
+                    if (data_sizes[i] > storage_capacity[j]) {
+                        h = model.boolVar("height_transfer_d" + i + "_n" + j, false);
+                    } else if (isFrozen[i] && !isResident) {
+                        // Frozen and NOT already here: no new replica reaches this node. Cannot
+                        // also force h=true on every node it's ALREADY resident on below -- h is
+                        // tied by reification to counters[j]>=1 (a task actually landing there),
+                        // and sum(counters) is constrained to equal this job's own task count
+                        // (wl.length) a few lines down. A job can easily be resident on MORE
+                        // nodes than it has tasks (replicas accumulate across many replans), so
+                        // forcing every one of those true would force sum(counters) past
+                        // wl.length -- outright infeasible. Leaving already-resident nodes free
+                        // (the else branch) lets the normal mechanism decide which of them still
+                        // keep a task this round, exactly like any non-frozen job's unused
+                        // replicas -- freezing only ever forbids reaching a NEW node.
+                        h = model.boolVar("height_transfer_d" + i + "_n" + j, false);
+                    } else if (excludedNodes.contains(j) && !isResident) {
+                        // Excluded (empty+slow) and NOT already here: same carve-out as isFrozen
+                        // above, applied per-NODE instead of per-job -- blocks every job
+                        // (including a brand-new arrival) from reaching this node for the first
+                        // time, but never forces away data already resident there.
+                        h = model.boolVar("height_transfer_d" + i + "_n" + j, false);
+                    } else {
+                        h = model.boolVar("height_transfer_d" + i + "_n" + j);
+                    }
                     if (isResident) {
                         // Data is already physically on this node from a previous solve: pin its
                         // storage-occupancy start to "now" (nodeStartingTimes[j]) instead of leaving
@@ -644,9 +745,19 @@ public class MainOnline {
                         d = 1;
                         end = model.intVar("end_transfer_d" + i + "_n" + j, nodeStartingTimes[j] + d, nodeStartingTimes[j] + d, true);
                     } else {
-                        s = model.intVar("start_transfer_d" + i + "_n" + j, nodeStartingTimes[j], makespan, true);
+                        // A data item can't start transferring before its own job has actually
+                        // arrived -- nodeStartingTimes[j] alone only bounds this by when the NODE
+                        // is free, which says nothing about the JOB itself. job_arriving_times[i]
+                        // is 0 for the ordinary case (job already arrived relative to this solve's
+                        // own "now"), so this is a no-op there; it only bites for a joint solve
+                        // over jobs with staggered real arrival times (e.g. state A's one-shot
+                        // build), where it stops the solver from silently scheduling a job's
+                        // transfer before local time 0 = its real arrival.
+                        int arrivalLb = job_arriving_times == null ? 0 : (int) Math.ceil(job_arriving_times[i]);
+                        int lb = Math.max(nodeStartingTimes[j], arrivalLb);
+                        s = model.intVar("start_transfer_d" + i + "_n" + j, lb, makespan, true);
                         d = (int) Math.ceil(transferTime(i, j, data_sizes[i], bandwidths[j], replicas_location));
-                        end = model.intVar("end_transfer_d" + i + "_n" + j, nodeStartingTimes[j] + d, makespan, true);
+                        end = model.intVar("end_transfer_d" + i + "_n" + j, lb + d, makespan, true);
                     }
                     IntVar durationVar = model.intVar(d);
                     
@@ -676,8 +787,26 @@ public class MainOnline {
                 // donc aucune tache liee a cette donnee ne peut s'y executer non plus.
                 // On retire directement ces noeuds du domaine de jobNodes.
                 List<Integer> validNodesList = new ArrayList<>();
-                for (int j = 0; j < nb_nodes; j++) {
-                    if (data_sizes[i] <= storage_capacity[j]) validNodesList.add(j);
+                if (isFrozen[i]) {
+                    // Frozen: confined to nodes it's ALREADY resident on -- no new node can ever
+                    // be reached (transferHeights fixed to false there above), so letting jobNodes
+                    // range over the rest would only let the solver explore placements it will
+                    // then find infeasible. Tasks can still move among its own existing replicas.
+                    for (int n : replicas_location[i]) validNodesList.add(n);
+                } else {
+                    for (int j = 0; j < nb_nodes; j++) {
+                        if (data_sizes[i] <= storage_capacity[j]) validNodesList.add(j);
+                    }
+                    if (isPowerRestricted[i] && !powerfulNodes.isEmpty()) {
+                        // Speed heuristic only: confine this already-running job to the powerful
+                        // subset, but ONLY if at least one storage-eligible node survives the
+                        // intersection -- never strand a job with a dataset too big for every
+                        // powerful node when a perfectly good non-powerful one exists. Silently
+                        // keep the full storage-eligible list (already built above) otherwise.
+                        List<Integer> restricted = new ArrayList<>();
+                        for (int n : validNodesList) if (powerfulNodes.contains(n)) restricted.add(n);
+                        if (!restricted.isEmpty()) validNodesList = restricted;
+                    }
                 }
                 int[] validNodes = validNodesList.isEmpty()
                         ? ArrayUtils.array(0, nb_nodes - 1) // instance infaisable ; on laisse les autres contraintes le detecter
@@ -896,7 +1025,7 @@ public class MainOnline {
             // ----- OBJECTIVE Make span-----
             //makespan var and ensure it's >= all end
             boolean makespan_obj = false;
-            final IntVar[] objectives = new IntVar[2];
+            final IntVar[] objectives = new IntVar[3];
             if (makespan_obj) {
                 /*IntVar makespanVar = model.intVar("makespan", 0, makespan);
 
@@ -921,6 +1050,30 @@ public class MainOnline {
 
                     all_flow_time[i] = flow;
                 }
+
+                // Optional per-job upper bound on all_flow_time[i] -- "hybrid-n_j" design
+                // (2026-10-05): lets a caller pair objectiveChoice=2 (minimize ONLY the new
+                // job's own flow time) with a hard cap on every OTHER job's flow time (e.g.
+                // 1.2x its own pre-escalation committed value), so a narrow objective can't buy
+                // the new job a win by silently wrecking an already-running job. One value per
+                // jobs_data row (same sorted-by-job_id order as jobs.get(i) everywhere else in
+                // this file), -1 = no cap for that job. File missing/empty = no caps at all,
+                // every existing caller unaffected.
+                try {
+                    String capsText = readFile(MODEL_INPUTS_DIR + "/flow_time_caps.txt").trim();
+                    if (!capsText.isEmpty()) {
+                        String[] capsParts = capsText.split(",");
+                        for (int i = 0; i < nb_data && i < capsParts.length; i++) {
+                            int cap = Integer.parseInt(capsParts[i].trim());
+                            if (cap >= 0) {
+                                model.arithm(all_flow_time[i], "<=", cap).post();
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    // File missing/unreadable: no caps, unchanged behavior.
+                }
+
                 IntVar maxFlowTime = model.intVar("max_flow_time", 0, 999_999);
                 model.max(maxFlowTime, all_flow_time).post();
                 IntVar sumFlowTime = model.intVar("sum_flow_time", 0, 999_999);
@@ -928,6 +1081,19 @@ public class MainOnline {
                 //model.setObjective(false, maxFlowTime);
                 objectives[1] = maxFlowTime;
                 objectives[0] = sumFlowTime;
+
+                // Objective 2: the flow time of ONE specific job -- by convention, whichever job
+                // in this batch has the HIGHEST job_id. Every experiment driving this from Python
+                // gives the brand-new job an id far above any existing job's (see
+                // xp_online_warmstart_test.py's NEW_JOB_ID_BASE), so after modelCSP.py's own
+                // sort-by-job_id this is always that new job -- letting Online be told to
+                // optimize purely for the new arrival's own flow time, instead of the whole
+                // batch's sum/max.
+                int newJobIdx = 0;
+                for (int i = 1; i < nb_data; i++) {
+                    if (jobs.get(i).job_id > jobs.get(newJobIdx).job_id) newJobIdx = i;
+                }
+                objectives[2] = all_flow_time[newJobIdx];
             }
 
             //----- SOLVER -----
@@ -939,8 +1105,100 @@ public class MainOnline {
             //model.displayPropagatorOccurrences();
 
             IntVar[] decisionVars = decisionVariables(nb_nodes, nb_data, works, jobNodes, jobStarts, transferHeights, transferTasks);
-            // TEMP: hints disabled to check whether they're locking in the job11-style idle gaps
-            // hints(nb_nodes, nb_data, data_sizes, works, cpus, solver, jobNodes);
+            // Left disabled by default (see greedy_size_hints.txt's own comment in modelCSP.py)
+            // after an earlier regression investigation ("job11-style idle gaps") never
+            // conclusively resolved whether hints() itself was the cause. Opt back in per-solve
+            // via master_node._config['greedy_size_hints'].
+            try {
+                String greedyHintsText = readFile(MODEL_INPUTS_DIR + "/greedy_size_hints.txt").trim();
+                if (greedyHintsText.equals("1")) {
+                    hints(nb_nodes, nb_data, data_sizes, works, cpus, solver, jobNodes);
+                }
+            } catch (Exception e) {
+                // File missing/unreadable: hints stay off (matches prior default behavior).
+            }
+
+            // Opt-in (see warmstart_as_hints.txt's own comment in modelCSP.py): applies
+            // warm_start.json's entries as solver.addHint() nudges instead of the heavier
+            // IntDomainLast-seeded value selector MainOnlineWarmStart.java uses for the same
+            // data -- a hint the search can abandon the moment it looks unprofitable, rather
+            // than one re-tried on every single decision for that variable. This class (the
+            // cold, non-warm-start one) never read warm_start.json before this existed; the
+            // caller is responsible for having written it (e.g. via _writeWarmStart) beforehand.
+            try {
+                String warmstartAsHintsText = readFile(MODEL_INPUTS_DIR + "/warmstart_as_hints.txt").trim();
+                if (warmstartAsHintsText.equals("1")) {
+                    String warmStartText = readFile(MODEL_INPUTS_DIR + "/warm_start.json").trim();
+                    if (!warmStartText.isEmpty()) {
+                        JSONObject warmStart = new JSONObject(warmStartText);
+                        int hinted = 0;
+                        if (warmStart.has("job_placements")) {
+                            JSONArray placements = warmStart.getJSONArray("job_placements");
+                            for (int p = 0; p < placements.length(); p++) {
+                                JSONObject entry = placements.getJSONObject(p);
+                                int i = entry.getInt("job_index");
+                                int k = entry.getInt("task_index");
+                                int node = entry.getInt("node");
+                                if (i < 0 || i >= nb_data || k < 0 || k >= works[i].length) continue;
+                                try {
+                                    if (jobNodes[i][k].contains(node)) {
+                                        solver.addHint(jobNodes[i][k], node);
+                                        hinted++;
+                                    }
+                                } catch (Exception e) { /* skip this one entry */ }
+                            }
+                        }
+                        if (warmStart.has("transfers")) {
+                            JSONArray transfersWs = warmStart.getJSONArray("transfers");
+                            for (int t = 0; t < transfersWs.length(); t++) {
+                                JSONObject entry = transfersWs.getJSONObject(t);
+                                int i = entry.getInt("job_index");
+                                int node = entry.getInt("node");
+                                if (i < 0 || i >= nb_data || node < 0 || node >= nb_nodes) continue;
+                                try {
+                                    if (transferHeights[node][i].contains(1)) {
+                                        solver.addHint(transferHeights[node][i], 1);
+                                        hinted++;
+                                    }
+                                } catch (Exception e) { /* skip this one entry */ }
+                            }
+                        }
+                        System.out.println("### warmstart_as_hints: " + hinted + " hint(s) applied ###");
+                    }
+                }
+            } catch (Exception e) {
+                // File missing/unreadable/malformed: proceed without these hints.
+            }
+
+            // Per-job solver.addHint() target node (e.g. the worst-estimated-flow-time job
+            // paired with the fastest node -- see job_node_hints.txt's own comment in
+            // modelCSP.py). Comma-separated "job_index:node_index" pairs; every one of that
+            // job's tasks gets the same node hint, same granularity as the pre-existing (and
+            // currently dead-ranking) hints() helper. File missing/empty (the default): no hint
+            // applied, identical to before this existed.
+            try {
+                String jobNodeHintsText = readFile(MODEL_INPUTS_DIR + "/job_node_hints.txt").trim();
+                if (!jobNodeHintsText.isEmpty()) {
+                    int hinted = 0;
+                    for (String pair : jobNodeHintsText.split(",")) {
+                        String[] parts = pair.split(":");
+                        int i = Integer.parseInt(parts[0].trim());
+                        int node = Integer.parseInt(parts[1].trim());
+                        if (i < 0 || i >= nb_data || node < 0 || node >= nb_nodes) continue;
+                        for (int k = 0; k < works[i].length; k++) {
+                            try {
+                                if (jobNodes[i][k].contains(node)) {
+                                    solver.addHint(jobNodes[i][k], node);
+                                    hinted++;
+                                }
+                            } catch (Exception e) { /* skip this one entry */ }
+                        }
+                    }
+                    System.out.println("### job_node_hints: " + hinted + " hint(s) applied ###");
+                }
+            } catch (Exception e) {
+                // File missing/unreadable/malformed: proceed without these hints.
+            }
 
             //solver.setNoGoodRecordingFromRestarts();
             ArraySort<?> sorter = new ArraySort<>(nb_nodes, false, true);
@@ -1007,10 +1265,27 @@ public class MainOnline {
             }
             System.out.println("Solver time limit: " + timeLimitSeconds + "s");
             solver.limitTime(timeLimitSeconds + "s");
-            
+
+            // Which objectives[] entry to actually optimize: 0=sum flow time (all jobs), 1=max
+            // flow time (all jobs, the long-standing default), 2=the new job's own flow time
+            // alone (see objectives[2] above). Runtime-selectable so every OTHER experiment that
+            // never writes this file keeps today's exact behavior (default: 1).
+            int objectiveChoice = 1;
+            try {
+                String objectiveChoiceText = readFile(MODEL_INPUTS_DIR + "/objective_choice.txt").trim();
+                if (!objectiveChoiceText.isEmpty()) objectiveChoice = Integer.parseInt(objectiveChoiceText);
+            } catch (Exception e) {
+                // File missing/unreadable: keep the default (1 = max flow time, all jobs).
+            }
+            System.out.println("Objective choice: " + objectiveChoice
+                    + " (0=sum all, 1=max all, 2=new job's own flow time)");
+
             boolean[] found = {false};
             solver.onSolution(() -> {
-                        
+
+                    System.out.println("### DIAG solution found: sumFlowTime=" + objectives[0].getValue()
+                            + " maxFlowTime=" + objectives[1].getValue()
+                            + " newJobFlowTime=" + objectives[2].getValue() + " nb_data=" + nb_data + " t=" + solver.getTimeCount());
                     found[0] = true;
 
                     transfersList.clear();
@@ -1033,6 +1308,15 @@ public class MainOnline {
 
                                 TransferConfig tmp_transfer = new TransferConfig(i, transferTasks[j][i].getStart().getValue(), transferTasks[j][i].getEnd().getValue(), j);
                                 transfersList.add(tmp_transfer);
+
+                                // Freshly-transferred data's own release time (computed by the
+                                // storage cumulative constraint above, storageTasks[j][i]'s end)
+                                // was never exported before -- only abandon decisions for
+                                // already-resident replicas were. Without this, nothing downstream
+                                // (the simulator's own bookkeeping, any storage-occupancy
+                                // reconstruction) can tell when this node frees back up, making
+                                // freshly-placed data look permanently resident.
+                                deletionsList.add(new DeletionConfig(i, j, storageTasks[j][i].getEnd().getValue()));
                             }
 
                             final int jFinal = j;
@@ -1072,10 +1356,13 @@ public class MainOnline {
                         j, starting_times[j], nodeStartingTimes[j], currentSimTime + nodeStartingTimes[j]);
             }
 
-            solver.findOptimalSolution(objectives[0], false);
+            solver.findOptimalSolution(objectives[objectiveChoice], false);
             if (!found[0]) {
                 System.out.println("No solution found");
             }
+            System.out.println("### DIAG search end: timeCount=" + solver.getTimeCount()
+                    + "s  timeLimitWas=" + timeLimitSeconds + "s  objectiveOptimal=" + solver.isObjectiveOptimal()
+                    + "  solutionCount=" + solver.getSolutionCount());
 
             SchedulingResult result = new SchedulingResult(transfersList, worksList, deletionsList);
 
@@ -1551,15 +1838,25 @@ public class MainOnline {
                         int ii = imaxs[i];
                         TIntArrayList values = mapping.get(ii);
                         if (i == data) {
-                            for (int k = 0; k < works[ii].length; k++) {
-                                if (jn[ii][k] != values.get(work)) {
-                                    jobNodes[ii][k].instantiateTo(jn[ii][k], this);
-                                    //jobStarts[ii][k].instantiateTo(sn[ii][k], this);
-                                }
-                            }
-                            work++;
-                            if (work == values.size()) {
+                            // Stale cursor guard (same failure getNeighbor2 already guards against):
+                            // if a ContradictionException was thrown by a later data's instantiateTo
+                            // in a previous call, the trailing `if (move)` never ran, leaving
+                            // work == values.size() -- values.get(work) then throws
+                            // ArrayIndexOutOfBoundsException. Treat it as "nothing left to fix for
+                            // this data" and move on. Never fires on a non-stale cursor.
+                            if (values == null || work >= values.size()) {
                                 move = true;
+                            } else {
+                                for (int k = 0; k < works[ii].length; k++) {
+                                    if (jn[ii][k] != values.get(work)) {
+                                        jobNodes[ii][k].instantiateTo(jn[ii][k], this);
+                                        //jobStarts[ii][k].instantiateTo(sn[ii][k], this);
+                                    }
+                                }
+                                work++;
+                                if (work == values.size()) {
+                                    move = true;
+                                }
                             }
                         } else {
                             for (int k = 0; k < works[ii].length; k++) {
@@ -1958,7 +2255,7 @@ public class MainOnline {
 
         // Call scheduler
         SchedulingWithDiffN.SchedulingResult result = SchedulingWithDiffN.runScheduler(
-            jobs,nodes.size(), nbData, data_sizes, works, bandwidths, cpus, storage_capacity, nodes_free_time, replicas_location,null, 0, true,null);
+            jobs,nodes.size(), nbData, data_sizes, works, bandwidths, cpus, storage_capacity, nodes_free_time, replicas_location,null, 0, true,jobs_arrival_time);
 
         String basePath = MODEL_OUTPUTS_DIR + "/";
 

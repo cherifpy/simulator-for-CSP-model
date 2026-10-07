@@ -1,0 +1,78 @@
+{
+  "n_existing": 10,
+  "new_job_index": 10,
+  "nb_nodes": 50,
+  "instance_dir": "/home/csimohammed/simulator-for-CSP-model/simulator/workloads/workloads-100-for_storage_constraintes/inst-50J-50N",
+  "solver_time_limit_s": 7200,
+  "incremental_time_limit_s": 600,
+  "state_a_time_limit_s": 60,
+  "repeats": 1,
+  "tiers": [
+    {
+      "tier": "medium",
+      "range": [
+        15360,
+        40960
+      ],
+      "trials": [
+        {
+          "repeat": 0,
+          "dataset_size": 29565,
+          "n_jobs_isolated": 11,
+          "online": {
+            "wait_time_new_job": 1681.0,
+            "flow_time_new_job": 2826.0,
+            "mean_flow_time_all": 2479.319417492982,
+            "max_flow_time_all": 2833.2426545520216,
+            "mean_flow_time_isolated": 2479.319417492982,
+            "max_flow_time_isolated": 2833.2426545520216,
+            "n_jobs_isolated": 11,
+            "jobs_to_reschedule": [
+              10,
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9
+            ],
+            "transfer_energy_total": 7988.580326258808
+          },
+          "incremental": {
+            "wait_time_new_job": 42.0,
+            "flow_time_new_job": 321.0000000000001,
+            "mean_flow_time_all": 3081.8597143155434,
+            "max_flow_time_all": 6144.298680960749,
+            "mean_flow_time_isolated": 3081.8597143155434,
+            "max_flow_time_isolated": 6144.298680960749,
+            "n_jobs_isolated": 11,
+            "jobs_to_reschedule": [
+              10
+            ],
+            "transfer_energy_total": 201.95708890859694
+          }
+        }
+      ]
+    }
+  ],
+  "aggregates": [
+    {
+      "tier": "medium",
+      "range": [
+        15360,
+        40960
+      ],
+      "n": 1,
+      "online_mean": 2479.319417492982,
+      "online_std": 0.0,
+      "incremental_mean": 3081.8597143155434,
+      "incremental_std": 0.0,
+      "cost": -602.5402968225612,
+      "cost_pct": -19.551191575129195
+    }
+  ]
+}
