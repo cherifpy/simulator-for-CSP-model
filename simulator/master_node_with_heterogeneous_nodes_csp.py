@@ -1761,6 +1761,35 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
                 for deletion in deletions_[key]:
                     self.deletions[key].append(deletion)
 
+    def _escalateJoint(self, jobs_to_reschedule, running_jobs, replicas_locations, nodes_free_time, budget):
+        """The joint-replan call itself (parallel multi-variant race or the single warm-started
+        solve), factored out of schedulingNewJob() so it can be reached two ways: the normal
+        should_escalate path (gated on F1 vs a threshold/margin) and the direct no-F1-solution
+        path below (F1 itself came back infeasible, so there is nothing to gate on -- escalate
+        unconditionally, at the full max budget, since a joint replan can move OTHER jobs out of
+        the way in a way a single-job Incremental solve never can). Returns (transfers_, works_,
+        deletions_) -- yield from, generator."""
+        parallel_escalation = self._config.get('parallel_warm_cold_escalation', self.parallel_warm_cold_escalation)
+        if parallel_escalation:
+            transfers_, works_, deletions_ = yield from self._timedParallelEscalation(
+                jobs_to_reschedule, running_jobs, replicas_locations, nodes_free_time, self.env.now, budget)
+        else:
+            self._writeWarmStart(jobs_to_reschedule, replicas_locations, nodes_free_time)
+            orig_limit = self._config.get('solver_time_limit_s')
+            orig_java_main_class = self.java_main_class
+            try:
+                self._config['solver_time_limit_s'] = max(1, int(round(budget)))
+                self.java_main_class = self.escalation_java_main_class
+                transfers_, works_, deletions_ = yield from self._timedSchedulingUsingJavaCSP(
+                    jobs_to_reschedule, replicas_locations, nodes_free_time, self.env.now)
+            finally:
+                self.java_main_class = orig_java_main_class
+                if orig_limit is None:
+                    self._config.pop('solver_time_limit_s', None)
+                else:
+                    self._config['solver_time_limit_s'] = orig_limit
+        return transfers_, works_, deletions_
+
     def schedulingNewJob(self):
 
         poll_count = 0
@@ -1784,7 +1813,34 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
                 inc_transfers, inc_works, inc_deletions, f1 = yield from self._placeSingleJobIncremental(job)
 
                 if f1 is None:
-                    logger.warning("[%s] Master: no CSP solution found for job %s (adaptive-joint/incremental probe), will retry", self.env.now, job.job_id)
+                    # Incremental alone found NO feasible placement for this job at all (e.g. a
+                    # genuine storage deadlock given every OTHER job's current residency -- see
+                    # 2026-10-07 Grid5000 finding: this used to just retry forever, re-probing the
+                    # exact same infeasible request every 0.1s tick until the walltime killed the
+                    # whole run, having made zero progress for ~85s straight). A single-job
+                    # Incremental solve can never free up space by moving someone else -- a joint
+                    # replan can. Escalate directly at the FULL max budget (there is no F1 to
+                    # scale alpha*F1 against) as a last resort before giving up on this tick.
+                    max_budget = self._config.get('adaptive_max_budget_s', self.adaptive_max_budget_s)
+                    logger.warning("[%s] Master: no CSP solution found for job %s (adaptive-joint/incremental probe) "
+                                   "-- escalating directly at max budget=%.3fs", self.env.now, job.job_id, max_budget)
+                    running_jobs = self.getRunningJobs()
+                    jobs_to_reschedule = [job] + running_jobs
+                    nodes_free_time = self.nodesFreeTime(self.ongoing_transfers, self.ongoing_works)
+                    replicas_locations = self.replicas_locations
+                    transfers_, works_, deletions_ = yield from self._escalateJoint(
+                        jobs_to_reschedule, running_jobs, replicas_locations, nodes_free_time, max_budget)
+
+                    if len(transfers_.keys()) > 0 and len(works_.keys()) > 0:
+                        # Nothing to gate against (F1 itself was infeasible) -- any solution beats
+                        # none, commit it unconditionally.
+                        logger.debug("[%s] Master: job %s placed via direct max-budget escalation "
+                                     "(%s job(s) replanned)", self.env.now, job.job_id, len(jobs_to_reschedule))
+                        self._commitJointPlan(transfers_, works_, deletions_)
+                        self.waiting_jobs.pop(0)
+                    else:
+                        logger.warning("[%s] Master: direct max-budget escalation ALSO found no solution for "
+                                       "job %s, will retry", self.env.now, job.job_id)
                     if self._allJobsCompleted():
                         break
                     continue
@@ -1840,46 +1896,11 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
 
                     nodes_free_time = self.nodesFreeTime(self.ongoing_transfers, self.ongoing_works)
                     replicas_locations = self.replicas_locations
-                    jobs_to_reschedule = [job] + self.getRunningJobs()
+                    running_jobs = self.getRunningJobs()
+                    jobs_to_reschedule = [job] + running_jobs
 
-                    parallel_escalation = self._config.get('parallel_warm_cold_escalation', self.parallel_warm_cold_escalation)
-                    if parallel_escalation:
-                        # Runs 4 candidate escalations CONCURRENTLY (freeze the below-mean
-                        # group / freeze the above-mean group / no freeze / no freeze but
-                        # warm-started) and keeps the best -- see _timedParallelEscalation's own
-                        # docstring. Handles its own java_main_class/_config/warm-start/freeze/
-                        # timing via per-thread proxies, so nothing here needs mutating self.
-                        transfers_, works_, deletions_ = yield from self._timedParallelEscalation(
-                            jobs_to_reschedule, self.getRunningJobs(), replicas_locations, nodes_free_time, self.env.now, budget)
-                    else:
-                        self._writeWarmStart(jobs_to_reschedule, replicas_locations, nodes_free_time)
-                        orig_limit = self._config.get('solver_time_limit_s')
-                        orig_java_main_class = self.java_main_class
-                        try:
-                            self._config['solver_time_limit_s'] = max(1, int(round(budget)))
-                            # Without this, the joint solve silently runs under the class-level
-                            # default (MainIncremental, kept for the cheap F1 probe) instead of the
-                            # actual bi-objectif+warmstart escalation -- and since MainIncremental
-                            # never stops early once it can't quickly prove optimal, it then just
-                            # burns the entire budget doing the wrong solve (confirmed: a real run got
-                            # stuck for 5+ minutes on a single-job MainIncremental call carrying a
-                            # 619s budget meant for the joint replan).
-                            self.java_main_class = self.escalation_java_main_class
-                            # _timedSchedulingUsingJavaCSP charges this solve's REAL wall-clock time
-                            # (not the budget estimate above, which only bounds the solver's time
-                            # limit) against simulated time -- see charge_thinking_time. Replaced an
-                            # earlier version that pre-emptively charged `budget` itself (a fixed
-                            # estimate, not what the solve actually took) before even running the
-                            # solve; this way every approach (online/online_biobj/incremental/hybrid)
-                            # is charged the same way, for its own actual solve, not an estimate.
-                            transfers_, works_, deletions_ = yield from self._timedSchedulingUsingJavaCSP(
-                                jobs_to_reschedule, replicas_locations, nodes_free_time, self.env.now)
-                        finally:
-                            self.java_main_class = orig_java_main_class
-                            if orig_limit is None:
-                                self._config.pop('solver_time_limit_s', None)
-                            else:
-                                self._config['solver_time_limit_s'] = orig_limit
+                    transfers_, works_, deletions_ = yield from self._escalateJoint(
+                        jobs_to_reschedule, running_jobs, replicas_locations, nodes_free_time, budget)
 
                     if len(transfers_.keys()) > 0 and len(works_.keys()) > 0:
                         # Quality gate: the escalation is a full joint replan under a TIGHT budget
