@@ -1125,22 +1125,44 @@ public class MainOnlineMultiObj {
                 // known constant once (i,j) is fixed; only which candidates get chosen is a
                 // decision. Upper-bounded by the (unreachable in practice) sum of EVERY
                 // candidate's cost, since selecting fewer can only reduce the total.
-                long energyUpperBoundLong = 0;
-                for (int[] row : energyContrib) for (int v : row) energyUpperBoundLong += v;
-                int energyUpperBound = (int) Math.min(energyUpperBoundLong, Integer.MAX_VALUE / 2);
-                IntVar energyVar = model.intVar("total_energy", 0, energyUpperBound, true);
-                IntVar[] transferHeightsFlat = new IntVar[nb_nodes * nb_data];
-                int[] energyCoeffsFlat = new int[nb_nodes * nb_data];
-                int ecIdx = 0;
-                for (int j = 0; j < nb_nodes; j++) {
-                    for (int i = 0; i < nb_data; i++) {
-                        transferHeightsFlat[ecIdx] = transferHeights[j][i];
-                        energyCoeffsFlat[ecIdx] = energyContrib[j][i];
-                        ecIdx++;
-                    }
+                //
+                // 2026-10-08: only built when multi_objective.txt actually requests bi-objective
+                // mode (1 or 2) -- a plain single-objective solve (mono mode, every hybrid-n_j
+                // escalation variant) used to build this var + its scalar constraint over EVERY
+                // transferHeights[j][i] regardless, which changes Choco's own variable-
+                // registration order even though objectives[3] is never searched on in that mode.
+                // Confirmed on Grid5000: this made a "nofreeze" escalation variant (java_main_class
+                // MainOnlineMultiObj) land on a DETERMINISTICALLY different, worse solution than an
+                // otherwise identically-configured dedicated MainOnline.java call (same budget,
+                // same objective_choice=2, same flow_time_caps) -- reproduced identically across
+                // two separate runs, ruling out CPU-contention noise as the explanation. Skipping
+                // this block in mono mode makes this class's model construction match
+                // MainOnline.java's exactly whenever bi-objective isn't actually in use.
+                boolean buildEnergyObjective;
+                try {
+                    String earlyMultiObjText = readFile(MODEL_INPUTS_DIR + "/multi_objective.txt").trim();
+                    buildEnergyObjective = !earlyMultiObjText.isEmpty() && Integer.parseInt(earlyMultiObjText) != 0;
+                } catch (Exception e) {
+                    buildEnergyObjective = false;
                 }
-                model.scalar(transferHeightsFlat, energyCoeffsFlat, "=", energyVar).post();
-                objectives[3] = energyVar;
+                if (buildEnergyObjective) {
+                    long energyUpperBoundLong = 0;
+                    for (int[] row : energyContrib) for (int v : row) energyUpperBoundLong += v;
+                    int energyUpperBound = (int) Math.min(energyUpperBoundLong, Integer.MAX_VALUE / 2);
+                    IntVar energyVar = model.intVar("total_energy", 0, energyUpperBound, true);
+                    IntVar[] transferHeightsFlat = new IntVar[nb_nodes * nb_data];
+                    int[] energyCoeffsFlat = new int[nb_nodes * nb_data];
+                    int ecIdx = 0;
+                    for (int j = 0; j < nb_nodes; j++) {
+                        for (int i = 0; i < nb_data; i++) {
+                            transferHeightsFlat[ecIdx] = transferHeights[j][i];
+                            energyCoeffsFlat[ecIdx] = energyContrib[j][i];
+                            ecIdx++;
+                        }
+                    }
+                    model.scalar(transferHeightsFlat, energyCoeffsFlat, "=", energyVar).post();
+                    objectives[3] = energyVar;
+                }
             }
 
             //----- SOLVER -----
@@ -1355,10 +1377,14 @@ public class MainOnlineMultiObj {
             int[] phase1FinalMaxFlow = {-1};
             solver.onSolution(() -> {
 
+                    // objectives[3] (energy) is null whenever buildEnergyObjective skipped it
+                    // (mono-objective mode, see that flag's own comment above) -- guard every
+                    // read of it here instead of assuming it's always built.
                     System.out.println("### DIAG solution found: sumFlowTime=" + objectives[0].getValue()
                             + " maxFlowTime=" + objectives[1].getValue()
                             + " newJobFlowTime=" + objectives[2].getValue()
-                            + " energy=" + objectives[3].getValue() + " nb_data=" + nb_data + " t=" + solver.getTimeCount());
+                            + (objectives[3] != null ? " energy=" + objectives[3].getValue() : "")
+                            + " nb_data=" + nb_data + " t=" + solver.getTimeCount());
                     found[0] = true;
                     lastMaxFlow[0] = objectives[1].getValue();
                     for (int i = 0; i < nb_data; i++) lastFlowTimeByJob[i] = all_flow_time[i].getValue();
@@ -1371,7 +1397,9 @@ public class MainOnlineMultiObj {
                                 + "exact solution before improving energy)" : "DID NOT hold exactly (search "
                                 + "found a different, still cap-respecting point first instead)") + " ###");
                     }
-                    lastEnergy[0] = objectives[3].getValue();
+                    if (objectives[3] != null) {
+                        lastEnergy[0] = objectives[3].getValue();
+                    }
 
                     transfersList.clear();
                     worksList.clear();
