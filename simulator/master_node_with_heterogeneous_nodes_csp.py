@@ -1544,7 +1544,19 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
         variant_specs = {
             "freeze_below_mean": ("MainOnlineMultiObj", False, below_ids, None, False, False, None, None),
             "freeze_above_mean": ("MainOnlineMultiObj", False, above_ids, None, False, False, None, None),
-            "nofreeze": ("MainOnlineMultiObj", False, [], None, False, False, None, None),
+            # 2026-10-08: MainOnline.java directly, not MainOnlineMultiObj.java -- a Grid5000
+            # comparison found nofreeze landing DETERMINISTICALLY worse than an otherwise
+            # identically-configured (same budget, objective_choice=2, flow_time_caps) dedicated
+            # MainOnline.java call, reproduced identically across repeated runs (ruling out CPU-
+            # contention noise) and unaffected by removing MainOnlineMultiObj's unused-in-mono-
+            # mode energy objective var (see that fix's own commit). Root cause not isolated --
+            # this sidesteps it by using the exact class a dedicated online/online_newjob call
+            # already uses, instead of a nominally-equivalent sibling class that measurably isn't.
+            # MainOnline.java already reads objective_choice.txt/flow_time_caps.txt/
+            # frozen_jobs.txt the same way, so this is a drop-in swap for the "nofreeze" semantics
+            # (cold search, nothing frozen, no multi-objective mode -- which nofreeze never used
+            # anyway).
+            "nofreeze": ("MainOnline", False, [], None, False, False, None, None),
             "warm_nofreeze": (self.escalation_java_main_class, True, [], None, False, False, None, None),
             "freeze_ongoing_transfer": ("MainOnlineMultiObj", False, ongoing_transfer_ids, None, False, False, None, None),
             # greedy_hints (2026-10-06): re-enables MainOnlineMultiObj.java's pre-existing
