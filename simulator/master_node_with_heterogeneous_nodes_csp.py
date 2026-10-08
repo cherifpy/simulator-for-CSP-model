@@ -1310,12 +1310,11 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
     # requested as a baseline to compare the mean/transfer-based freeze criteria against: if a
     # criterion-free random split does just as well, the specific criterion isn't doing real
     # work). A brand-new arrival is never restricted/frozen in any of the seven variants.
+    # 2026-10-08: dropped avoid_empty_slow_nodes, restrict_powerful_nodes, freeze_random_half (8
+    # variants left, was 11) -- user's own call after reviewing the full variant list, not tied
+    # to any specific measured regression from these three.
     _PARALLEL_ESCALATION_LABELS = ("freeze_below_mean", "freeze_above_mean", "nofreeze", "warm_nofreeze",
-                                   "restrict_powerful_nodes", "freeze_ongoing_transfer", "freeze_random_half",
-                                   "greedy_hints", "hint_from_f1", "avoid_empty_slow_nodes", "hint_slow_to_fast")
-    # Fraction of nodes (by bandwidth/compute_capacity) restrict_powerful_nodes confines already-
-    # running jobs to -- see reschedule_top_fraction's own comment in modelCSP.py.
-    _PARALLEL_ESCALATION_RESCHEDULE_TOP_FRACTION = 0.5
+                                   "freeze_ongoing_transfer", "greedy_hints", "hint_from_f1", "hint_slow_to_fast")
 
     def _ensureParallelRunDirs(self):
         """Lazily creates one isolated utils/model tree per concurrent escalation variant (own
@@ -1410,8 +1409,9 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
         return below, above
 
     def _timedParallelEscalation(self, jobs_to_reschedule, not_finished_jobs, replicas_locations, nodes_free_time, now, budget):
-        """Runs the escalation as FIVE concurrent Java solves. The first four cross "which
-        not-finished jobs get frozen" with "warm-started or not":
+        """Runs the escalation as _PARALLEL_ESCALATION_LABELS concurrent Java solves (8, as of
+        2026-10-08 -- avoid_empty_slow_nodes/restrict_powerful_nodes/freeze_random_half dropped).
+        The first four cross "which not-finished jobs get frozen" with "warm-started or not":
           - freeze_below_mean: cold search, freeze whichever not-finished jobs have an
             _estimateJobFlowTime at or below the MEAN (i.e. the jobs closest to done / with the
             least to gain from reconsideration -- see the whole freeze-criterion investigation
@@ -1425,11 +1425,6 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
             _writeWarmStart), nothing frozen -- kept only to double check warm-vs-cold still
             doesn't matter once freezing is out of the picture (the earlier warm-vs-cold
             investigation already found 13/14 controlled comparisons identical).
-        The fifth explores a different axis -- WHICH NODES are eligible, not which jobs:
-          - restrict_powerful_nodes: cold search, no job frozen, but every not-finished job's
-            reconsideration is confined to the top _PARALLEL_ESCALATION_RESCHEDULE_TOP_FRACTION of
-            nodes by bandwidth/compute_capacity (reschedule_top_fraction, see modelCSP.py) -- a
-            smaller search space without picking which jobs lose flexibility.
           - freeze_ongoing_transfer: cold search, freeze whichever not-finished jobs have a
             transfer currently IN FLIGHT (self.ongoing_transfers) -- the criterion
             freeze_jobs_with_ongoing_transfer was meant to apply, but frozen_job_ids_override
@@ -1467,29 +1462,6 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
         }
         ongoing_transfer_ids = [j.job_id for j in not_finished_jobs if j.job_id in ongoing_transfer_job_ids]
         print(f"### PARALLEL ESCALATION ongoing-transfer freeze (freeze_ongoing_transfer): {ongoing_transfer_ids} ###")
-
-        # freeze_random_half: no ranking criterion at all, just a fresh coin flip per job (~50%
-        # frozen) -- a criterion-free baseline. If this does as well as the mean/transfer-based
-        # variants on average, those criteria aren't earning their own complexity.
-        random_half_jobs = random.sample(not_finished_jobs, k=len(not_finished_jobs) // 2)
-        random_half_ids = [j.job_id for j in random_half_jobs]
-        print(f"### PARALLEL ESCALATION random half freeze (freeze_random_half): {random_half_ids} ###")
-
-        # avoid_empty_slow_nodes: a node with NO data resident on it right now AND in the slower
-        # half by bandwidth/compute_capacity (same scoring as reschedule_top_fraction, see
-        # modelCSP.py) is a "bad bet" -- no locality advantage, and slow once used -- so exclude
-        # it from every job's candidacy entirely (new arrival included, unlike every freeze
-        # variant above, which only ever restricts specific not_finished jobs).
-        occupied_node_ids = {n for locs in self.replicas_locations.values() for n in locs}
-        power_scored = sorted(
-            range(len(self.compute_nodes)),
-            key=lambda n: self.compute_nodes[n].bandwidth / self.compute_nodes[n].compute_capacity,
-        )
-        slow_node_ids = set(power_scored[:len(power_scored) // 2])
-        empty_and_slow_ids = [n for n in range(len(self.compute_nodes))
-                               if n not in occupied_node_ids and n in slow_node_ids]
-        print(f"### PARALLEL ESCALATION empty+slow node exclusion (avoid_empty_slow_nodes): "
-              f"{empty_and_slow_ids} ###")
 
         # hint_slow_to_fast: pairs the not_finished job with the WORST _estimateJobFlowTime
         # (slowest) with the FASTEST node (by compute_capacity -- a duration multiplier, so
@@ -1574,10 +1546,7 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
             "freeze_above_mean": ("MainOnlineMultiObj", False, above_ids, None, False, False, None, None),
             "nofreeze": ("MainOnlineMultiObj", False, [], None, False, False, None, None),
             "warm_nofreeze": (self.escalation_java_main_class, True, [], None, False, False, None, None),
-            "restrict_powerful_nodes": ("MainOnlineMultiObj", False, [],
-                                        self._PARALLEL_ESCALATION_RESCHEDULE_TOP_FRACTION, False, False, None, None),
             "freeze_ongoing_transfer": ("MainOnlineMultiObj", False, ongoing_transfer_ids, None, False, False, None, None),
-            "freeze_random_half": ("MainOnlineMultiObj", False, random_half_ids, None, False, False, None, None),
             # greedy_hints (2026-10-06): re-enables MainOnlineMultiObj.java's pre-existing
             # size/cpu greedy hints() helper (biggest job -> fastest node), left disabled
             # project-wide since an earlier, never-conclusively-resolved regression
@@ -1589,10 +1558,6 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
             # warm_nofreeze's full IntDomainLast-seeded value selector for the exact same data --
             # a hint the search can abandon the moment it looks unprofitable.
             "hint_from_f1": ("MainOnlineMultiObj", True, [], None, False, True, None, None),
-            # avoid_empty_slow_nodes (2026-10-06): excludes nodes with no data resident on them
-            # AND in the slower half by bandwidth/compute_capacity from every job's candidacy
-            # (new arrival included) -- see empty_and_slow_ids above.
-            "avoid_empty_slow_nodes": ("MainOnlineMultiObj", False, [], None, False, False, empty_and_slow_ids, None),
             # hint_slow_to_fast (2026-10-06): per-job solver.addHint() pairing the worst
             # _estimateJobFlowTime with the fastest node (see slow_to_fast_hints above) -- the
             # fix for greedy_hints' own dead size-based ranking (hints()'s didx is computed but
