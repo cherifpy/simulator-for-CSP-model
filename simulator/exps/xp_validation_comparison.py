@@ -51,7 +51,8 @@ configure_logging(logging.WARNING)
 
 from xp_simultaneous_sweep import generate_existing_jobs, draw_new_job_sizes, make_new_job_raw, write_instance, NB_TASKS_RANGE
 from xp_dataset_size_sweep import (build_state_a, run_incremental_style, run_online_style,
-                                    run_online_newjob_style, run_hybrid_style, make_new_job)
+                                    run_online_newjob_style, run_online_newjob_biobj_style,
+                                    run_hybrid_style, make_new_job)
 
 DEFAULT_OUTPUT_DIR = os.path.join(SIMULATOR_DIR, "results-validation-2026-10-07")
 DEFAULT_INSTANCES_DIR = os.path.join(SIMULATOR_DIR, "workloads", "validation_phaseABC")
@@ -186,14 +187,20 @@ def verify_plan_storage(plan, job_size, node_capacity, ghost_entries):
     return violations
 
 
-def plan_metrics(plan, new_job_id):
+def plan_metrics(plan, new_job_id, job_size=None):
     nb_transfers_total = sum(len(v) for v in plan.get("transfers", {}).values())
     nb_transfers_new_job = 0
     nodes_new_job, nodes_all = set(), set()
+    # Per-job transfer count (how many replicas -- distinct nodes receiving a transfer -- this
+    # PARTICULAR job got in this plan), for EVERY job in the batch, not just the new arrival --
+    # lets a caller see how much data movement each approach generates to place/replan each job
+    # individually, not only the new one.
+    per_job_transfers = {}
     for key, entries in plan.get("transfers", {}).items():
         node = int(key.split('_')[1])
         for job_id, node_index, start_abs, end_abs, duration in entries:
             nodes_all.add(node)
+            per_job_transfers[job_id] = per_job_transfers.get(job_id, 0) + 1
             if job_id == new_job_id:
                 nb_transfers_new_job += 1
                 nodes_new_job.add(node)
@@ -203,14 +210,19 @@ def plan_metrics(plan, new_job_id):
             nodes_all.add(node)
             if job_id == new_job_id:
                 nodes_new_job.add(node)
+    per_job_data_mb = {}
+    if job_size:
+        per_job_data_mb = {jid: n * job_size.get(jid, 0) for jid, n in per_job_transfers.items()}
     return {
         "nb_transfers_total": nb_transfers_total, "nb_transfers_new_job": nb_transfers_new_job,
         "nb_nodes_used_new_job": len(nodes_new_job), "nb_nodes_used_total": len(nodes_all),
+        "per_job_transfers": per_job_transfers, "per_job_data_mb": per_job_data_mb,
     }
 
 
 def run_scenario(phase, group, tag, n_existing, nb_nodes, seed, task_duration_range, dataset_size_range,
-                  objective, degradation_cap_pct, instances_dir, results_dir, rows):
+                  objective, degradation_cap_pct, instances_dir, results_dir, rows, per_job_rows=None,
+                  bi_objective=False, approaches=None):
     full_tag = f"{phase}_{group}_{tag}"
     print(f"\n{'='*70}\n### {full_tag}  (objective={objective}) ###\n{'='*70}", flush=True)
 
@@ -244,8 +256,16 @@ def run_scenario(phase, group, tag, n_existing, nb_nodes, seed, task_duration_ra
     job_size = {j.job_id: j.dataset_size for j in master.jobs}
     job_size[new_job_raw["job_id"]] = new_job_raw["dataset_size"]
 
-    approaches = ["incremental", "online", "hybrid"]
+    approaches = approaches if approaches is not None else ["incremental", "online", "hybrid"]
     for approach in approaches:
+        # Exported label: with objective="new_job" (default), the "online" branch actually calls
+        # run_online_newjob_style (minimize only the new job's own flow time + degradation cap) --
+        # "online_newjob", not plain "online" (which the "max" objective genuinely is, via
+        # run_online_style). Matches the established convention already used in
+        # phaseABC_full_metrics.csv / the analysis notebooks.
+        approach_label = "online_newjob" if approach == "online" and objective != "max" else approach
+        if bi_objective and approach in ("online", "hybrid") and objective != "max":
+            approach_label = f"{approach_label}_biobj"
         m = copy.copy(master)
         m._config = dict(getattr(master, "_config", {}))
         nj = make_new_job(new_job_raw, new_job_raw["dataset_size"], now)
@@ -261,6 +281,14 @@ def run_scenario(phase, group, tag, n_existing, nb_nodes, seed, task_duration_ra
                 m._config['solver_time_limit_s'] = SOLVER_TIME_LIMIT
                 if objective == "max":
                     res = run_online_style(m, nj, not_finished_ids, nb_nodes, now, replicas_locations, not_finished_jobs)
+                elif bi_objective:
+                    # Total budget doubled (phase 1 + phase 2), split 50/50 by epsilon_phase1_fraction
+                    # -- "30s pour le 1er objectif, 30s pour le 2eme" means SOLVER_TIME_LIMIT each,
+                    # so SOLVER_TIME_LIMIT*2 total.
+                    res = run_online_newjob_biobj_style(m, nj, not_finished_ids, nb_nodes, now, replicas_locations,
+                                                         not_finished_jobs, degradation_cap_pct=degradation_cap_pct,
+                                                         solver_time_limit=SOLVER_TIME_LIMIT * 2,
+                                                         epsilon_fraction=0.15, epsilon_phase1_fraction=0.5)
                 else:
                     res = run_online_newjob_style(m, nj, not_finished_ids, nb_nodes, now, replicas_locations,
                                                    not_finished_jobs, degradation_cap_pct=degradation_cap_pct,
@@ -275,6 +303,18 @@ def run_scenario(phase, group, tag, n_existing, nb_nodes, seed, task_duration_ra
                                             adaptive_gate_metric='max', adaptive_selection_metric='max',
                                             adaptive_new_job_objective=False, adaptive_degradation_cap_pct=None,
                                             adaptive_bi_objective=False)
+                elif bi_objective:
+                    # Same doubled-budget convention as online's biobj sibling above --
+                    # hybrid_max_budget is the escalation's TOTAL budget, split 50/50 by
+                    # epsilon_phase1_fraction inside run_variant/MainOnlineMultiObj's own
+                    # epsilon-constraint phase 1/phase 2 split.
+                    res = run_hybrid_style(m, nj, not_finished_ids, nb_nodes, now, replicas_locations, not_finished_jobs,
+                                            hybrid_alpha=0.25, hybrid_max_budget=HYBRID_MAX_BUDGET * 2,
+                                            hybrid_incremental_time_limit=HYBRID_F1_TIME_LIMIT,
+                                            epsilon_fraction=0.15, epsilon_phase1_fraction=0.5,
+                                            adaptive_gate_metric='new_job', adaptive_selection_metric='new_job',
+                                            adaptive_new_job_objective=True, adaptive_degradation_cap_pct=degradation_cap_pct,
+                                            adaptive_bi_objective=True)
                 else:
                     res = run_hybrid_style(m, nj, not_finished_ids, nb_nodes, now, replicas_locations, not_finished_jobs,
                                             hybrid_alpha=0.25, hybrid_max_budget=HYBRID_MAX_BUDGET,
@@ -290,11 +330,11 @@ def run_scenario(phase, group, tag, n_existing, nb_nodes, seed, task_duration_ra
         if res is None:
             print(f"  [{approach}] NO SOLUTION", flush=True)
             rows.append({"phase": phase, "group": group, "tag": tag, "objective": objective,
-                         "n_existing": n_existing, "nb_nodes": nb_nodes, "approach": approach, "no_solution": True})
+                         "n_existing": n_existing, "nb_nodes": nb_nodes, "approach": approach_label, "no_solution": True})
             continue
 
         plan = res.pop("_plan")
-        pm = plan_metrics(plan, nj.job_id)
+        pm = plan_metrics(plan, nj.job_id, job_size)
         ghosts = ghost_entries_for(master, batch_job_ids)
         violations = verify_plan_storage(plan, job_size, node_capacity, ghosts)
 
@@ -311,7 +351,7 @@ def run_scenario(phase, group, tag, n_existing, nb_nodes, seed, task_duration_ra
             "new_job_dataset_size": new_job_raw["dataset_size"], "new_job_nb_tasks": new_job_raw["nb_tasks"],
             "new_job_task_duration": new_job_raw["task_duration"],
             "dataset_size_range_lo": dataset_size_range[0], "dataset_size_range_hi": dataset_size_range[1],
-            "approach": approach,
+            "approach": approach_label,
             "flow_time_new_job": res["flow_time_new_job"],
             "mean_flow_time_all": res.get("mean_flow_time_all"),
             "max_flow_time_all": res.get("max_flow_time_all"),
@@ -334,6 +374,16 @@ def run_scenario(phase, group, tag, n_existing, nb_nodes, seed, task_duration_ra
         print(f"  [{approach}] flow_time_new_job={row['flow_time_new_job']} max_flow_time_all={row['max_flow_time_all']} "
               f"sched_time={elapsed:.1f}s storage_violations={violations} winning_variant={winning_variant}", flush=True)
 
+        if per_job_rows is not None:
+            for jid, nb_tr in pm["per_job_transfers"].items():
+                per_job_rows.append({
+                    "phase": phase, "group": group, "tag": tag, "objective": objective,
+                    "n_existing": n_existing, "nb_nodes": nb_nodes, "approach": approach_label,
+                    "job_id": jid, "is_new_job": jid == nj.job_id,
+                    "nb_transfers": nb_tr, "dataset_size_mb": job_size.get(jid),
+                    "data_transferred_mb": pm["per_job_data_mb"].get(jid),
+                })
+
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -349,18 +399,36 @@ def main():
                    help=f"Where to write the result CSV (default: {DEFAULT_OUTPUT_DIR}).")
     p.add_argument("--instances-dir", default=DEFAULT_INSTANCES_DIR,
                    help=f"Where generated instances live/are cached (default: {DEFAULT_INSTANCES_DIR}).")
+    p.add_argument("--bi-objective", action="store_true",
+                   help="2026-10-08: online/hybrid minimize the new job's own flow time (phase 1) "
+                        "THEN transfer energy within --objective new_job's degradation-cap-"
+                        "protected epsilon-constraint (phase 2) -- MainOnlineMultiObj.java's "
+                        "existing epsilon-constraint machinery, just pointed at objective_choice=2 "
+                        "instead of max flow time. Doubles the solver budget (SOLVER_TIME_LIMIT / "
+                        "HYBRID_MAX_BUDGET become the TOTAL across both phases, split 50/50) so "
+                        "each phase keeps its usual budget. Incremental is left untouched (not "
+                        "requested -- it already implicitly favors low transfer energy by never "
+                        "creating a replica it doesn't need). No effect with --objective max.")
+    p.add_argument("--approaches", default="incremental,online,hybrid",
+                   help="Comma-separated subset of {incremental,online,hybrid} to run per scenario "
+                        "(default: all three). E.g. --approaches online,hybrid to skip incremental "
+                        "when it's not needed for a given comparison.")
     args = p.parse_args()
 
     wanted_phases = {s.strip().replace("phase", "").upper() for s in args.scenarios.split(",")}
     scenarios = [s for s in build_scenarios() if s[0] in wanted_phases]
+    wanted_approaches = [a.strip() for a in args.approaches.split(",")]
 
     os.makedirs(args.output_dir, exist_ok=True)
     rows = []
+    per_job_rows = []
     for phase, group, tag, n_existing, nb_nodes, seed, tdr, dsr in scenarios:
         run_scenario(phase, group, tag, n_existing, nb_nodes, seed, tdr, dsr,
-                     args.objective, args.degradation_cap_pct, args.instances_dir, args.output_dir, rows)
+                     args.objective, args.degradation_cap_pct, args.instances_dir, args.output_dir, rows,
+                     per_job_rows=per_job_rows, bi_objective=args.bi_objective, approaches=wanted_approaches)
 
-    out_csv = os.path.join(args.output_dir, f"phaseABC_full_metrics_{args.objective}.csv")
+    objective_suffix = f"{args.objective}_biobj" if args.bi_objective else args.objective
+    out_csv = os.path.join(args.output_dir, f"phaseABC_full_metrics_{objective_suffix}.csv")
     fieldnames = list(rows[0].keys()) if rows else []
     for r in rows:
         for k in fieldnames:
@@ -370,6 +438,18 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
     print(f"\n### written {len(rows)} rows to {out_csv} ###", flush=True)
+
+    # Per-job data-movement breakdown (one row per job per scenario per approach) -- lets a
+    # caller see where the data-transfer cost concentrates: only the new arrival, or also the
+    # existing jobs an approach reconsiders (Online_newjob/Hybrid can move already-placed jobs;
+    # Incremental never does).
+    per_job_csv = os.path.join(args.output_dir, f"phaseABC_per_job_data_transfer_{objective_suffix}.csv")
+    per_job_fieldnames = list(per_job_rows[0].keys()) if per_job_rows else []
+    with open(per_job_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=per_job_fieldnames)
+        writer.writeheader()
+        writer.writerows(per_job_rows)
+    print(f"### written {len(per_job_rows)} per-job rows to {per_job_csv} ###", flush=True)
 
 
 if __name__ == "__main__":

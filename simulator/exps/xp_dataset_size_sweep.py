@@ -784,6 +784,90 @@ def run_online_newjob_style(master, new_job, isolated_ids, nb_nodes, now, replic
     }
 
 
+def run_online_newjob_biobj_style(master, new_job, isolated_ids, nb_nodes, now, replicas_locations, not_finished_jobs,
+                                   degradation_cap_pct, solver_time_limit, epsilon_fraction=0.15,
+                                   epsilon_phase1_fraction=0.5):
+    """Bi-objective sibling of run_online_newjob_style (2026-10-08): phase 1 minimizes the new
+    job's own flow time (objective_choice=2, identical to the mono version), phase 2 then
+    minimizes transfer energy within epsilon_fraction of phase 1's own result -- the SAME
+    epsilon-constraint machinery already used by online_biobj/hybrid-n_j's bi-objective
+    escalation (MainOnlineMultiObj.java's phase-1-respects-objective_choice revision, 2026-10-05),
+    just pointed at this objective instead of max flow time. The only functional difference from
+    run_online_newjob_style is java_main_class ('MainOnlineMultiObj' instead of 'MainOnline') --
+    multi_objective=2 is already SchedulingUsingCSPAdaptiveJoint's own class default (inherited
+    from SchedulingUsingCSPOnlineMultiObjWarmStart), so it was always being written, just ignored
+    by the mono-objective Java class. Both mechanisms stack, same as hybrid-n_j's escalation:
+    flow_time_caps (degradation_cap_pct against each job's CURRENTLY COMMITTED flow time) is
+    still posted before phase 1 starts, and phase 2's own epsilon cap (against phase 1's result)
+    applies on top -- independent, not one replacing the other.
+
+    solver_time_limit is the TOTAL budget split between the two phases by
+    epsilon_phase1_fraction (e.g. solver_time_limit=60, epsilon_phase1_fraction=0.5 -> 30s+30s)."""
+    jobs_to_reschedule = [new_job] + not_finished_jobs
+    nodes_free_time = master.nodesFreeTime(master.ongoing_transfers, master.ongoing_works)
+
+    newjob_master = copy.copy(master)
+    newjob_master.__class__ = SchedulingUsingCSPAdaptiveJoint
+    newjob_master._config = dict(master._config)
+    newjob_master.java_main_class = 'MainOnlineMultiObj'
+    newjob_master.objective_choice = 2
+    newjob_master.epsilon_fraction = epsilon_fraction
+    newjob_master.epsilon_phase1_fraction = epsilon_phase1_fraction
+
+    if degradation_cap_pct is not None:
+        committed = newjob_master._currentCommittedBatchFlowTimes(not_finished_jobs)
+        newjob_master.flow_time_caps = {jid: int(round(flow * (1 + degradation_cap_pct))) for jid, flow in committed.items()}
+        print(f"### ONLINE-NEWJOB-BIOBJ: objective=new_job_flow_time+energy, "
+              f"degradation_cap={degradation_cap_pct * 100:.0f}%, epsilon_fraction={epsilon_fraction}, "
+              f"phase1_fraction={epsilon_phase1_fraction}, caps={newjob_master.flow_time_caps} ###", flush=True)
+
+    newjob_master._config['solver_time_limit_s'] = solver_time_limit
+    transfers_, works_, deletions_ = schedulingUsingJavaCSP(newjob_master, jobs_to_reschedule, replicas_locations, nodes_free_time, now)
+
+    if not transfers_ or not works_:
+        return None
+
+    finish = {j.job_id: None for j in jobs_to_reschedule}
+    for key in [f'node_{i}' for i in range(nb_nodes)]:
+        for w in works_.get(key, []):
+            job_id, node_index, task_index, start_abs, end_abs, duration = w
+            if job_id in finish:
+                finish[job_id] = end_abs if finish[job_id] is None else max(finish[job_id], end_abs)
+
+    flow_by_job = {}
+    for j in master.jobs + [new_job]:
+        if j.job_id in finish and finish[j.job_id] is not None:
+            flow_by_job[j.job_id] = finish[j.job_id] - j.arriving_time
+        else:
+            cf = committed_finish_time(master, nb_nodes, j.job_id)
+            if cf is not None:
+                flow_by_job[j.job_id] = cf - j.arriving_time
+    flow_times = list(flow_by_job.values())
+    isolated_flow_times = [ft for jid, ft in flow_by_job.items() if jid in isolated_ids]
+
+    new_job_start = None
+    for key in [f'node_{i}' for i in range(nb_nodes)]:
+        for w in works_.get(key, []):
+            job_id, node_index, task_index, start_abs, end_abs, duration = w
+            if job_id == new_job.job_id:
+                new_job_start = start_abs if new_job_start is None else min(new_job_start, start_abs)
+    wait_time = (new_job_start - new_job.arriving_time) if new_job_start is not None else None
+
+    return {
+        "wait_time_new_job": wait_time,
+        "flow_time_new_job": (finish.get(new_job.job_id) - new_job.arriving_time) if finish.get(new_job.job_id) is not None else None,
+        "mean_flow_time_all": sum(flow_times) / len(flow_times) if flow_times else None,
+        "max_flow_time_all": max(flow_times) if flow_times else None,
+        "mean_flow_time_isolated": sum(isolated_flow_times) / len(isolated_flow_times) if isolated_flow_times else None,
+        "max_flow_time_isolated": max(isolated_flow_times) if isolated_flow_times else None,
+        "n_jobs_isolated": len(isolated_flow_times),
+        "jobs_to_reschedule": [j.job_id for j in jobs_to_reschedule],
+        "transfer_energy_total": compute_transfer_energy(transfers_, master),
+        "_plan": {"transfers": transfers_, "works": works_, "deletions": deletions_,
+                  "nodes_free_time": dict(nodes_free_time), "flow_by_job": flow_by_job},
+    }
+
+
 def build_warm_start_for_reconsideration(master, new_job, not_finished_jobs, nb_nodes, now, replicas_locations,
                                           new_job_placement=None):
     """Writes warm_start.json to seed Online's search with a solution AT LEAST heuristically as

@@ -271,6 +271,26 @@ def parse_args():
                               "restricted, and a job falls back to the full storage-eligible node "
                               "set if the powerful subset can't fit its dataset). "
                               "Default: unset (no restriction, identical to before this existed).")
+    parser.add_argument("--adaptive-replication-factor", action="store_true",
+                         help="ALL approaches (2026-10-08): instead of the CSP model's hardcoded "
+                              "factor=1 (Transfer_time <= factor * sum(execution_time), the "
+                              "minimum work a node must do to justify an extra replica), run a "
+                              "detrended Perturb & Observe control loop "
+                              "(controlLoopReplicationFactor, ported from "
+                              "replication-policies-simulator's controlLoopAccelerationThreshold) "
+                              "that adjusts it continuously based on observed flow time. Default: "
+                              "off (factor stays frozen at 1.0, identical to before this existed).")
+    parser.add_argument("--base-replication-factor", type=float, default=1.0,
+                         help="Starting value for --adaptive-replication-factor's control loop "
+                              "(default: 1.0, matching the prior hardcoded constant).")
+    parser.add_argument("--replication-factor-window-size", type=int, default=None,
+                         help="--adaptive-replication-factor only: jobs per control-loop window "
+                              "(default: 5, controlLoopReplicationFactor's own default) -- lower "
+                              "it on a small instance (few total jobs) so at least a few windows "
+                              "can actually fire before the run ends.")
+    parser.add_argument("--replication-factor-no-pressure-min-windows", type=int, default=None,
+                         help="--adaptive-replication-factor only: consecutive low-wait windows "
+                              "required before the no-pressure freeze engages (default: 3).")
     return parser.parse_args()
 
 
@@ -325,6 +345,12 @@ def run(args):
     config["freeze_jobs_with_ongoing_transfer"] = args.freeze_jobs_with_ongoing_transfer
     config["freeze_blocks_node_until_done"] = args.freeze_blocks_node_until_done
     config["reschedule_top_fraction"] = args.reschedule_top_fraction
+    config["adaptive_replication_factor"] = args.adaptive_replication_factor
+    config["base_replication_factor"] = args.base_replication_factor
+    if args.replication_factor_window_size is not None:
+        config["replication_factor_control_window_size"] = args.replication_factor_window_size
+    if args.replication_factor_no_pressure_min_windows is not None:
+        config["replication_factor_control_no_pressure_min_windows"] = args.replication_factor_no_pressure_min_windows
 
     results_dir = args.results_dir or os.path.join(
         SIMULATOR_DIR, "results-grid5000",

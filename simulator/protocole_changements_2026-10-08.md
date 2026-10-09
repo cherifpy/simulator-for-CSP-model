@@ -114,3 +114,4 @@ Tableau complet des 16 scénarios (ecotaxe) :
 | C_s4 | 11665.0 | 7725.0 | **7157.0** | freeze_ongoing_transfer |
 
 0 violation de stockage sur les 48 lignes (16 scénarios × 3 approches).
+

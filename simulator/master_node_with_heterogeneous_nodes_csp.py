@@ -1544,19 +1544,30 @@ class SchedulingUsingCSPAdaptiveJoint(SchedulingUsingCSPOnlineMultiObjWarmStart)
         variant_specs = {
             "freeze_below_mean": ("MainOnlineMultiObj", False, below_ids, None, False, False, None, None),
             "freeze_above_mean": ("MainOnlineMultiObj", False, above_ids, None, False, False, None, None),
-            # 2026-10-08: MainOnline.java directly, not MainOnlineMultiObj.java -- a Grid5000
-            # comparison found nofreeze landing DETERMINISTICALLY worse than an otherwise
-            # identically-configured (same budget, objective_choice=2, flow_time_caps) dedicated
-            # MainOnline.java call, reproduced identically across repeated runs (ruling out CPU-
-            # contention noise) and unaffected by removing MainOnlineMultiObj's unused-in-mono-
-            # mode energy objective var (see that fix's own commit). Root cause not isolated --
-            # this sidesteps it by using the exact class a dedicated online/online_newjob call
+            # 2026-10-08: MainOnline.java directly (mono-objective path), not MainOnlineMultiObj.java
+            # -- a Grid5000 comparison found nofreeze landing DETERMINISTICALLY worse than an
+            # otherwise identically-configured (same budget, objective_choice=2, flow_time_caps)
+            # dedicated MainOnline.java call, reproduced identically across repeated runs (ruling
+            # out CPU-contention noise) and unaffected by removing MainOnlineMultiObj's unused-in-
+            # mono-mode energy objective var (see that fix's own commit). Root cause not isolated
+            # -- this sidesteps it by using the exact class a dedicated online/online_newjob call
             # already uses, instead of a nominally-equivalent sibling class that measurably isn't.
             # MainOnline.java already reads objective_choice.txt/flow_time_caps.txt/
             # frozen_jobs.txt the same way, so this is a drop-in swap for the "nofreeze" semantics
-            # (cold search, nothing frozen, no multi-objective mode -- which nofreeze never used
-            # anyway).
-            "nofreeze": ("MainOnline", False, [], None, False, False, None, None),
+            # (cold search, nothing frozen) in mono-objective mode.
+            #
+            # 2026-10-09 fix: the swap above silently broke bi-objective mode -- MainOnline.java
+            # has NO epsilon-constraint/multi_objective code at all, so when bi_objective=True,
+            # "nofreeze" was running a PURE mono-objective (flow-time-only) solve regardless,
+            # never minimizing energy in a phase 2 at all, while a dedicated
+            # run_online_newjob_biobj_style call genuinely does via MainOnlineMultiObj.java. This
+            # explained the systematic pattern found comparing them (nofreeze always winning on
+            # flow time -- no energy phase to trade off against -- and always losing on energy --
+            # never deliberately minimized). Route back to MainOnlineMultiObj specifically when
+            # bi_objective is on, so "nofreeze" stays a true equivalent of the dedicated
+            # online_newjob(_biobj) call in BOTH modes; the mono-objective fix above is preserved
+            # untouched when bi_objective is off.
+            "nofreeze": ("MainOnlineMultiObj" if bi_objective else "MainOnline", False, [], None, False, False, None, None),
             "warm_nofreeze": (self.escalation_java_main_class, True, [], None, False, False, None, None),
             "freeze_ongoing_transfer": ("MainOnlineMultiObj", False, ongoing_transfer_ids, None, False, False, None, None),
             # greedy_hints (2026-10-06): re-enables MainOnlineMultiObj.java's pre-existing
@@ -2380,4 +2391,239 @@ class SchedulingUsingCSPSemiOnline:
             )
 
             if compute_node.node_id in self.actual_transfers.keys(): del self.actual_transfers[self.compute_nodes[compute_node.node_id].node_id]
+
+
+def controlLoopReplicationFactor(master_node, window_size=None, alpha_initial=None, alpha_min=None,
+                                  alpha_max=None, gamma_up=None, gamma_down=None,
+                                  min_factor=None, max_factor=None,
+                                  epsilon_abs=None, epsilon_rel=None,
+                                  trend_window=None, initial_direction=None,
+                                  dead_zone_freeze=None, use_detrending=None, detrend_signal_mode=None,
+                                  no_pressure_threshold=None, no_pressure_min_windows=None,
+                                  regime_detection=None, regime_window=None, regime_multiplier=None,
+                                  metric=None):
+    """Perturb & Observe (extremum-seeking) controller for the CSP model's `factor` -- the
+    hardcoded-1 multiplier in MainOnline/MainIncremental/MainOnlineMultiObj(WarmStart).java's
+    "Transfer_time <= factor * sum(execution_time)" constraint (how much execution work a node
+    must do to justify holding an extra replica: larger factor = stricter = less aggressive
+    replication). Ported from replication-policies-simulator's
+    simulator/utils/classifier.py:controlLoopAccelerationThreshold (its 3rd, bug-fixed iteration
+    -- see that file's docstring for the dead-zone/CUSUM/detrending bugs it fixes), targeting
+    `master_node.replication_factor` (read by schedulingUsingJavaCSP into replication_factor.txt,
+    then by the Java side) instead of that project's `_config['acceleration_threshold']` (which
+    feeds a different, non-CSP utility-score heuristic there). "Free nodes" uses this project's
+    own _idleNodeIds() where the source used select_availables_nodes(k=-1) -- same notion (no
+    active transfer, no active task right now), different name.
+
+    J_k = mean flow_time of the last `window_size` jobs to finish, read from
+    master_node.tracker.stats_on_jobs. The controller only moves while there is real queueing
+    pressure (no_pressure guard) and reacts to the DETRENDED residual (J_k minus a linear
+    projection from the recent trend_window) rather than raw J_k, so it isn't fooled by workload
+    growing/shrinking on its own -- see the source file's docstring for why that distinction
+    matters empirically.
+    """
+    window_size = window_size if window_size is not None else master_node._config.get('replication_factor_control_window_size', 5)
+    alpha_initial = alpha_initial if alpha_initial is not None else master_node._config.get('replication_factor_control_alpha0', 0.3)
+    alpha_min = alpha_min if alpha_min is not None else master_node._config.get('replication_factor_control_alpha_min', 0.02)
+    alpha_max = alpha_max if alpha_max is not None else master_node._config.get('replication_factor_control_alpha_max', 1.5)
+    gamma_up = gamma_up if gamma_up is not None else master_node._config.get('replication_factor_control_gamma_up', 1.12)
+    gamma_down = gamma_down if gamma_down is not None else master_node._config.get('replication_factor_control_gamma_down', 0.5)
+    min_factor = min_factor if min_factor is not None else master_node._config.get('replication_factor_control_min', 0.01)
+    max_factor = max_factor if max_factor is not None else master_node._config.get(
+        'replication_factor_control_max', master_node._config.get('max_replication_factor', 16.0))
+    epsilon_abs = epsilon_abs if epsilon_abs is not None else master_node._config.get('replication_factor_control_epsilon_abs', 1.0)
+    epsilon_rel = epsilon_rel if epsilon_rel is not None else master_node._config.get('replication_factor_control_epsilon_rel', 0.05)
+    trend_window = trend_window if trend_window is not None else master_node._config.get('replication_factor_control_trend_window', 5)
+    initial_direction = initial_direction if initial_direction is not None else master_node._config.get(
+        'replication_factor_control_initial_direction', 1)
+    dead_zone_freeze = dead_zone_freeze if dead_zone_freeze is not None else master_node._config.get(
+        'replication_factor_control_dead_zone_freeze', True)
+    use_detrending = use_detrending if use_detrending is not None else master_node._config.get(
+        'replication_factor_control_use_detrending', True)
+    detrend_signal_mode = detrend_signal_mode if detrend_signal_mode is not None else master_node._config.get(
+        'replication_factor_control_detrend_signal_mode', 'residual')
+    no_pressure_threshold = no_pressure_threshold if no_pressure_threshold is not None else master_node._config.get(
+        'replication_factor_control_no_pressure_threshold', 1.0)
+    no_pressure_min_windows = no_pressure_min_windows if no_pressure_min_windows is not None else master_node._config.get(
+        'replication_factor_control_no_pressure_min_windows', 3)
+    regime_detection = regime_detection if regime_detection is not None else master_node._config.get(
+        'replication_factor_control_regime_detection', True)
+    regime_window = regime_window if regime_window is not None else master_node._config.get('replication_factor_control_regime_window', 8)
+    regime_multiplier = regime_multiplier if regime_multiplier is not None else master_node._config.get(
+        'replication_factor_control_regime_multiplier', 4.0)
+    metric = metric if metric is not None else master_node._config.get('replication_factor_control_metric', 'flow_time')
+
+    def _finished():
+        # NOTE: this project's own `all_jobs` dict (unlike replication-policies-simulator's) is
+        # initialized and never written to anywhere -- always {} -- so `len(master_node.jobs)`
+        # (the live list every arriving job is appended to, see schedulingNewJob/receiveJobs) is
+        # used instead, matching the same termination check already used by
+        # SchedulingUsingCSPSemiOnline elsewhere in this file.
+        return (master_node.finished_jobs == master_node._config['total_nb_jobs']
+                and len(master_node.waiting_jobs) == 0
+                and len(master_node.jobs) == master_node._config['total_nb_jobs']
+                and len(master_node.tracker.ongoing_tasks) == 0
+                and len(master_node.queue.items) == 0
+                and all(len(n.queue.items) == 0 for n in master_node.compute_nodes))
+
+    def _trimmed_mean(values, trim=0.1):
+        values = sorted(values)
+        k = int(len(values) * trim)
+        core = values[k: len(values) - k] if len(values) - 2 * k > 0 else values
+        return float(np.mean(core))
+
+    def _fit_trend_and_predict(history, k_index):
+        """Linear regression on `history` (consecutive indices ending right before k_index),
+        extrapolated to k_index -- OUT-OF-SAMPLE prediction (uses no information about J_k
+        itself)."""
+        m = len(history)
+        idx = np.arange(k_index - m, k_index)
+        b, a = np.polyfit(idx, history, 1)  # J ~ a + b*i
+        return a + b * k_index
+
+    base_factor = master_node._config.get('base_replication_factor', 1.0)
+    master_node.replication_factor = base_factor
+    factor = base_factor
+    alpha = alpha_initial
+    direction = 0  # neutral at start -- initial_direction is only taken on the first real move
+    J_history = []          # raw J_k, to fit the trend
+    residual_history = []   # residuals (or raw dJ if use_detrending=False), for the regime detector
+    residual_scale_ewma = None
+    recent_waits = []
+    n_seen = 0
+    k = 0  # window index (for the regression on consecutive indices)
+    history_log = []  # exposed for analysis/plots: (env.now, k, factor, J_k, Jhat_k, residual, signal, direction, alpha)
+
+    def _reexplore_burst(candidates):
+        """Short re-exploration burst (3 points spaced around the current factor) -- reuses the
+        explore-then-commit spirit but bounded to 3 windows, triggered only by the regime
+        detector (rare)."""
+        nonlocal factor
+        best_c, best_j = factor, float('inf')
+        for c in candidates:
+            c = min(max_factor, max(min_factor, c))
+            master_node.replication_factor = c
+            n_before = len(master_node.tracker.stats_on_jobs)
+            while len(master_node.tracker.stats_on_jobs) - n_before < window_size:
+                yield master_node.env.timeout(1)
+                if _finished():
+                    return
+            flows = [j['finishing_time'] - j['arriving_time']
+                     for j in master_node.tracker.stats_on_jobs[n_before:n_before + window_size]]
+            j_c = _trimmed_mean(flows)
+            if j_c < best_j:
+                best_c, best_j = c, j_c
+        factor = best_c
+        master_node.replication_factor = factor
+
+    while True:
+        yield master_node.env.timeout(1)  # fine granularity -- act as soon as a window is ready
+
+        if _finished():
+            break
+
+        all_jobs = master_node.tracker.stats_on_jobs
+        while len(all_jobs) - n_seen >= window_size:
+            window = all_jobs[n_seen: n_seen + window_size]
+            n_seen += window_size
+            k += 1
+
+            waits = [j['starting_time'] - j['arriving_time'] for j in window]
+            if metric == 'waiting_time':
+                J_k = _trimmed_mean(waits)
+            else:
+                flow_times = [j['finishing_time'] - j['arriving_time'] for j in window]
+                J_k = _trimmed_mean(flow_times)
+            wait_k = _trimmed_mean(waits)
+
+            recent_waits.append(wait_k)
+            recent_waits = recent_waits[-no_pressure_min_windows:]
+
+            # --- no-pressure guard: nothing to optimize, don't explore blindly. ---
+            if len(recent_waits) >= no_pressure_min_windows and max(recent_waits) < no_pressure_threshold:
+                direction = 0
+                alpha = alpha_initial
+                J_history.append(J_k)
+                J_history = J_history[-(trend_window + regime_window + 2):]
+                history_log.append((master_node.env.now, k, factor, J_k, None, None, direction, alpha))
+                continue
+
+            J_history.append(J_k)
+            J_history = J_history[-(trend_window + regime_window + 2):]
+
+            if use_detrending:
+                if len(J_history) < trend_window + 1:
+                    history_log.append((master_node.env.now, k, factor, J_k, None, None, direction, alpha))
+                    continue
+                fit_history = J_history[-(trend_window + 1):-1]
+                Jhat_k = _fit_trend_and_predict(fit_history, k)
+                residual = J_k - Jhat_k
+            else:
+                Jhat_k = J_history[-2] if len(J_history) >= 2 else None
+                if Jhat_k is None:
+                    history_log.append((master_node.env.now, k, factor, J_k, None, None, direction, alpha))
+                    continue
+                residual = J_k - Jhat_k
+
+            residual_history.append(residual)
+            residual_history = residual_history[-(regime_window + 1):]
+            residual_scale_ewma = (
+                abs(residual) if residual_scale_ewma is None
+                else 0.1 * abs(residual) + 0.9 * residual_scale_ewma
+            )
+
+            if detrend_signal_mode == 'diff_residual' and len(residual_history) >= 2:
+                signal = residual_history[-1] - residual_history[-2]
+            else:
+                signal = residual
+
+            # --- regime-change detection, on the (already detrended) residual. ---
+            if (regime_detection and len(residual_history) >= regime_window
+                    and residual_scale_ewma and residual_scale_ewma > 1e-6):
+                recent_mean = float(np.mean(residual_history[-regime_window:]))
+                if abs(recent_mean) > regime_multiplier * residual_scale_ewma:
+                    logger.info(f"[REPLICATION-FACTOR-P&O] regime change detected "
+                                f"(mean residual={recent_mean:.2f}, scale={residual_scale_ewma:.2f}) "
+                                f"-- re-exploration burst")
+                    yield from _reexplore_burst([factor / 3, factor, factor * 3])
+                    J_history, residual_history, residual_scale_ewma = [], [], None
+                    direction, alpha = 0, alpha_initial
+                    continue
+
+            epsilon = epsilon_abs + epsilon_rel * abs(J_k)
+
+            if abs(signal) < epsilon:
+                if dead_zone_freeze:
+                    direction = 0
+                    alpha = alpha_initial
+                    # factor unchanged
+                else:
+                    if direction == 0:
+                        direction = initial_direction
+                    alpha = min(alpha_max, gamma_up * alpha)
+                    factor = min(max_factor, max(min_factor, factor + direction * alpha))
+                    master_node.replication_factor = factor
+            elif signal < 0:  # improvement: observed cost below what the trend predicted
+                if direction == 0:
+                    direction = initial_direction
+                alpha = min(alpha_max, gamma_up * alpha)
+                factor = min(max_factor, max(min_factor, factor + direction * alpha))
+                master_node.replication_factor = factor
+            else:  # degradation: observed cost above the predicted trend
+                direction = -direction if direction != 0 else -initial_direction
+                alpha = max(alpha_min, gamma_down * alpha)
+                factor = min(max_factor, max(min_factor, factor + direction * alpha))
+                master_node.replication_factor = factor
+
+            master_node.tracker.log_threshold(factor, signal=signal, raw_signal=J_k)
+            history_log.append((master_node.env.now, k, factor, J_k, Jhat_k, residual, direction, alpha))
+
+            logger.debug(
+                f"[REPLICATION-FACTOR-P&O] J_k={J_k:.2f} Jhat_k={Jhat_k if Jhat_k is None else round(Jhat_k, 2)} "
+                f"residual={residual:.2f} signal={signal:.2f} eps={epsilon:.2f} "
+                f"dir={direction:+d} alpha={alpha:.3f} factor->{factor:.3f}"
+            )
+
+    master_node.replication_factor_control_history = history_log
+    master_node.tracker.replication_factor_control_history = history_log
 

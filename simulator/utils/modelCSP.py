@@ -629,6 +629,20 @@ def _schedulingUsingJavaCSP_impl(master_node, jobs: list, replicas_locations: di
         else:
             f.write("")
 
+    # Optional: dynamic replacement for the CSP's hardcoded "factor" (Transfer_time <= factor *
+    # sum(execution_time)" -- the minimum execution work a node must do to justify holding an
+    # extra replica). Written when a caller opts in via master_node.replication_factor (set by
+    # controlLoopReplicationFactor below, ported from replication-policies-simulator's
+    # controlLoopAccelerationThreshold); absent otherwise, so every existing caller keeps the
+    # prior hardcoded-1.0 behavior untouched (the Java side defaults to 1.0 when this is empty).
+    replication_factor = getattr(master_node, 'replication_factor', None)
+    replication_factor_path = os.path.join(model_dir, "inputs", "replication_factor.txt")
+    with open(replication_factor_path, "w") as f:
+        if replication_factor is not None:
+            f.write(str(float(replication_factor)))
+        else:
+            f.write("")
+
     # Java only ever works in a LOCAL frame (0 = "now" for this solve) -- it has no idea what
     # the simulator's absolute clock reads. Pass it along purely so debug prints can show
     # absolute times directly comparable to the final solution's "start:"/"end:" values.

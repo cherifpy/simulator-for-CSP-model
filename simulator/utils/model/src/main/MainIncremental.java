@@ -703,7 +703,20 @@ public class MainIncremental {
                     nb_transfers[i][j] = transferHeights[j][i].intVar();
                 }
             }
-            int factor = 1;
+            // 2026-10-08: factor made dynamic -- read from replication_factor.txt (written by
+            // the Python-side control loop, controlLoopReplicationFactor, ported from
+            // replication-policies-simulator's controlLoopAccelerationThreshold) instead of a
+            // hardcoded 1. Controls how much execution work a node must do to justify holding an
+            // extra replica (Transfer_time <= factor * sum(execution_time)): a LARGER factor is
+            // STRICTER (less aggressive replication), factor<=0 disables the constraint entirely
+            // (unrestricted replication) -- same as before, just no longer frozen at exactly 1.
+            double factor = 1.0;
+            try {
+                String factorText = readFile(MODEL_INPUTS_DIR + "/replication_factor.txt").trim();
+                if (!factorText.isEmpty()) factor = Double.parseDouble(factorText);
+            } catch (Exception e) {
+                // File missing/unreadable: keep the default (1.0, matches prior hardcoded behavior).
+            }
             for (int i = 0; i < nb_data; i++) {
                 int[] wl = works[i];
                 IntVar[] counters = new IntVar[nb_nodes];
@@ -728,7 +741,7 @@ public class MainIncremental {
                     model.sum(nb_transfers[i], "=", transfers_counter).post();
                     BoolVar h = transfers_counter.gt(1).and(transferHeights[j][i]).boolVar();
                     int transferTime = (int) Math.ceil((double) data_sizes[i] / bandwidths[j]);
-                    model.sum(executions, ">=", model.intView(transferTime * factor, h, 0)).post();
+                    model.sum(executions, ">=", model.intView((int) Math.round(transferTime * factor), h, 0)).post();
                     //counters[j].gt(1).imp(exe).post();
                 }
 

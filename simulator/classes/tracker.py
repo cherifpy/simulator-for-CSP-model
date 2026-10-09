@@ -144,6 +144,8 @@ class Tracker:
 
         logger.debug("[%s] Job %s finished.", self.env.now, job_id)
         #print(f"Job {job_id} stats: nb_tasks={nb_task}, dataset_size={dataset_size}, arriving_time={arriving_time}, starting_time={start_time}, finishing_time={end_time}, transfert_time={transfert_time}, task_execution_time={task_execution_time}, nb_replicas={nb_replicas}")
-    def log_threshold(self, theta):
-        self.threshold_history.append({"time": self.env.now, "theta": theta})
+    def log_threshold(self, theta, signal=None, raw_signal=None):
+        self.threshold_history.append({
+            "time": self.env.now, "theta": theta, "signal": signal, "raw_signal": raw_signal,
+        })
         

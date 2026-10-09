@@ -6,7 +6,7 @@ import simpy
 import pandas as pd
 from compute_node import ComputeNode
 from classes.job import Job
-from master_node_with_heterogeneous_nodes_csp import SchedulingUsingCSPOnline,SchedulingUsingCSPSemiOnline,SchedulingUsingCSPIncremental
+from master_node_with_heterogeneous_nodes_csp import SchedulingUsingCSPOnline,SchedulingUsingCSPSemiOnline,SchedulingUsingCSPIncremental,controlLoopReplicationFactor
 from utils.plots import plot_gantt_chart
 from classes.tracker import Tracker
 
@@ -148,12 +148,19 @@ def simulatorForOptimalPerfsUsingCSPOnline(config,jobs=[], overlap = False, thre
     env.process(master.schedulingNewJob())
     env.process(master.scheduling())
     env.process(master.checkOnJobs())
-    
+
     master.compute_nodes = compute_nodes
     master.nb_nodes = len(compute_nodes)
-    
+
     for node in compute_nodes:
         env.process(node.processTasks())
+
+    # Opt-in: dynamic replication_factor (CSP model's "factor" -- see
+    # master_node_with_heterogeneous_nodes_csp.controlLoopReplicationFactor's own docstring)
+    # instead of the hardcoded 1.0 the Java side falls back to when replication_factor.txt is
+    # empty. Off by default so every existing caller is unaffected.
+    if config.get('adaptive_replication_factor', False):
+        env.process(controlLoopReplicationFactor(master))
 
     if poisson:   
         env.process(jobsInjectorBasedOnLambdaPoisson(env, master, job_file_path=config['jobs_file_path'], lambda_rate=config['lambda_rate']))        
