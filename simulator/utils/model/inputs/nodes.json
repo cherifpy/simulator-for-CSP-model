@@ -1,402 +1,162 @@
 [
     {
         "node_id":0,
-        "bandwidth":572.0,
-        "compute_capacity":3.23388,
-        "free_time":439,
-        "storage_capacity":471461,
-        "energy_consumption":0.4324288711
+        "bandwidth":388.0,
+        "compute_capacity":6.241469,
+        "free_time":0,
+        "storage_capacity":14243,
+        "energy_consumption":1.53742539
     },
     {
         "node_id":1,
-        "bandwidth":229.0,
-        "compute_capacity":6.756101,
+        "bandwidth":106.0,
+        "compute_capacity":9.305659,
         "free_time":0,
-        "storage_capacity":150890,
-        "energy_consumption":0.4836476423
+        "storage_capacity":13155,
+        "energy_consumption":1.5417246523
     },
     {
         "node_id":2,
-        "bandwidth":754.0,
-        "compute_capacity":9.558388,
-        "free_time":0,
-        "storage_capacity":8610,
-        "energy_consumption":1.4996763559
+        "bandwidth":675.0,
+        "compute_capacity":3.571168,
+        "free_time":228,
+        "storage_capacity":16946,
+        "energy_consumption":0.5053965955
     },
     {
         "node_id":3,
-        "bandwidth":406.0,
-        "compute_capacity":3.67279,
-        "free_time":0,
-        "storage_capacity":231555,
-        "energy_consumption":1.7691977312
+        "bandwidth":132.0,
+        "compute_capacity":9.534777,
+        "free_time":100,
+        "storage_capacity":26098,
+        "energy_consumption":0.8577997951
     },
     {
         "node_id":4,
-        "bandwidth":117.0,
-        "compute_capacity":1.858104,
-        "free_time":0,
-        "storage_capacity":70883,
-        "energy_consumption":1.3292943119
+        "bandwidth":566.0,
+        "compute_capacity":6.472987,
+        "free_time":320,
+        "storage_capacity":24165,
+        "energy_consumption":0.6165161126
     },
     {
         "node_id":5,
-        "bandwidth":622.0,
-        "compute_capacity":7.180274,
+        "bandwidth":458.0,
+        "compute_capacity":9.199515,
         "free_time":0,
-        "storage_capacity":442627,
-        "energy_consumption":0.7476210184
+        "storage_capacity":7689,
+        "energy_consumption":0.6005561144
     },
     {
         "node_id":6,
-        "bandwidth":593.0,
-        "compute_capacity":9.666003,
+        "bandwidth":127.0,
+        "compute_capacity":7.007046,
         "free_time":0,
-        "storage_capacity":65583,
-        "energy_consumption":0.1107398124
+        "storage_capacity":5682,
+        "energy_consumption":0.8790626946
     },
     {
         "node_id":7,
-        "bandwidth":74.0,
-        "compute_capacity":1.82869,
-        "free_time":0,
-        "storage_capacity":336643,
-        "energy_consumption":1.7829122834
+        "bandwidth":204.0,
+        "compute_capacity":5.35255,
+        "free_time":736,
+        "storage_capacity":17202,
+        "energy_consumption":2.0218390599
     },
     {
         "node_id":8,
-        "bandwidth":89.0,
-        "compute_capacity":6.394361,
-        "free_time":0,
-        "storage_capacity":425079,
-        "energy_consumption":0.2767606972
+        "bandwidth":351.0,
+        "compute_capacity":1.684201,
+        "free_time":59,
+        "storage_capacity":8553,
+        "energy_consumption":0.6910734054
     },
     {
         "node_id":9,
-        "bandwidth":509.0,
-        "compute_capacity":8.758483,
+        "bandwidth":584.0,
+        "compute_capacity":5.023593,
         "free_time":0,
-        "storage_capacity":120398,
-        "energy_consumption":0.4164858792
+        "storage_capacity":8844,
+        "energy_consumption":1.0532753563
     },
     {
         "node_id":10,
-        "bandwidth":444.0,
-        "compute_capacity":9.508278,
+        "bandwidth":424.0,
+        "compute_capacity":3.326369,
         "free_time":0,
-        "storage_capacity":404400,
-        "energy_consumption":0.582343269
+        "storage_capacity":6018,
+        "energy_consumption":1.1154993814
     },
     {
         "node_id":11,
-        "bandwidth":703.0,
-        "compute_capacity":7.218366,
+        "bandwidth":670.0,
+        "compute_capacity":7.556088,
         "free_time":0,
-        "storage_capacity":507784,
-        "energy_consumption":0.7691388881
+        "storage_capacity":2649,
+        "energy_consumption":1.424843784
     },
     {
         "node_id":12,
-        "bandwidth":749.0,
-        "compute_capacity":2.455055,
-        "free_time":0,
-        "storage_capacity":308769,
-        "energy_consumption":1.7584473834
+        "bandwidth":694.0,
+        "compute_capacity":2.337815,
+        "free_time":198,
+        "storage_capacity":13964,
+        "energy_consumption":0.8358520866
     },
     {
         "node_id":13,
-        "bandwidth":253.0,
-        "compute_capacity":3.218931,
-        "free_time":0,
-        "storage_capacity":32807,
-        "energy_consumption":0.6767108079
+        "bandwidth":158.0,
+        "compute_capacity":1.396614,
+        "free_time":155,
+        "storage_capacity":11630,
+        "energy_consumption":0.5257635177
     },
     {
         "node_id":14,
-        "bandwidth":89.0,
-        "compute_capacity":1.661252,
-        "free_time":0,
-        "storage_capacity":295173,
-        "energy_consumption":1.3432888141
+        "bandwidth":710.0,
+        "compute_capacity":2.827731,
+        "free_time":207,
+        "storage_capacity":16954,
+        "energy_consumption":0.2210734385
     },
     {
         "node_id":15,
-        "bandwidth":557.0,
-        "compute_capacity":4.434069,
-        "free_time":1039,
-        "storage_capacity":500913,
-        "energy_consumption":1.3264576747
+        "bandwidth":90.0,
+        "compute_capacity":3.040214,
+        "free_time":0,
+        "storage_capacity":9675,
+        "energy_consumption":0.8442481383
     },
     {
         "node_id":16,
-        "bandwidth":138.0,
-        "compute_capacity":7.435278,
+        "bandwidth":215.0,
+        "compute_capacity":1.431608,
         "free_time":0,
-        "storage_capacity":337403,
-        "energy_consumption":0.7492782343
+        "storage_capacity":4805,
+        "energy_consumption":2.0093469368
     },
     {
         "node_id":17,
-        "bandwidth":448.0,
-        "compute_capacity":6.921498,
+        "bandwidth":581.0,
+        "compute_capacity":6.329425,
         "free_time":0,
-        "storage_capacity":381204,
-        "energy_consumption":0.7626311646
+        "storage_capacity":6154,
+        "energy_consumption":1.8780916277
     },
     {
         "node_id":18,
-        "bandwidth":598.0,
-        "compute_capacity":4.997667,
+        "bandwidth":486.0,
+        "compute_capacity":2.725929,
         "free_time":0,
-        "storage_capacity":325016,
-        "energy_consumption":0.8940265721
+        "storage_capacity":15054,
+        "energy_consumption":0.777835638
     },
     {
         "node_id":19,
-        "bandwidth":624.0,
-        "compute_capacity":5.138406,
-        "free_time":1317,
-        "storage_capacity":422457,
-        "energy_consumption":0.2788784255
-    },
-    {
-        "node_id":20,
-        "bandwidth":38.0,
-        "compute_capacity":1.229147,
-        "free_time":0,
-        "storage_capacity":38522,
-        "energy_consumption":1.1524766906
-    },
-    {
-        "node_id":21,
-        "bandwidth":418.0,
-        "compute_capacity":7.640389,
-        "free_time":0,
-        "storage_capacity":64894,
-        "energy_consumption":0.221406352
-    },
-    {
-        "node_id":22,
-        "bandwidth":309.0,
-        "compute_capacity":3.813626,
-        "free_time":0,
-        "storage_capacity":261958,
-        "energy_consumption":1.205122602
-    },
-    {
-        "node_id":23,
-        "bandwidth":265.0,
-        "compute_capacity":7.565082,
-        "free_time":0,
-        "storage_capacity":219462,
-        "energy_consumption":1.7721701882
-    },
-    {
-        "node_id":24,
-        "bandwidth":243.0,
-        "compute_capacity":6.895675,
-        "free_time":0,
-        "storage_capacity":201519,
-        "energy_consumption":1.8626469533
-    },
-    {
-        "node_id":25,
-        "bandwidth":319.0,
-        "compute_capacity":6.004179,
-        "free_time":0,
-        "storage_capacity":85947,
-        "energy_consumption":1.2331786816
-    },
-    {
-        "node_id":26,
-        "bandwidth":660.0,
-        "compute_capacity":5.421867,
-        "free_time":0,
-        "storage_capacity":492810,
-        "energy_consumption":0.9630177835
-    },
-    {
-        "node_id":27,
-        "bandwidth":491.0,
-        "compute_capacity":9.581908,
-        "free_time":0,
-        "storage_capacity":233396,
-        "energy_consumption":1.0411218561
-    },
-    {
-        "node_id":28,
-        "bandwidth":372.0,
-        "compute_capacity":5.440176,
-        "free_time":0,
-        "storage_capacity":15084,
-        "energy_consumption":1.2983623665
-    },
-    {
-        "node_id":29,
-        "bandwidth":573.0,
-        "compute_capacity":6.567502,
-        "free_time":0,
-        "storage_capacity":194439,
-        "energy_consumption":1.7487806129
-    },
-    {
-        "node_id":30,
-        "bandwidth":164.0,
-        "compute_capacity":8.318983,
-        "free_time":0,
-        "storage_capacity":133830,
-        "energy_consumption":0.4330804486
-    },
-    {
-        "node_id":31,
-        "bandwidth":738.0,
-        "compute_capacity":9.474609,
-        "free_time":0,
-        "storage_capacity":179996,
-        "energy_consumption":1.8452609901
-    },
-    {
-        "node_id":32,
-        "bandwidth":799.0,
-        "compute_capacity":7.925058,
-        "free_time":0,
-        "storage_capacity":82707,
-        "energy_consumption":1.850892149
-    },
-    {
-        "node_id":33,
-        "bandwidth":118.0,
-        "compute_capacity":7.079432,
-        "free_time":0,
-        "storage_capacity":72958,
-        "energy_consumption":0.8589967407
-    },
-    {
-        "node_id":34,
-        "bandwidth":92.0,
-        "compute_capacity":4.425774,
-        "free_time":0,
-        "storage_capacity":528591,
-        "energy_consumption":1.4576415299
-    },
-    {
-        "node_id":35,
-        "bandwidth":575.0,
-        "compute_capacity":2.613102,
-        "free_time":0,
-        "storage_capacity":215394,
-        "energy_consumption":0.9423421444
-    },
-    {
-        "node_id":36,
-        "bandwidth":354.0,
-        "compute_capacity":3.330273,
-        "free_time":0,
-        "storage_capacity":309674,
-        "energy_consumption":1.5004532685
-    },
-    {
-        "node_id":37,
-        "bandwidth":172.0,
-        "compute_capacity":5.011554,
-        "free_time":0,
-        "storage_capacity":147229,
-        "energy_consumption":1.783367345
-    },
-    {
-        "node_id":38,
-        "bandwidth":58.0,
-        "compute_capacity":9.321111,
-        "free_time":0,
-        "storage_capacity":318770,
-        "energy_consumption":0.7243775126
-    },
-    {
-        "node_id":39,
-        "bandwidth":313.0,
-        "compute_capacity":8.657002,
-        "free_time":0,
-        "storage_capacity":159696,
-        "energy_consumption":0.8048664446
-    },
-    {
-        "node_id":40,
-        "bandwidth":668.0,
-        "compute_capacity":8.643518,
-        "free_time":0,
-        "storage_capacity":527730,
-        "energy_consumption":1.2454270938
-    },
-    {
-        "node_id":41,
-        "bandwidth":800.0,
-        "compute_capacity":1.456525,
-        "free_time":734,
-        "storage_capacity":296796,
-        "energy_consumption":1.3635287687
-    },
-    {
-        "node_id":42,
-        "bandwidth":499.0,
-        "compute_capacity":2.639352,
-        "free_time":0,
-        "storage_capacity":259326,
-        "energy_consumption":1.4091355859
-    },
-    {
-        "node_id":43,
-        "bandwidth":778.0,
-        "compute_capacity":1.393712,
-        "free_time":743,
-        "storage_capacity":526560,
-        "energy_consumption":1.0835949315
-    },
-    {
-        "node_id":44,
-        "bandwidth":582.0,
-        "compute_capacity":1.350958,
-        "free_time":826,
-        "storage_capacity":410389,
-        "energy_consumption":0.4278279477
-    },
-    {
-        "node_id":45,
-        "bandwidth":99.0,
-        "compute_capacity":1.740666,
-        "free_time":0,
-        "storage_capacity":377040,
-        "energy_consumption":1.2810769083
-    },
-    {
-        "node_id":46,
-        "bandwidth":19.0,
-        "compute_capacity":3.862078,
-        "free_time":0,
-        "storage_capacity":328849,
-        "energy_consumption":1.3996872574
-    },
-    {
-        "node_id":47,
-        "bandwidth":782.0,
-        "compute_capacity":6.068085,
-        "free_time":0,
-        "storage_capacity":372373,
-        "energy_consumption":0.4638855152
-    },
-    {
-        "node_id":48,
-        "bandwidth":295.0,
-        "compute_capacity":5.092962,
-        "free_time":0,
-        "storage_capacity":195528,
-        "energy_consumption":0.3999981406
-    },
-    {
-        "node_id":49,
-        "bandwidth":401.0,
-        "compute_capacity":4.543557,
-        "free_time":1329,
-        "storage_capacity":527011,
-        "energy_consumption":2.0281483953
+        "bandwidth":641.0,
+        "compute_capacity":7.333941,
+        "free_time":764,
+        "storage_capacity":24148,
+        "energy_consumption":0.6910730932
     }
 ]

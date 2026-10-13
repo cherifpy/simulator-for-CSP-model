@@ -278,7 +278,7 @@ def parse_args():
     return args
 
 
-def build_state_a(config, args, results_dir, tier_name, size_range, tier_index):
+def build_state_a(config, args, results_dir, tier_name, size_range, tier_index, use_raw_dataset_size=False):
     """Builds state A as ONE direct joint CSP solve over all --n-existing jobs at once (their
     real dataset_size/nb_tasks/task_duration/arriving_time), with node free times at 0 and no
     pre-existing replicas -- a genuine one-shot "offline" placement, not a replay of N sequential
@@ -290,7 +290,15 @@ def build_state_a(config, args, results_dir, tier_name, size_range, tier_index):
     master.env.now, so solving at env.now=T would wrongly anchor every job to start at-or-after T,
     making nothing ever appear already finished by the freeze point. Only after solving is env.now
     advanced to T (via env.run(until=T) with no processes registered, so SimPy just advances the
-    clock) for the new job's own arrival and the final solve."""
+    clock) for the new job's own arrival and the final solve.
+
+    use_raw_dataset_size (2026-10-10, default False -- every existing caller keeps the original
+    behavior untouched): when True, each existing job keeps its OWN dataset_size exactly as
+    written in jobs.json instead of being redrawn uniformly from size_range (size_range is then
+    unused for existing jobs). Added for rl-escalation-policy's real-trace-driven scenarios,
+    where jobs.json's sizes are already real/representative data and a uniform redraw would
+    silently discard them -- found when a 5194MB real job's dataset_size turned into ~399105MB
+    (a uniform draw from an unrelated synthetic size_range) partway through a training episode."""
     with open(os.path.join(args.instance_dir, "jobs.json")) as f:
         all_jobs_raw = json.load(f)
     existing_jobs_raw = all_jobs_raw[:args.n_existing]
@@ -360,7 +368,7 @@ def build_state_a(config, args, results_dir, tier_name, size_range, tier_index):
     job_size_rng = random.Random(args.seed * 2000 + tier_index)
     existing_jobs = []
     for raw in existing_jobs_raw:
-        dataset_size = job_size_rng.randint(*size_range)
+        dataset_size = raw["dataset_size"] if use_raw_dataset_size else job_size_rng.randint(*size_range)
         j = Job(raw["job_id"], raw["task_duration"], raw["nb_tasks"], dataset_size)
         j.arriving_time = raw["arriving_time"]
         existing_jobs.append(j)

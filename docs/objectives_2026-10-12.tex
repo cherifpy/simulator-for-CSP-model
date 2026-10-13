@@ -1,0 +1,120 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath, amssymb}
+\usepackage[margin=2.5cm]{geometry}
+\title{Objectifs CSP~: Incremental, Online, Hybrid-n\_j}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Notation commune}
+
+Pour un ensemble de jobs $\mathcal{J} = \{1, \dots, n\}$ à (re)placer dans un solve donné, et pour
+chaque job $i \in \mathcal{J}$~:
+
+\begin{itemize}
+  \item $\mathrm{end}_i$ = instant de fin de la dernière tâche de $i$ (variable de décision,
+        dépend du placement choisi sur les nœuds)~;
+  \item $e_i$ = \texttt{timelapsed}, le temps déjà écoulé pour $i$ à travers les replans
+        précédents (constante, connue avant le solve)~;
+  \item $\mathrm{flow}_i = \mathrm{end}_i + e_i$ — le \emph{flow time} du job $i$, intégrant le
+        temps d'attente déjà subi, pas seulement le temps d'exécution de ce solve.
+\end{itemize}
+
+Trois objectifs scalaires sont construits à partir de $\{\mathrm{flow}_i\}_{i \in \mathcal{J}}$~:
+
+\begin{align}
+  \text{(sum)} \quad && F_{\mathrm{sum}} &= \sum_{i \in \mathcal{J}} \mathrm{flow}_i \\
+  \text{(max)} \quad && F_{\mathrm{max}} &= \max_{i \in \mathcal{J}} \mathrm{flow}_i \\
+  \text{(new job)} \quad && F_{\mathrm{new}} &= \mathrm{flow}_{i^\star}, \quad
+      i^\star = \arg\max_{i \in \mathcal{J}} \; \mathrm{job\_id}_i
+\end{align}
+
+($i^\star$ est conventionnellement le job au plus grand \texttt{job\_id} du batch — par construction
+côté Python, c'est toujours le nouveau job qui vient d'arriver.)
+
+Le choix entre ces trois formulations se fait via \texttt{objective\_choice.txt}
+($0 \to F_{\mathrm{sum}}$, $1 \to F_{\mathrm{max}}$ par défaut, $2 \to F_{\mathrm{new}}$), et le
+solve minimise la variable choisie~:
+\[
+  \min \; F_{\mathrm{objective\_choice}}
+\]
+
+\subsection{Énergie (bi-objectif, Online/Hybrid uniquement)}
+
+Pour chaque candidat de transfert $(j, i)$ (donnée $i$ vers nœud $j$), un coût énergétique
+constant est précalculé~:
+\[
+  c_{j,i} = \underbrace{\sigma}_{\text{énergie émetteur}}
+          + \underbrace{\kappa_j \cdot d_{j,i}}_{\text{énergie récepteur} \times \text{durée transfert}}
+          + \underbrace{\nu}_{\text{énergie réseau}}
+\]
+où $\sigma$ (\texttt{senderEnergy}), $\nu$ (\texttt{networkEnergy}) viennent de
+\texttt{energy\_config.txt}, $\kappa_j$ = \texttt{node\_energy\_consumption} du nœud $j$, et
+$d_{j,i}$ la durée du transfert de $i$ vers $j$. L'énergie totale est la somme pondérée par les
+transferts effectivement sélectionnés ($h_{j,i} \in \{0,1\}$, 1 si le transfert $(j,i)$ a lieu)~:
+\[
+  E = \sum_{j} \sum_{i} h_{j,i} \cdot c_{j,i}
+\]
+
+\section{Incremental}
+
+Place uniquement le \textbf{nouveau job}, sans reconsidérer les jobs déjà en cours (ceux-ci
+restent figés tels quels — pas de variable de décision pour eux dans ce solve). L'objectif est
+toujours~:
+\[
+  \min \; F_{\mathrm{max}}
+\]
+appliqué au batch réduit à ce seul job (donc équivalent à $\min \mathrm{flow}_{\mathrm{new}}$ dans
+ce cas précis, puisque $\mathcal{J} = \{\text{new}\}$). Pas de choix d'objectif configurable, pas
+de volet énergie.
+
+\section{Online}
+
+Solve joint sur \textbf{tous} les jobs du batch (existants + nouveau) à chaque arrivée — aucun job
+n'est figé. Objectif sélectionnable via \texttt{objective\_choice.txt}~:
+\[
+  \min \; F_{\mathrm{objective\_choice}} \quad \text{(typiquement } F_{\mathrm{max}} \text{ par défaut)}
+\]
+
+En mode bi-objectif (\texttt{MainOnlineMultiObj}, \texttt{multi\_objective.txt=2}), recherche en
+deux phases (\emph{epsilon-constraint})~:
+\begin{align}
+  \text{Phase 1:}\quad & \min \; F_{\mathrm{objective\_choice}} \quad \to \quad F^\star \\
+  \text{Phase 2:}\quad & \min \; E
+  \quad \text{s.t.} \quad F_{\mathrm{objective\_choice}} \le (1+\varepsilon) \, F^\star
+\end{align}
+où $\varepsilon$ = \texttt{epsilon\_fraction} (10\% par défaut). Le budget solveur total se
+répartit entre les deux phases (\texttt{epsilon\_phase1\_fraction}, 50/50 par défaut), et une
+borne absolue optionnelle (\texttt{epsilon\_max\_cap}) peut plafonner la phase 2 indépendamment du
+slack relatif.
+
+\section{Hybrid-n\_j}
+
+Même mécanique qu'Online (solve joint), mais avec deux ajouts spécifiques~:
+
+\begin{enumerate}
+  \item \textbf{Objectif fixé à $F_{\mathrm{new}}$} (\texttt{objective\_choice=2}) — on optimise
+        uniquement le flow time du nouveau job, jamais le batch entier.
+  \item \textbf{Plafond de dégradation par job} (optionnel, \texttt{flow\_time\_caps.txt}) — une
+        borne dure par job existant~:
+        \[
+          \mathrm{flow}_i \le \mathrm{cap}_i, \quad \mathrm{cap}_i = \mathrm{committed}_i \cdot (1 + p)
+        \]
+        où $\mathrm{committed}_i$ est l'estimation gloutonne pré-escalade du flow time de $i$
+        (\texttt{\_estimateJobFlowTime}, côté Python) et $p$ le pourcentage de dégradation toléré
+        (25\% par défaut dans nos expériences). Empêche l'objectif étroit $F_{\mathrm{new}}$
+        d'améliorer le nouveau job au prix d'une dégradation arbitraire d'un job existant.
+  \item \textbf{Gel sélectif} (\texttt{frozen\_jobs.txt} / \texttt{frozen\_job\_ids\_override}) —
+        un sous-ensemble $\mathcal{F} \subseteq \mathcal{J} \setminus \{\text{new}\}$ de jobs est
+        confiné à ses nœuds de résidence actuels (aucun nouveau transfert autorisé pour ces
+        jobs)~; c'est précisément le sous-ensemble $\mathcal{F}$ que les 8 heuristiques (et le
+        modèle appris) cherchent à choisir.
+\end{enumerate}
+
+Le même volet bi-objectif (phase 1 sur $F_{\mathrm{new}}$, phase 2 sur $E$ sous contrainte
+epsilon) s'applique identiquement, les plafonds de dégradation et le gel restant actifs dans les
+deux phases.
+
+\end{document}

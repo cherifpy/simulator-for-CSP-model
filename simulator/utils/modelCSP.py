@@ -3,7 +3,15 @@ import os
 import csv
 import threading
 import contextlib
-from pychoco import *
+# 2026-10-10: commented out -- only used by onLineSchedulingUsingCSP below (Model/IntVar/etc.),
+# which is itself never called anywhere in the codebase (confirmed via grep: imported in
+# master_node_with_heterogeneous_nodes_csp.py but never invoked -- the real solve path is
+# schedulingUsingJavaCSP, which shells out to javac/java as a subprocess, not pychoco's embedded
+# JVM). Keeping this import unconditional made the WHOLE module fail to load wherever pychoco's
+# own embedded-JVM startup fails (the same "graal_create_isolate error" seen all week for
+# standalone java invocations on certain Grid5000 nodes/JDKs) -- found on nancy.g5k's frontend,
+# even though nothing in this project's actual code path needs it.
+# from pychoco import *
 import pandas as pd
 import random as rnd
 import math
