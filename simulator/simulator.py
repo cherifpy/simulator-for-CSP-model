@@ -60,7 +60,7 @@ def jobsInjectorWithVariyingLoad(env, master, job_file_path = None):
         jobs = []
         with open(job_file_path, "r", encoding="utf-8") as file:
             jobs = json.load(file)
-        
+
         nb_injected_jobs = 0
         lambda_rate = master._config['lambda_rate']
 
@@ -72,16 +72,64 @@ def jobsInjectorWithVariyingLoad(env, master, job_file_path = None):
                     print("lambda changed to ", lambda_rate)
                 master._config['lambda_rate'] = lambda_rate
             inter_arrival_time = random.expovariate(lambd=1/lambda_rate)
-            
+
             yield env.timeout(inter_arrival_time)  # Simulate job inter-arrivals # Wait for a short time to allow the environment to process events
-            
+
             job = jobs[nb_injected_jobs]
-            
+
             yield master.queue.put(Job(job['job_id'], job['task_duration'], job['nb_tasks'], job['dataset_size']))
             nb_injected_jobs += 1
     else:
-        
+
         return
+
+
+def jobsInjectorDiurnal(env, master, job_file_path=None, low_rate=None, peak_rate=None,
+                         low_fraction=0.3):
+    """Poisson arrivals with a 3-phase LOW -> PEAK -> LOW rate schedule, instead of one constant
+    lambda_rate -- a rough diurnal cycle (sparse arrivals overnight, a busy daytime peak, sparse
+    again) matching the shape found in the real CMU/Hadoop trace analysis done earlier this
+    project (clear peak/trough inter-arrival pattern), rather than the flat-rate Poisson process
+    every other injector here uses (2026-10-14).
+
+    Phased by JOB-INDEX FRACTION through the job list (first low_fraction = low rate, middle
+    (1 - 2*low_fraction) = peak rate, last low_fraction = low rate again), not by elapsed
+    simulated time -- the total simulated-time span of a run isn't known upfront (it depends on
+    the rates themselves), so indexing by position in the list is the only way to guarantee all
+    three phases actually occur regardless of how long each phase ends up taking.
+
+    low_rate/peak_rate are mean inter-arrival times (same convention as lambda_rate elsewhere --
+    larger = SPARSER, fed to random.expovariate(1/rate)). Defaults (when None): derived from
+    master._config['lambda_rate'] as the baseline -- low = 3x that (sparser), peak = 0.3x (much
+    busier) -- so an existing --lambda-rate value still sets the overall scale, this just adds
+    variation around it instead of requiring two brand-new values to be chosen from scratch."""
+    if job_file_path is None:
+        return
+    with open(job_file_path, "r", encoding="utf-8") as file:
+        jobs = json.load(file)
+
+    base_rate = master._config['lambda_rate']
+    low_rate = low_rate if low_rate is not None else base_rate * 3
+    peak_rate = peak_rate if peak_rate is not None else base_rate * 0.3
+
+    n = len(jobs)
+    low_phase_end = int(n * low_fraction)
+    peak_phase_end = n - low_phase_end
+
+    nb_injected_jobs = 0
+    while nb_injected_jobs < n:
+        if nb_injected_jobs < low_phase_end or nb_injected_jobs >= peak_phase_end:
+            phase, rate = "low", low_rate
+        else:
+            phase, rate = "peak", peak_rate
+        inter_arrival_time = random.expovariate(lambd=1 / rate)
+        yield env.timeout(inter_arrival_time)
+
+        job = jobs[nb_injected_jobs]
+        print(f"### diurnal injector: job {job['job_id']} (#{nb_injected_jobs}) arrives at "
+              f"env.now={env.now:.2f}, phase={phase} (rate={rate:.2f}) ###")
+        yield master.queue.put(Job(job['job_id'], job['task_duration'], job['nb_tasks'], job['dataset_size']))
+        nb_injected_jobs += 1
 
 def jobs_injector(env, master, jobs = [], job_file_path = None, config= None):
 
@@ -162,8 +210,17 @@ def simulatorForOptimalPerfsUsingCSPOnline(config,jobs=[], overlap = False, thre
     if config.get('adaptive_replication_factor', False):
         env.process(controlLoopReplicationFactor(master))
 
-    if poisson:   
-        env.process(jobsInjectorBasedOnLambdaPoisson(env, master, job_file_path=config['jobs_file_path'], lambda_rate=config['lambda_rate']))        
+    if varying_load:
+        # 2026-10-14: varying_load was accepted as a parameter here but never actually read --
+        # dead code, jobsInjectorWithVariyingLoad was never reachable through this function.
+        # Wired to the new diurnal injector (low/peak/low rate schedule) instead of the old
+        # every-200-jobs one, which never varies anything on a workload smaller than 200 jobs.
+        env.process(jobsInjectorDiurnal(
+            env, master, job_file_path=config['jobs_file_path'],
+            low_rate=config.get('diurnal_low_rate'), peak_rate=config.get('diurnal_peak_rate'),
+            low_fraction=config.get('diurnal_low_fraction', 0.3)))
+    elif poisson:
+        env.process(jobsInjectorBasedOnLambdaPoisson(env, master, job_file_path=config['jobs_file_path'], lambda_rate=config['lambda_rate']))
     else:
         env.process(jobs_injector(env, master,jobs=jobs,job_file_path=config['jobs_file_path'], config=config))
     

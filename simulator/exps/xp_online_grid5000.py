@@ -111,6 +111,21 @@ def parse_args():
                          help="CSP solver time budget per solve, in seconds.")
     parser.add_argument("--lambda-rate", type=int, default=60,
                          help="Mean inter-arrival time for the Poisson job injector (default: 60).")
+    parser.add_argument("--diurnal-arrivals", action="store_true",
+                         help="2026-10-14: replace the flat-rate Poisson injector with a 3-phase "
+                              "LOW -> PEAK -> LOW rate schedule (a rough diurnal cycle, sparse "
+                              "overnight / busy daytime / sparse again), phased by job-index "
+                              "fraction through the instance. --diurnal-low-rate/--diurnal-peak-"
+                              "rate override the derived defaults (3x/0.3x --lambda-rate).")
+    parser.add_argument("--diurnal-low-rate", type=float, default=None,
+                         help="diurnal mode only: mean inter-arrival time during the low phases. "
+                              "Default: 3x --lambda-rate.")
+    parser.add_argument("--diurnal-peak-rate", type=float, default=None,
+                         help="diurnal mode only: mean inter-arrival time during the peak phase. "
+                              "Default: 0.3x --lambda-rate.")
+    parser.add_argument("--diurnal-low-fraction", type=float, default=0.3,
+                         help="diurnal mode only: fraction of jobs (by index) in each low phase "
+                              "(so 2x this fraction is low, the rest is peak). Default: 0.3.")
     parser.add_argument("--config", default=os.path.join(SIMULATOR_DIR, "config.json"),
                          help="Path to the base config.json to start from (default: <simulator>/config.json).")
     parser.add_argument("--results-dir", default=None,
@@ -326,6 +341,9 @@ def run(args):
     config["jobs_file_path"] = os.path.join(args.instance_dir, "jobs.json")
     config["solver_time_limit_s"] = args.solver_time_limit
     config["lambda_rate"] = args.lambda_rate
+    config["diurnal_low_rate"] = args.diurnal_low_rate
+    config["diurnal_peak_rate"] = args.diurnal_peak_rate
+    config["diurnal_low_fraction"] = args.diurnal_low_fraction
     config["adaptive_alpha"] = args.adaptive_alpha
     config["adaptive_max_budget_s"] = args.adaptive_max_budget
     config["adaptive_f1_threshold"] = args.adaptive_f1_threshold
@@ -394,7 +412,7 @@ def run(args):
 
     random.seed(args.seed)
     results, _ = simulatorForOptimalPerfsUsingCSPOnline(
-        config=config, jobs=[], overlap=True, poisson=True, varying_load=False,
+        config=config, jobs=[], overlap=True, poisson=True, varying_load=args.diurnal_arrivals,
         nodes_config=nodes_config, master_class=master_class,
     )
 
